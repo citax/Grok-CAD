@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Sequence, Tuple, Union
 
 import numpy as np
@@ -160,6 +162,112 @@ def boolean_op(a: Mesh, b: Mesh, op: BooleanOp) -> Mesh:
     if not _status_ok(result.status()):
         raise RuntimeError(f"manifold3d boolean failed: {result.status()}")
     return Mesh.from_manifold(result)
+
+
+def write_stl_binary(
+    mesh: Mesh,
+    path: Union[str, Path],
+    *,
+    header: str = "Grok CAD binary STL",
+    require_watertight: bool = True,
+) -> None:
+    """Write a triangle mesh as binary STL.
+
+    Rejects empty meshes. When ``require_watertight`` is True (default), also
+    rejects non-watertight / non-solid meshes with a clear ValueError.
+    """
+    if mesh is None or mesh.empty:
+        raise ValueError("cannot export empty mesh to STL")
+    if require_watertight and not mesh.is_watertight():
+        raise ValueError("cannot export non-watertight (open/non-solid) mesh to STL")
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    ntri = int(len(faces))
+    if ntri <= 0:
+        raise ValueError("cannot export empty mesh to STL")
+
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    normals = np.cross(v1 - v0, v2 - v0)
+    lens = np.linalg.norm(normals, axis=1)
+    # Avoid div-by-zero; zero-area faces should already fail watertight check
+    good = lens > 1e-30
+    normals = np.zeros_like(normals)
+    normals[good] = (np.cross(v1 - v0, v2 - v0)[good]) / lens[good, None]
+
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    hdr = header.encode("ascii", errors="replace")[:80]
+    hdr = hdr + b"\0" * (80 - len(hdr))
+
+    # Pack facets efficiently: each facet is 12 floats + uint16 attribute
+    facet_dtype = np.dtype(
+        [
+            ("n", "<f4", (3,)),
+            ("v0", "<f4", (3,)),
+            ("v1", "<f4", (3,)),
+            ("v2", "<f4", (3,)),
+            ("attr", "<u2"),
+        ]
+    )
+    facets = np.empty(ntri, dtype=facet_dtype)
+    facets["n"] = normals.astype(np.float32)
+    facets["v0"] = v0.astype(np.float32)
+    facets["v1"] = v1.astype(np.float32)
+    facets["v2"] = v2.astype(np.float32)
+    facets["attr"] = 0
+
+    with out_path.open("wb") as fh:
+        fh.write(hdr)
+        fh.write(struct.pack("<I", ntri))
+        fh.write(facets.tobytes())
+
+
+def read_stl_binary(path: Union[str, Path]) -> Mesh:
+    """Read a binary STL into an indexed Mesh (vertices may be duplicated)."""
+    data = Path(path).read_bytes()
+    if len(data) < 84:
+        raise ValueError("STL file too small to be binary STL")
+    # Binary STL: 80-byte header + uint32 count; ASCII starts with "solid"
+    ntri = struct.unpack_from("<I", data, 80)[0]
+    expected = 84 + ntri * 50
+    if len(data) < expected:
+        raise ValueError(
+            f"STL truncated: header claims {ntri} triangles, need {expected} bytes, got {len(data)}"
+        )
+    facet_dtype = np.dtype(
+        [
+            ("n", "<f4", (3,)),
+            ("v0", "<f4", (3,)),
+            ("v1", "<f4", (3,)),
+            ("v2", "<f4", (3,)),
+            ("attr", "<u2"),
+        ]
+    )
+    facets = np.frombuffer(data, dtype=facet_dtype, count=ntri, offset=84)
+    # Build non-indexed then weld vertices (float32 STL quantisation)
+    tri_verts = np.stack([facets["v0"], facets["v1"], facets["v2"]], axis=1)  # (T,3,3)
+    flat = tri_verts.reshape(-1, 3).astype(np.float64)
+    keys = np.round(flat, decimals=6)
+    verts, inv = np.unique(keys, axis=0, return_inverse=True)
+    faces = inv.reshape(-1, 3).astype(np.int32)
+    return Mesh(verts, faces)
+
+
+def write_stl(
+    mesh: Mesh,
+    path: Union[str, Path],
+    *,
+    binary: bool = True,
+    require_watertight: bool = True,
+) -> None:
+    """Export mesh to STL (binary by default)."""
+    if not binary:
+        raise ValueError("ASCII STL is not supported; use binary=True")
+    write_stl_binary(mesh, path, require_watertight=require_watertight)
 
 
 def make_box(width: float, height: float, depth: float) -> Mesh:

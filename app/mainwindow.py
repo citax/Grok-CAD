@@ -9,6 +9,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
+    QFileDialog,
     QFormLayout,
     QInputDialog,
     QLabel,
@@ -39,6 +40,7 @@ from cadcore.document import (
     first_closed_profile,
     is_reference_plane,
 )
+from cadcore.mesh import write_stl_binary
 
 
 class MainWindow(QMainWindow):
@@ -178,6 +180,16 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self) -> None:
         file_m = self.menuBar().addMenu("&File")
+        self.act_export_stl = QAction(
+            fa_icon("fa5s.file-export", color=ACCENT), "Export STL…", self
+        )
+        self.act_export_stl.setShortcut(QKeySequence("Ctrl+E"))
+        self.act_export_stl.setToolTip(
+            "Export the selected solid feature (extrude/revolve) as binary STL"
+        )
+        self.act_export_stl.triggered.connect(self._export_stl)
+        file_m.addAction(self.act_export_stl)
+        file_m.addSeparator()
         act_exit = QAction(fa_icon("fa5s.sign-out-alt"), "E&xit", self)
         act_exit.setShortcut(QKeySequence.StandardKey.Quit)
         act_exit.triggered.connect(self.close)
@@ -625,6 +637,70 @@ class MainWindow(QMainWindow):
         self._sync_selection(feat.id)
         self.statusBar().showMessage(
             f"Created {feat.name} (angle={ang:g}°)", 3000
+        )
+
+    def _export_stl(self) -> None:
+        """Export the currently selected solid (extrude/revolve/…) as binary STL."""
+        if self.viewport.in_sketch_mode:
+            self.statusBar().showMessage("Exit sketch before exporting", 3000)
+            return
+        f = self.doc.find(self.doc.selected_id)
+        if f is None or is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
+            QMessageBox.information(
+                self,
+                "Export STL",
+                "Select a solid feature (Extrude or Revolve) in the tree, "
+                "then File → Export STL…",
+            )
+            self.statusBar().showMessage("Select a solid feature to export", 4000)
+            return
+
+        # Evaluate on this thread via document path (geometry); no VTK required
+        try:
+            mesh = self.doc.evaluate_feature(f.id)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Export STL", f"Failed to evaluate solid:\n{exc}")
+            return
+        if mesh is None or mesh.empty:
+            QMessageBox.information(
+                self,
+                "Export STL",
+                f"{f.name} has no solid mesh to export.",
+            )
+            return
+        if not mesh.is_watertight():
+            QMessageBox.warning(
+                self,
+                "Export STL",
+                f"{f.name} is not watertight and cannot be exported to STL.",
+            )
+            return
+
+        default_name = f"{f.name.replace(' ', '_')}.stl"
+        path, _filt = QFileDialog.getSaveFileName(
+            self,
+            "Export STL",
+            default_name,
+            "STL files (*.stl);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".stl"):
+            path = path + ".stl"
+
+        try:
+            write_stl_binary(mesh, path, require_watertight=True)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Export STL", str(exc))
+            self.statusBar().showMessage(f"Export failed: {exc}", 4000)
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "Export STL", f"Could not write file:\n{exc}")
+            return
+
+        ntri = len(mesh.faces)
+        self.statusBar().showMessage(
+            f"Exported {f.name} → {path}  ({ntri} triangles)", 5000
         )
 
     def _delete_selected(self) -> None:

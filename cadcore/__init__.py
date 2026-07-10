@@ -11,9 +11,12 @@ from cadcore.mesh import (
     make_box,
     make_cylinder,
     make_sphere,
+    read_stl_binary,
     revolve_circle,
     revolve_profile,
     revolve_rectangle,
+    write_stl,
+    write_stl_binary,
 )
 from cadcore.sketch import CircleEntity, LineEntity, PlaneFrame, RectEntity, Sketch
 
@@ -33,6 +36,9 @@ __all__ = [
     "revolve_profile",
     "revolve_rectangle",
     "revolve_circle",
+    "write_stl",
+    "write_stl_binary",
+    "read_stl_binary",
     "Sketch",
     "PlaneFrame",
     "LineEntity",
