@@ -76,11 +76,38 @@ class SketchController:
             self.selected_entity_id = -1
             self.hover_handle = None
 
-    def cancel(self) -> None:
-        """Clear drawing/drag state without tool change."""
+    def is_drawing(self) -> bool:
+        """True if an entity is mid-placement (has at least one click)."""
+        return self.draw is not None and len(self.draw.points) > 0
+
+    def cancel_drawing(self) -> bool:
+        """Cancel in-progress entity. Returns True if something was cancelled."""
+        if self.draw is None and self.drag is None:
+            return False
         self.draw = None
         self.drag = None
         self.preview_uv = None
+        return True
+
+    def cancel(self) -> None:
+        """Legacy: clear drawing/drag state without tool change."""
+        self.cancel_drawing()
+
+    def confirm_current(self) -> Optional[str]:
+        """Finish in-progress entity using preview as last point (Enter).
+
+        Returns entity kind name if committed, else None.
+        """
+        if self.draw is None or not self.draw.points:
+            return None
+        # Need a second point: use preview if available, else abort
+        if self.preview_uv is None:
+            if len(self.draw.points) < 2:
+                return None
+        else:
+            if len(self.draw.points) == 1:
+                self.draw.points.append(self.preview_uv)
+        return self._try_finish_draw()
 
     # --- snapping ---
     def snap(self, uv: Vec2, *, drawing: bool = False) -> SnapResult:

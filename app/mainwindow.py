@@ -262,3 +262,24 @@ class MainWindow(QMainWindow):
             self._sync_selection(self.doc.selected_id)
             self.statusBar().showMessage("Feature deleted", 2000)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self.viewport.in_sketch_mode:
+            if event.key() == Qt.Key.Key_Escape:
+                # Two-stage: cancel draw → Select, or exit sketch if idle
+                was_drawing = (
+                    self.viewport._sketch_ctrl is not None
+                    and self.viewport._sketch_ctrl.is_drawing()
+                )
+                self.viewport.sketch_escape()
+                if not self.viewport.in_sketch_mode:
+                    self.sketch_tb.setVisible(False)
+                    self._refresh_tree()
+                    self._sync_selection(self.doc.selected_id)
+                    self.statusBar().showMessage("Exited sketch", 2000)
+                elif was_drawing:
+                    self.statusBar().showMessage("Sketch: Select", 2000)
+                return
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.viewport.sketch_confirm()
+                return
+        super().keyPressEvent(event)

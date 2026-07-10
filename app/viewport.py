@@ -111,6 +111,13 @@ class _InteractorFilter(QObject):
         if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
             self.vp._sketch_mouse_release(event.position().x(), event.position().y())
             return True
+        if et == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self.vp.sketch_escape()
+                return True
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.vp.sketch_confirm()
+                return True
         # Block middle/right orbit while sketching
         if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
             if event.button() != Qt.MouseButton.LeftButton:
@@ -496,14 +503,44 @@ class Viewport(QWidget):
         self.sketch_status.emit(f"Sketch: {tool.name.title()}")
         self._update_cursor()
 
-    def sketch_cancel(self) -> None:
-        """Cancel current draw/drag preview (no tool change)."""
+    def sketch_escape(self) -> None:
+        """Esc: cancel in-progress draw → Select; if idle, exit sketch mode."""
         if self._sketch_ctrl is None:
             return
-        self._sketch_ctrl.cancel()
-        self._clear_preview()
-        self._update_handles_visual()
-        self._request_render()
+        if self._sketch_ctrl.is_drawing() or self._sketch_ctrl.drag is not None:
+            self._sketch_ctrl.cancel_drawing()
+            self._sketch_ctrl.set_tool(SketchTool.SELECT)
+            self._clear_preview()
+            self._update_handles_visual()
+            self._update_cursor()
+            self.sketch_status.emit("Sketch: Select")
+            self._request_render()
+            return
+        # Idle select — exit sketch entirely
+        self.exit_sketch()
+        self.sketch_status.emit("Exited sketch")
+
+    def sketch_confirm(self) -> None:
+        """Enter: finish current entity using rubber-band end point."""
+        if self._sketch_ctrl is None:
+            return
+        msg = self._sketch_ctrl.confirm_current()
+        if msg:
+            ent = self._sketch_ctrl.sketch.entities[-1]
+            self._upsert_entity_actor(ent)
+            self._clear_preview()
+            self._update_handles_visual()
+            self.sketch_status.emit(f"Sketch: {msg}")
+            self._request_render()
+
+    def sketch_cancel(self) -> None:
+        """Back-compat alias for Esc first stage only (cancel draw)."""
+        if self._sketch_ctrl is None:
+            return
+        if self._sketch_ctrl.is_drawing() or self._sketch_ctrl.drag is not None:
+            self.sketch_escape()
+        else:
+            self.sketch_escape()
 
     def _install_sketch_filter(self) -> None:
         if not self.plotter:
