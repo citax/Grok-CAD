@@ -1,0 +1,46 @@
+# Python virtualenvs (never commit)
+.venv/
+.venv
+venv/
+ENV/
+
+# Caches / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build / native
+build/
+dist/
+*.so
+*.o
+*.a
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Local user bundles (Qt xcb libs etc. live under $HOME — keep out of repo)
+.local/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# App outputs
+*.stl
+*.cad.json
+*.log
+
+# Qt / aqt noise
+aqtinstall.log
