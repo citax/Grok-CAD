@@ -16,6 +16,7 @@ def main() -> int:
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
         from app.mainwindow import MainWindow
+        from app.theme import apply_theme
     except Exception as exc:  # noqa: BLE001
         print(f"[main] Import failed: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -24,6 +25,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Grok CAD")
     app.setOrganizationName("CadCore")
+    apply_theme(app)
     try:
         win = MainWindow()
         win.show()

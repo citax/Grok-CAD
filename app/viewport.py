@@ -14,6 +14,28 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from pyvistaqt import QtInteractor
 
 from app.sketch_mode import SketchController, SketchTool
+from app.theme import (
+    ACCENT,
+    TEXT_PRIMARY,
+    AXIS_X,
+    AXIS_Y,
+    AXIS_Z,
+    GRID_COLOR,
+    HANDLE_COLOR,
+    HANDLE_HOVER,
+    PLANE_FRONT,
+    PLANE_RIGHT,
+    PLANE_TOP,
+    SKETCH_COLOR,
+    SKETCH_GRID,
+    SKETCH_H,
+    SKETCH_PREVIEW,
+    SKETCH_V,
+    SOLID_COLOR,
+    SOLID_SELECTED,
+    VP_BG_BOTTOM,
+    VP_BG_TOP,
+)
 from app.workers import GeometryRebuildJob, snapshot_features
 from cadcore.document import Document, FeatureType, is_reference_plane
 from cadcore.sketch import (
@@ -26,15 +48,11 @@ from cadcore.sketch import (
 )
 
 PLANE_COLORS = {
-    FeatureType.PLANE_FRONT: "#3B82F6",
-    FeatureType.PLANE_TOP: "#22C55E",
-    FeatureType.PLANE_RIGHT: "#EF4444",
+    FeatureType.PLANE_FRONT: PLANE_FRONT,
+    FeatureType.PLANE_TOP: PLANE_TOP,
+    FeatureType.PLANE_RIGHT: PLANE_RIGHT,
 }
 PLANE_HALF = 2.5
-SKETCH_COLOR = "#F8FAFC"
-SKETCH_PREVIEW = "#FBBF24"
-HANDLE_COLOR = "#FDE047"
-HANDLE_HOVER = "#F97316"
 
 
 def _plane_surface(ftype: FeatureType, half: float = PLANE_HALF) -> pv.PolyData:
@@ -133,12 +151,14 @@ class Viewport(QWidget):
     busy_changed = Signal(bool, str)
     sketch_exited = Signal()
     sketch_status = Signal(str)
+    renderer_info = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._doc: Optional[Document] = None
         self._selected_id = -1
         self._ok = False
+        self.gl_renderer = ""
         self._planes_built = False
         self._solid_fps: Dict[int, str] = {}
         self._job_gen = 0
@@ -170,13 +190,17 @@ class Viewport(QWidget):
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] FAILED: {exc}", file=sys.stderr)
             err = QLabel(f"3D viewport failed:\n{exc}")
-            err.setStyleSheet("color: #f0c850; background: #1e1f24; padding: 24px;")
+            err.setStyleSheet(f"color: {SKETCH_PREVIEW}; background: {VP_BG_BOTTOM}; padding: 24px;")
             err.setWordWrap(True)
             layout.addWidget(err)
             self.plotter = None  # type: ignore
             return
 
-        self.plotter.set_background("#1e1f24")
+        # Graphite vertical gradient (top lighter → bottom darker)
+        try:
+            self.plotter.set_background(VP_BG_BOTTOM, top=VP_BG_TOP)
+        except TypeError:
+            self.plotter.set_background(VP_BG_BOTTOM)
         self._configure_softgl_render()
         self._log_renderer()
         self._setup_helpers()
@@ -214,25 +238,34 @@ class Viewport(QWidget):
             if isinstance(rw, vtkOpenGLRenderWindow):
                 caps = rw.ReportCapabilities() or ""
                 for line in caps.splitlines():
-                    if any(k in line.lower() for k in ("renderer", "version", "vendor")):
+                    low = line.lower()
+                    if any(k in low for k in ("renderer", "version", "vendor")):
                         print(f"[viewport] {line.strip()}", file=sys.stderr)
+                    if "opengl renderer string" in low or (
+                        "renderer string" in low and "opengl" in low
+                    ):
+                        # "OpenGL renderer string:  llvmpipe (...)"
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            self.gl_renderer = parts[1].strip()
+                            self.renderer_info.emit(self.gl_renderer)
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] log: {exc}", file=sys.stderr)
 
     def _setup_helpers(self) -> None:
         assert self.plotter is not None
         self.plotter.show_bounds(
-            grid="back", location="outer", color="#5a5e68", font_size=9,
+            grid="back", location="outer", color=GRID_COLOR, font_size=9,
             xtitle="X", ytitle="Y", ztitle="Z",
         )
         self.plotter.add_mesh(
             pv.Sphere(radius=0.07, center=(0, 0, 0), theta_resolution=8, phi_resolution=8),
-            color="white", name="__origin", pickable=False,
+            color=TEXT_PRIMARY, name="__origin", pickable=False,
         )
         for end, color, name in (
-            ((2.4, 0, 0), "#FF3333", "__ax"),
-            ((0, 2.4, 0), "#33FF55", "__ay"),
-            ((0, 0, 2.4), "#3399FF", "__az"),
+            ((2.4, 0, 0), AXIS_X, "__ax"),
+            ((0, 2.4, 0), AXIS_Y, "__ay"),
+            ((0, 0, 2.4), AXIS_Z, "__az"),
         ):
             self.plotter.add_mesh(
                 pv.Line((0, 0, 0), end), color=color, line_width=3, name=name, pickable=False
@@ -240,7 +273,7 @@ class Viewport(QWidget):
         try:
             self.plotter.add_axes(
                 line_width=2, xlabel="X", ylabel="Y", zlabel="Z",
-                x_color="#FF4444", y_color="#44FF66", z_color="#4488FF",
+                x_color=AXIS_X, y_color=AXIS_Y, z_color=AXIS_Z,
                 viewport=(0.0, 0.0, 0.18, 0.18),
             )
         except Exception as exc:  # noqa: BLE001
@@ -366,7 +399,7 @@ class Viewport(QWidget):
             except Exception:
                 pass
             self.plotter.add_mesh(
-                pdata, color="#9aa3ad", name=f"solid_{fid}", pickable=True,
+                pdata, color=SOLID_COLOR, name=f"solid_{fid}", pickable=True,
                 smooth_shading=False, show_edges=False, render=False,
             )
             self._solid_fps[fid] = fp
@@ -444,7 +477,7 @@ class Viewport(QWidget):
                     prop.SetOpacity(0.25)
                 else:
                     prop.SetOpacity(1.0)
-                prop.SetColor(*( (1.0, 0.85, 0.25) if selected else (0.60, 0.64, 0.68) ))
+                prop.SetColor(*( (0.98, 0.75, 0.14) if selected else (0.60, 0.64, 0.68) ))
 
     # ----- sketch mode -----
     def enter_sketch(self, sketch_feature_id: int) -> None:
@@ -595,18 +628,18 @@ class Viewport(QWidget):
         grid = segs(pts_u).merge(segs(pts_v)) if pts_u else pv.PolyData()
         self._remove_actor("__sk_grid")
         self.plotter.add_mesh(
-            grid, color="#64748B", line_width=1, name="__sk_grid", pickable=False, render=False
+            grid, color=SKETCH_GRID, line_width=1, name="__sk_grid", pickable=False, render=False
         )
         # H axis (u) and V axis (v) through origin
         self._remove_actor("__sk_h")
         self._remove_actor("__sk_v")
         self.plotter.add_mesh(
             pv.Line(fr.to_world((-half, 0)), fr.to_world((half, 0))),
-            color="#F87171", line_width=2, name="__sk_h", pickable=False, render=False,
+            color=SKETCH_H, line_width=2, name="__sk_h", pickable=False, render=False,
         )
         self.plotter.add_mesh(
             pv.Line(fr.to_world((0, -half)), fr.to_world((0, half))),
-            color="#4ADE80", line_width=2, name="__sk_v", pickable=False, render=False,
+            color=SKETCH_V, line_width=2, name="__sk_v", pickable=False, render=False,
         )
 
     def _clear_sketch_overlays(self) -> None:
@@ -632,7 +665,7 @@ class Viewport(QWidget):
             for ent in f.sketch.entities:
                 pdata = _entity_polydata(ent, f.sketch)
                 self.plotter.add_mesh(
-                    pdata, color="#E2E8F0", line_width=2,
+                    pdata, color=SKETCH_COLOR, line_width=2,
                     name=f"sk_closed_{f.id}_{ent.id}", pickable=False, render=False,
                 )
         self._request_render()
@@ -724,7 +757,7 @@ class Viewport(QWidget):
             w = fr.to_world(ctrl.preview_uv)
             self.plotter.add_mesh(
                 pv.Sphere(radius=0.05, center=w, theta_resolution=6, phi_resolution=6),
-                color="#38BDF8", name="__sk_infer", pickable=False, render=False,
+                color=ACCENT, name="__sk_infer", pickable=False, render=False,
             )
 
     def _update_cursor(self) -> None:
