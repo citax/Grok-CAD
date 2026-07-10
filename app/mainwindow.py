@@ -10,6 +10,7 @@ from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFormLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -35,6 +36,7 @@ from cadcore.document import (
     Document,
     FeatureType,
     feature_type_name,
+    first_closed_profile,
     is_reference_plane,
 )
 
@@ -152,15 +154,21 @@ class MainWindow(QMainWindow):
         self.prop_type = QLabel("—")
         self.prop_type.setObjectName("fieldValue")
         self.prop_type.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.prop_detail = QLabel("—")
+        self.prop_detail.setObjectName("fieldValue")
+        self.prop_detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         lbl_name = QLabel("Name")
         lbl_name.setObjectName("fieldLabel")
         lbl_type = QLabel("Type")
         lbl_type.setObjectName("fieldLabel")
+        lbl_detail = QLabel("Detail")
+        lbl_detail.setObjectName("fieldLabel")
         form.addRow(lbl_name, self.prop_name)
         form.addRow(lbl_type, self.prop_type)
+        form.addRow(lbl_detail, self.prop_detail)
 
-        hint = QLabel("Select a plane → Sketch to draw.")
+        hint = QLabel("Select a plane → Sketch → Extrude closed profile.")
         hint.setObjectName("secondaryLabel")
         hint.setWordWrap(True)
         form.addRow(hint)
@@ -205,6 +213,10 @@ class MainWindow(QMainWindow):
         act.setShortcut(QKeySequence("S"))
         act.triggered.connect(self._enter_sketch)
         insert_m.addAction(act)
+        act_ex = QAction(fa_icon("fa5s.cube", color=ACCENT), "Extrude (Pad)…", self)
+        act_ex.setShortcut(QKeySequence("E"))
+        act_ex.triggered.connect(self._extrude)
+        insert_m.addAction(act_ex)
 
     def _build_toolbar(self) -> None:
         views = QToolBar("Views")
@@ -244,6 +256,14 @@ class MainWindow(QMainWindow):
         self.act_sketch.setToolTip("Create or edit a sketch on the selected plane (S)")
         self.act_sketch.triggered.connect(self._enter_sketch)
         main.addAction(self.act_sketch)
+
+        self.act_extrude = QAction(fa_icon("fa5s.cube", color=ACCENT), "Extrude", self)
+        self.act_extrude.setToolTip(
+            "Extrude (pad) a closed sketch profile into a solid (E)"
+        )
+        self.act_extrude.setShortcut(QKeySequence("E"))
+        self.act_extrude.triggered.connect(self._extrude)
+        main.addAction(self.act_extrude)
 
     def _build_sketch_toolbar(self) -> None:
         self.sketch_tb = QToolBar("Sketch")
@@ -306,6 +326,8 @@ class MainWindow(QMainWindow):
             return fa_icon("fa5s.clone", color=PLANE_RIGHT)
         if ftype is FeatureType.SKETCH:
             return fa_icon("fa5s.pencil-alt", color=ACCENT)
+        if ftype is FeatureType.EXTRUDE:
+            return fa_icon("fa5s.cube", color=ACCENT)
         return fa_icon("fa5s.cube", color=TEXT_SECONDARY)
 
     def _refresh_tree(self) -> None:
@@ -354,10 +376,20 @@ class MainWindow(QMainWindow):
         if f is None:
             self.prop_name.setText("—")
             self.prop_type.setText("—")
+            self.prop_detail.setText("—")
             self.statusBar().showMessage(f"Selected: (none) · {self._status_env}")
             return
         self.prop_name.setText(f.name)
         self.prop_type.setText(feature_type_name(f.type))
+        if f.type is FeatureType.EXTRUDE:
+            self.prop_detail.setText(f"Distance = {f.depth:g}")
+        elif f.type is FeatureType.SKETCH and f.sketch is not None:
+            n = len(f.sketch.entities)
+            self.prop_detail.setText(f"{n} entit{'y' if n == 1 else 'ies'}")
+        elif is_reference_plane(f.type):
+            self.prop_detail.setText("Reference")
+        else:
+            self.prop_detail.setText("—")
         self.statusBar().showMessage(f"Selected: {f.name} · {self._status_env}")
         self.tree.blockSignals(True)
         self.tree.clearSelection()
@@ -448,6 +480,76 @@ class MainWindow(QMainWindow):
     def _on_sketch_exited(self) -> None:
         self.sketch_tb.setVisible(False)
         self._refresh_tree()
+
+    def _resolve_extrude_sketch_id(self) -> int:
+        """Sketch feature id for extrude: active sketch mode, else selection."""
+        if self.viewport.in_sketch_mode and self.viewport._sketch_feature_id >= 0:
+            return int(self.viewport._sketch_feature_id)
+        f = self.doc.find(self.doc.selected_id)
+        if f is not None and f.type is FeatureType.SKETCH:
+            return f.id
+        # Prefer the most recently created sketch with a closed profile
+        for f in reversed(self.doc.features):
+            if f.type is FeatureType.SKETCH and f.sketch is not None:
+                if first_closed_profile(f.sketch) is not None:
+                    return f.id
+        return -1
+
+    def _extrude(self) -> None:
+        """Extrude (pad) a closed sketch profile via distance dialog + rebuild worker."""
+        sid = self._resolve_extrude_sketch_id()
+        skf = self.doc.find(sid) if sid >= 0 else None
+        if skf is None or skf.sketch is None:
+            QMessageBox.information(
+                self,
+                "Extrude",
+                "Create or select a sketch with a closed rectangle or circle first.",
+            )
+            self.statusBar().showMessage(
+                "Extrude needs a closed sketch profile", 4000
+            )
+            return
+        if first_closed_profile(skf.sketch) is None:
+            QMessageBox.information(
+                self,
+                "Extrude",
+                "The sketch has no closed profile.\n"
+                "Draw a rectangle or circle, then Extrude.",
+            )
+            self.statusBar().showMessage("No closed profile to extrude", 4000)
+            return
+
+        dist, ok = QInputDialog.getDouble(
+            self,
+            "Extrude (Pad)",
+            "Distance:",
+            1.0,
+            1e-6,
+            1e6,
+            4,
+        )
+        if not ok:
+            return
+
+        # Leave sketch mode so the solid rebuild is visible
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self.sketch_tb.setVisible(False)
+
+        try:
+            feat = self.doc.create_extrude(sid, float(dist))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Extrude", str(exc))
+            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
+            return
+
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(feat.id)
+        self.statusBar().showMessage(
+            f"Created {feat.name} (distance={dist:g})", 3000
+        )
 
     def _delete_selected(self) -> None:
         if self.viewport.in_sketch_mode:

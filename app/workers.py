@@ -2,35 +2,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
-from cadcore.document import Document, Feature, FeatureType, is_boolean, is_reference_plane
+from cadcore.document import (
+    Document,
+    Feature,
+    FeatureType,
+    copy_sketch,
+    first_closed_profile,
+    is_boolean,
+    is_reference_plane,
+    sketch_fingerprint,
+)
 from cadcore.mesh import Mesh
 
 
 def feature_fingerprint(f: Feature) -> str:
     """Stable key: if this changes, the solid mesh must be recomputed/re-uploaded."""
-    return "|".join(
-        [
-            str(f.id),
-            f.type.name,
-            f"{f.width:.6g}",
-            f"{f.height:.6g}",
-            f"{f.depth:.6g}",
-            f"{f.radius:.6g}",
-            str(f.segments),
-            str(f.rings),
-            str(f.operand_a),
-            str(f.operand_b),
-            f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
-            str(int(f.visible)),
-            str(int(f.suppressed)),
-        ]
-    )
+    parts = [
+        str(f.id),
+        f.type.name,
+        f"{f.width:.6g}",
+        f"{f.height:.6g}",
+        f"{f.depth:.6g}",
+        f"{f.radius:.6g}",
+        str(f.segments),
+        str(f.rings),
+        str(f.operand_a),
+        str(f.operand_b),
+        str(f.profile_entity_id),
+        f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
+        str(int(f.visible)),
+        str(int(f.suppressed)),
+    ]
+    if f.type is FeatureType.EXTRUDE or f.type is FeatureType.SKETCH:
+        parts.append(sketch_fingerprint(f.sketch))
+    return "|".join(parts)
 
 
 def snapshot_features(doc: Document) -> List[Feature]:
@@ -51,6 +61,9 @@ def snapshot_features(doc: Document) -> List[Feature]:
                 operand_a=f.operand_a,
                 operand_b=f.operand_b,
                 translation=tuple(f.translation),  # type: ignore[arg-type]
+                plane_id=f.plane_id,
+                sketch=copy_sketch(f.sketch),
+                profile_entity_id=f.profile_entity_id,
                 visible=f.visible,
                 suppressed=f.suppressed,
             )
@@ -73,19 +86,36 @@ def evaluate_solids_snapshot(
         if fid in cache:
             return cache[fid]
         f = by_id.get(fid)
-        if f is None or f.suppressed or is_reference_plane(f.type) or f.type.name == "SKETCH":
+        if f is None or f.suppressed or is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
             cache[fid] = None
             return None
         from cadcore.mesh import (
             BooleanOp,
             boolean_op,
+            extrude_profile,
             make_box,
             make_cylinder,
             make_sphere,
         )
 
         mesh: Optional[Mesh] = None
-        if f.type is FeatureType.BOX:
+        if f.type is FeatureType.EXTRUDE:
+            skf = by_id.get(f.operand_a)
+            if skf is None or skf.sketch is None:
+                cache[fid] = None
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                cache[fid] = None
+                return None
+            mesh = extrude_profile(
+                ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+            )
+        elif f.type is FeatureType.BOX:
             mesh = make_box(f.width, f.height, f.depth)
         elif f.type is FeatureType.SPHERE:
             mesh = make_sphere(f.radius, f.segments, f.rings)
@@ -125,10 +155,35 @@ def evaluate_solids_snapshot(
         m = eval_one(f.id)
         if m is None or m.empty:
             continue
+        # For extrude, include source sketch geometry in the fingerprint
+        fp_feature = f
+        if f.type is FeatureType.EXTRUDE:
+            skf = by_id.get(f.operand_a)
+            if skf is not None and skf.sketch is not None:
+                # temporary view with sketch attached for fingerprint only
+                fp_feature = Feature(
+                    id=f.id,
+                    name=f.name,
+                    type=f.type,
+                    width=f.width,
+                    height=f.height,
+                    depth=f.depth,
+                    radius=f.radius,
+                    segments=f.segments,
+                    rings=f.rings,
+                    operand_a=f.operand_a,
+                    operand_b=f.operand_b,
+                    translation=f.translation,
+                    plane_id=f.plane_id,
+                    sketch=skf.sketch,
+                    profile_entity_id=f.profile_entity_id,
+                    visible=f.visible,
+                    suppressed=f.suppressed,
+                )
         results[f.id] = (
             np.ascontiguousarray(m.vertices, dtype=np.float64),
             np.ascontiguousarray(m.faces, dtype=np.int32),
-            feature_fingerprint(f),
+            feature_fingerprint(fp_feature),
         )
     return results
 

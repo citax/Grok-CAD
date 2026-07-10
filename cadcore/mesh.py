@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple
+from typing import TYPE_CHECKING, Sequence, Tuple, Union
 
 import numpy as np
 
 try:
-    from manifold3d import Manifold, Mesh as ManifoldMesh
+    from manifold3d import CrossSection, Manifold, Mesh as ManifoldMesh
 except ImportError:  # pragma: no cover
+    CrossSection = None  # type: ignore
     Manifold = None  # type: ignore
     ManifoldMesh = None  # type: ignore
+
+if TYPE_CHECKING:
+    from cadcore.sketch import CircleEntity, PlaneFrame, RectEntity, SketchEntity
 
 
 def _status_ok(st: object) -> bool:
@@ -185,3 +189,134 @@ def make_cylinder(radius: float, height: float, segments: int = 32) -> Mesh:
         float(height), float(radius), float(radius), max(3, int(segments)), True
     )
     return Mesh.from_manifold(man)
+
+
+def _frame_transform(frame: "PlaneFrame") -> list:
+    """3×4 matrix mapping (u, v, h) → origin + u·U + v·V + h·N."""
+    u = np.asarray(frame.u_axis, dtype=np.float64).reshape(3)
+    v = np.asarray(frame.v_axis, dtype=np.float64).reshape(3)
+    n = np.asarray(frame.normal, dtype=np.float64).reshape(3)
+    o = np.asarray(frame.origin, dtype=np.float64).reshape(3)
+    return [
+        [float(u[0]), float(v[0]), float(n[0]), float(o[0])],
+        [float(u[1]), float(v[1]), float(n[1]), float(o[1])],
+        [float(u[2]), float(v[2]), float(n[2]), float(o[2])],
+    ]
+
+
+def _rect_polygon_uv(c0: Sequence[float], c1: Sequence[float]) -> list:
+    """Axis-aligned rectangle corners in CCW order (positive area for CrossSection)."""
+    u0, u1 = sorted([float(c0[0]), float(c1[0])])
+    v0, v1 = sorted([float(c0[1]), float(c1[1])])
+    w = u1 - u0
+    h = v1 - v0
+    if w <= 1e-12 or h <= 1e-12:
+        raise ValueError("degenerate rectangle: zero area")
+    return [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+
+
+def _cross_section_from_polygon(poly: Sequence[Tuple[float, float]]) -> "CrossSection":
+    if CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    loop = [[float(p[0]), float(p[1])] for p in poly]
+    cs = CrossSection([loop])
+    if cs.is_empty() or abs(float(cs.area())) <= 1e-14:
+        raise ValueError("degenerate profile: empty or zero-area cross-section")
+    return cs
+
+
+def extrude_polygon(
+    polygon_uv: Sequence[Tuple[float, float]],
+    distance: float,
+    frame: "PlaneFrame",
+) -> Mesh:
+    """Extrude a closed 2D UV polygon along ``frame.normal`` by ``distance``.
+
+    Uses manifold3d ``CrossSection`` + ``Manifold.extrude`` (not hand-rolled geometry).
+    """
+    if Manifold is None or CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    if len(polygon_uv) < 3:
+        raise ValueError("polygon must have at least 3 vertices")
+    cs = _cross_section_from_polygon(polygon_uv)
+    man = Manifold.extrude(cs, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(f"manifold extrude failed: {man.status()}")
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("extrude result is not watertight")
+    return mesh
+
+
+def extrude_rectangle(
+    c0: Sequence[float],
+    c1: Sequence[float],
+    distance: float,
+    frame: "PlaneFrame",
+) -> Mesh:
+    """Extrude an axis-aligned UV rectangle along the plane normal."""
+    return extrude_polygon(_rect_polygon_uv(c0, c1), distance, frame)
+
+
+def extrude_circle(
+    center: Sequence[float],
+    radius: float,
+    distance: float,
+    frame: "PlaneFrame",
+    *,
+    segments: int = 64,
+) -> Mesh:
+    """Extrude a UV circle along the plane normal (polygonal approx)."""
+    if Manifold is None or CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    r = float(radius)
+    if not np.isfinite(r) or r <= 1e-12:
+        raise ValueError("degenerate circle: radius must be positive")
+    segs = max(3, int(segments))
+    cs = CrossSection.circle(r, segs)
+    cx, cy = float(center[0]), float(center[1])
+    if abs(cx) > 1e-15 or abs(cy) > 1e-15:
+        cs = cs.translate([cx, cy])
+    if cs.is_empty() or abs(float(cs.area())) <= 1e-14:
+        raise ValueError("degenerate circle: empty cross-section")
+    man = Manifold.extrude(cs, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(f"manifold extrude failed: {man.status()}")
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("extrude result is not watertight")
+    return mesh
+
+
+def extrude_profile(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity"],
+    distance: float,
+    frame: "PlaneFrame",
+    *,
+    segments: int = 64,
+) -> Mesh:
+    """Extrude a closed sketch profile (Rectangle or Circle) into a watertight solid.
+
+    Open entities (e.g. lines) and degenerate geometry are rejected with ValueError.
+    """
+    from cadcore.sketch import CircleEntity, EntityKind, LineEntity, RectEntity
+
+    if isinstance(profile, LineEntity) or getattr(profile, "kind", None) is EntityKind.LINE:
+        raise ValueError("cannot extrude open profile: line is not a closed profile")
+    if isinstance(profile, RectEntity):
+        return extrude_rectangle(profile.c0, profile.c1, distance, frame)
+    if isinstance(profile, CircleEntity):
+        return extrude_circle(
+            profile.center, profile.radius, distance, frame, segments=segments
+        )
+    raise ValueError(
+        f"unsupported profile type for extrude: {type(profile).__name__}"
+    )

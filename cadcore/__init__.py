@@ -1,7 +1,17 @@
 """Pure-Python CAD core: document, sketches, mesh kernel."""
 
 from cadcore.document import Document, Feature, FeatureType
-from cadcore.mesh import BooleanOp, Mesh, boolean_op, make_box, make_cylinder, make_sphere
+from cadcore.mesh import (
+    BooleanOp,
+    Mesh,
+    boolean_op,
+    extrude_circle,
+    extrude_profile,
+    extrude_rectangle,
+    make_box,
+    make_cylinder,
+    make_sphere,
+)
 from cadcore.sketch import CircleEntity, LineEntity, PlaneFrame, RectEntity, Sketch
 
 __all__ = [
@@ -14,6 +24,9 @@ __all__ = [
     "make_box",
     "make_sphere",
     "make_cylinder",
+    "extrude_profile",
+    "extrude_rectangle",
+    "extrude_circle",
     "Sketch",
     "PlaneFrame",
     "LineEntity",
