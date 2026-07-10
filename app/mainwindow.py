@@ -217,6 +217,10 @@ class MainWindow(QMainWindow):
         act_ex.setShortcut(QKeySequence("E"))
         act_ex.triggered.connect(self._extrude)
         insert_m.addAction(act_ex)
+        act_rev = QAction(fa_icon("fa5s.sync-alt", color=ACCENT), "Revolve…", self)
+        act_rev.setShortcut(QKeySequence("R"))
+        act_rev.triggered.connect(self._revolve)
+        insert_m.addAction(act_rev)
 
     def _build_toolbar(self) -> None:
         views = QToolBar("Views")
@@ -264,6 +268,14 @@ class MainWindow(QMainWindow):
         self.act_extrude.setShortcut(QKeySequence("E"))
         self.act_extrude.triggered.connect(self._extrude)
         main.addAction(self.act_extrude)
+
+        self.act_revolve = QAction(fa_icon("fa5s.sync-alt", color=ACCENT), "Revolve", self)
+        self.act_revolve.setToolTip(
+            "Revolve a closed sketch profile about the V-axis into a solid (R)"
+        )
+        self.act_revolve.setShortcut(QKeySequence("R"))
+        self.act_revolve.triggered.connect(self._revolve)
+        main.addAction(self.act_revolve)
 
     def _build_sketch_toolbar(self) -> None:
         self.sketch_tb = QToolBar("Sketch")
@@ -328,6 +340,8 @@ class MainWindow(QMainWindow):
             return fa_icon("fa5s.pencil-alt", color=ACCENT)
         if ftype is FeatureType.EXTRUDE:
             return fa_icon("fa5s.cube", color=ACCENT)
+        if ftype is FeatureType.REVOLVE:
+            return fa_icon("fa5s.sync-alt", color=ACCENT)
         return fa_icon("fa5s.cube", color=TEXT_SECONDARY)
 
     def _refresh_tree(self) -> None:
@@ -383,6 +397,8 @@ class MainWindow(QMainWindow):
         self.prop_type.setText(feature_type_name(f.type))
         if f.type is FeatureType.EXTRUDE:
             self.prop_detail.setText(f"Distance = {f.depth:g}")
+        elif f.type is FeatureType.REVOLVE:
+            self.prop_detail.setText(f"Angle = {f.revolve_angle:g}°")
         elif f.type is FeatureType.SKETCH and f.sketch is not None:
             n = len(f.sketch.entities)
             self.prop_detail.setText(f"{n} entit{'y' if n == 1 else 'ies'}")
@@ -481,8 +497,8 @@ class MainWindow(QMainWindow):
         self.sketch_tb.setVisible(False)
         self._refresh_tree()
 
-    def _resolve_extrude_sketch_id(self) -> int:
-        """Sketch feature id for extrude: active sketch mode, else selection."""
+    def _resolve_closed_sketch_id(self) -> int:
+        """Sketch feature id for extrude/revolve: active sketch mode, else selection."""
         if self.viewport.in_sketch_mode and self.viewport._sketch_feature_id >= 0:
             return int(self.viewport._sketch_feature_id)
         f = self.doc.find(self.doc.selected_id)
@@ -495,9 +511,13 @@ class MainWindow(QMainWindow):
                     return f.id
         return -1
 
+    def _resolve_extrude_sketch_id(self) -> int:
+        """Back-compat alias."""
+        return self._resolve_closed_sketch_id()
+
     def _extrude(self) -> None:
         """Extrude (pad) a closed sketch profile via distance dialog + rebuild worker."""
-        sid = self._resolve_extrude_sketch_id()
+        sid = self._resolve_closed_sketch_id()
         skf = self.doc.find(sid) if sid >= 0 else None
         if skf is None or skf.sketch is None:
             QMessageBox.information(
@@ -549,6 +569,62 @@ class MainWindow(QMainWindow):
         self._sync_selection(feat.id)
         self.statusBar().showMessage(
             f"Created {feat.name} (distance={dist:g})", 3000
+        )
+
+    def _revolve(self) -> None:
+        """Revolve a closed sketch profile about the V-axis via angle dialog + rebuild."""
+        sid = self._resolve_closed_sketch_id()
+        skf = self.doc.find(sid) if sid >= 0 else None
+        if skf is None or skf.sketch is None:
+            QMessageBox.information(
+                self,
+                "Revolve",
+                "Create or select a sketch with a closed rectangle or circle first.\n"
+                "The profile must lie entirely on one side of the V-axis (u=0).",
+            )
+            self.statusBar().showMessage(
+                "Revolve needs a closed sketch profile", 4000
+            )
+            return
+        if first_closed_profile(skf.sketch) is None:
+            QMessageBox.information(
+                self,
+                "Revolve",
+                "The sketch has no closed profile.\n"
+                "Draw a rectangle or circle offset from the V-axis, then Revolve.",
+            )
+            self.statusBar().showMessage("No closed profile to revolve", 4000)
+            return
+
+        ang, ok = QInputDialog.getDouble(
+            self,
+            "Revolve",
+            "Angle (degrees):",
+            360.0,
+            1e-3,
+            360.0,
+            2,
+        )
+        if not ok:
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self.sketch_tb.setVisible(False)
+
+        try:
+            feat = self.doc.create_revolve(sid, angle_degrees=float(ang))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Revolve", str(exc))
+            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
+            return
+
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(feat.id)
+        self.statusBar().showMessage(
+            f"Created {feat.name} (angle={ang:g}°)", 3000
         )
 
     def _delete_selected(self) -> None:

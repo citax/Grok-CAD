@@ -16,6 +16,7 @@ from cadcore.mesh import (
     make_box,
     make_cylinder,
     make_sphere,
+    revolve_profile,
 )
 from cadcore.sketch import (
     CircleEntity,
@@ -33,6 +34,7 @@ class FeatureType(Enum):
     PLANE_RIGHT = auto()  # YZ
     SKETCH = auto()
     EXTRUDE = auto()  # pad closed sketch profile along plane normal
+    REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
     # Kernel primitives (not primary UI path)
     BOX = auto()
     SPHERE = auto()
@@ -49,6 +51,7 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.PLANE_RIGHT: "Right Plane",
         FeatureType.SKETCH: "Sketch",
         FeatureType.EXTRUDE: "Extrude",
+        FeatureType.REVOLVE: "Revolve",
         FeatureType.BOX: "Box",
         FeatureType.SPHERE: "Sphere",
         FeatureType.CYLINDER: "Cylinder",
@@ -171,6 +174,11 @@ class Feature:
     # Extrude (pad): operand_a = source sketch id, depth = distance,
     # profile_entity_id = closed entity (or -1 → first closed profile)
     profile_entity_id: int = -1
+    # Revolve: operand_a = sketch id, revolve_angle in degrees (default 360),
+    # axis in sketch UV (origin + direction); segments = angular resolution
+    revolve_angle: float = 360.0
+    axis_origin: Tuple[float, float] = (0.0, 0.0)
+    axis_direction: Tuple[float, float] = (0.0, 1.0)  # default: sketch V-axis
     visible: bool = True
     suppressed: bool = False
 
@@ -183,6 +191,7 @@ class Document:
     _next_id: int = 1
     _sketch_count: int = 0
     _extrude_count: int = 0
+    _revolve_count: int = 0
 
     def add_feature(self, f: Feature) -> int:
         f.id = self._next_id
@@ -217,6 +226,7 @@ class Document:
         self.name = "Untitled"
         self._sketch_count = 0
         self._extrude_count = 0
+        self._revolve_count = 0
 
     def seed_reference_planes(self) -> None:
         have = {f.type for f in self.features}
@@ -296,6 +306,64 @@ class Document:
         self.add_feature(f)
         return f
 
+    def create_revolve(
+        self,
+        sketch_id: int,
+        *,
+        angle_degrees: float = 360.0,
+        axis_origin: Tuple[float, float] = (0.0, 0.0),
+        axis_direction: Tuple[float, float] = (0.0, 1.0),
+        profile_entity_id: int = -1,
+        segments: int = 64,
+    ) -> Feature:
+        """Revolve a closed sketch profile about an in-plane axis.
+
+        Raises ValueError for missing sketch, open/degenerate/axis-crossing profiles,
+        or non-positive angle.
+        """
+        skf = self.find(sketch_id)
+        if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
+            raise ValueError("revolve requires a valid sketch feature")
+        sketch = skf.sketch
+        if profile_entity_id >= 0:
+            ent = sketch.find_entity(profile_entity_id)
+            if ent is None:
+                raise ValueError(f"sketch has no entity id={profile_entity_id}")
+        else:
+            ent = first_closed_profile(sketch)
+            if ent is None:
+                raise ValueError("sketch has no closed profile (rectangle or circle)")
+            profile_entity_id = ent.id
+        if not is_closed_profile(ent):
+            raise ValueError("profile is not a closed rectangle/circle (or is degenerate)")
+        ang = float(angle_degrees)
+        if not np.isfinite(ang) or ang <= 1e-12:
+            raise ValueError("revolve angle must be a positive finite number (degrees)")
+        ax_o = (float(axis_origin[0]), float(axis_origin[1]))
+        ax_d = (float(axis_direction[0]), float(axis_direction[1]))
+        # Validate by building once
+        _ = revolve_profile(
+            ent,
+            sketch.frame,
+            axis_origin=ax_o,
+            axis_direction=ax_d,
+            angle_degrees=ang,
+            segments=int(segments),
+        )
+        self._revolve_count += 1
+        f = Feature(
+            type=FeatureType.REVOLVE,
+            name=f"Revolve{self._revolve_count}",
+            segments=int(segments),
+            operand_a=sketch_id,
+            profile_entity_id=int(profile_entity_id),
+            revolve_angle=ang,
+            axis_origin=ax_o,
+            axis_direction=ax_d,
+        )
+        self.add_feature(f)
+        return f
+
     def evaluate_feature(self, fid: int) -> Optional[Mesh]:
         f = self.find(fid)
         if f is None or f.suppressed or is_reference_plane(f.type):
@@ -315,6 +383,25 @@ class Document:
                 return None
             mesh = extrude_profile(
                 ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+            )
+        elif f.type is FeatureType.REVOLVE:
+            skf = self.find(f.operand_a)
+            if skf is None or skf.sketch is None:
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                return None
+            mesh = revolve_profile(
+                ent,
+                sketch.frame,
+                axis_origin=f.axis_origin,
+                axis_direction=f.axis_direction,
+                angle_degrees=f.revolve_angle,
+                segments=max(3, int(f.segments)),
             )
         elif f.type is FeatureType.BOX:
             mesh = make_box(f.width, f.height, f.depth)

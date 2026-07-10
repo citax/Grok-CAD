@@ -11,6 +11,9 @@ from cadcore.mesh import (
     make_box,
     make_cylinder,
     make_sphere,
+    revolve_circle,
+    revolve_profile,
+    revolve_rectangle,
 )
 from cadcore.sketch import CircleEntity, LineEntity, PlaneFrame, RectEntity, Sketch
 
@@ -27,6 +30,9 @@ __all__ = [
     "extrude_profile",
     "extrude_rectangle",
     "extrude_circle",
+    "revolve_profile",
+    "revolve_rectangle",
+    "revolve_circle",
     "Sketch",
     "PlaneFrame",
     "LineEntity",
