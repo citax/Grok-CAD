@@ -38,7 +38,9 @@ from cadcore.document import (
     FeatureType,
     feature_type_name,
     first_closed_profile,
+    is_closed_profile,
     is_reference_plane,
+    resolve_profiles,
 )
 from cadcore.mesh import write_stl_binary
 
@@ -609,8 +611,39 @@ class MainWindow(QMainWindow):
             self.viewport.exit_sketch()
             self.sketch_tb.setVisible(False)
 
+        profile_entity_id = -1
         try:
-            feat = self.doc.create_extrude(sid, float(dist))
+            # Nested holes auto-resolved; disjoint profiles raise → picker
+            resolve_profiles(skf.sketch)
+        except ValueError as exc:
+            if "ambiguous" not in str(exc).lower():
+                QMessageBox.warning(self, "Extrude", str(exc))
+                self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
+                return
+            # Profile picker for disjoint closed profiles
+            closed = [e for e in skf.sketch.entities if is_closed_profile(e)]
+            labels = []
+            for e in closed:
+                kind = type(e).__name__.replace("Entity", "")
+                labels.append(f"{kind} id={e.id}")
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Select Profile",
+                "Multiple disjoint closed profiles found.\n"
+                "Select which profile to extrude:",
+                labels,
+                0,
+                False,
+            )
+            if not ok or not choice:
+                return
+            idx = labels.index(choice)
+            profile_entity_id = closed[idx].id
+
+        try:
+            feat = self.doc.create_extrude(
+                sid, float(dist), profile_entity_id=profile_entity_id
+            )
         except ValueError as exc:
             QMessageBox.warning(self, "Extrude", str(exc))
             self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)

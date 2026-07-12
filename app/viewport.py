@@ -84,15 +84,21 @@ def _mesh_to_polydata(vertices: np.ndarray, faces: np.ndarray) -> pv.PolyData:
     return pv.PolyData(vertices, face_arr)
 
 
+# Nudge sketch entity geometry toward the camera (plane normal) so it wins
+# z-order against coplanar grid/axes without fighting depth buffer noise.
+_SKETCH_DEPTH_BIAS = 0.012
+
+
 def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
     fr = sketch.frame
+    bias = np.asarray(fr.normal, dtype=np.float64) * _SKETCH_DEPTH_BIAS
     if isinstance(ent, LineEntity):
-        p0 = fr.to_world(ent.p0)
-        p1 = fr.to_world(ent.p1)
+        p0 = fr.to_world(ent.p0) + bias
+        p1 = fr.to_world(ent.p1) + bias
         return pv.Line(p0, p1)
     if isinstance(ent, RectEntity):
         cs = ent.corners()
-        pts = np.array([fr.to_world(c) for c in cs + [cs[0]]], float)
+        pts = np.array([fr.to_world(c) + bias for c in cs + [cs[0]]], float)
         return pv.lines_from_points(pts, close=False)
     if isinstance(ent, CircleEntity):
         # polyline circle in plane
@@ -104,9 +110,22 @@ def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
                 ent.center[0] + ent.radius * np.cos(a),
                 ent.center[1] + ent.radius * np.sin(a),
             )
-            pts.append(fr.to_world(uv))
+            pts.append(fr.to_world(uv) + bias)
         return pv.lines_from_points(np.array(pts, float), close=False)
     return pv.PolyData()
+
+
+def _entity_fingerprint(ent: SketchEntity, *, selected: bool = False) -> str:
+    """Geometry + style key for incremental actor upserts."""
+    if isinstance(ent, LineEntity):
+        g = f"L:{ent.p0[0]:.6g},{ent.p0[1]:.6g},{ent.p1[0]:.6g},{ent.p1[1]:.6g}"
+    elif isinstance(ent, RectEntity):
+        g = f"R:{ent.c0[0]:.6g},{ent.c0[1]:.6g},{ent.c1[0]:.6g},{ent.c1[1]:.6g}"
+    elif isinstance(ent, CircleEntity):
+        g = f"C:{ent.center[0]:.6g},{ent.center[1]:.6g},{ent.radius:.6g}"
+    else:
+        g = f"?{ent.id}"
+    return f"{g}|sel={int(selected)}"
 
 
 class _InteractorFilter(QObject):
@@ -168,6 +187,9 @@ class Viewport(QWidget):
         self._sketch_feature_id = -1
         self._sketch_ctrl: Optional[SketchController] = None
         self._sketch_entity_actors: Set[int] = set()
+        # Incremental actor caches: name → fingerprint (skip unchanged)
+        self._sketch_entity_fps: Dict[int, str] = {}
+        self._closed_sketch_fps: Dict[str, str] = {}
         self._filter: Optional[_InteractorFilter] = None
 
         self._rebuild_timer = QTimer(self)
@@ -175,6 +197,7 @@ class Viewport(QWidget):
         self._rebuild_timer.setInterval(40)
         self._rebuild_timer.timeout.connect(self._start_rebuild_job)
 
+        # Render-on-demand coalesce (throttle full VTK renders)
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(16)
@@ -646,36 +669,88 @@ class Viewport(QWidget):
         for name in list(self._sketch_entity_actors):
             self._remove_actor(f"sk_e_{name}")
         self._sketch_entity_actors.clear()
+        self._sketch_entity_fps.clear()
         for n in ("__sk_grid", "__sk_h", "__sk_v", "__sk_preview", "__sk_handles", "__sk_infer"):
             self._remove_actor(n)
 
+    def _apply_sketch_actor_priority(self, name: str) -> None:
+        """Ensure sketch entity lines draw above coplanar grid/axes."""
+        if not self.plotter or name not in self.plotter.actors:
+            return
+        try:
+            actor = self.plotter.actors[name]
+            mapper = actor.GetMapper()
+            if mapper is not None:
+                # Prefer entity fragments over coincident axis/grid lines
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                try:
+                    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-4, -4)
+                except Exception:
+                    pass
+            prop = actor.GetProperty()
+            prop.SetLineWidth(max(prop.GetLineWidth(), 2.5))
+        except Exception:
+            pass
+
     def refresh_sketches(self) -> None:
-        """Redraw all closed sketches in 3D (when not editing)."""
+        """Incremental redraw of closed sketches in 3D (when not editing)."""
         if not self.plotter or self._doc is None:
             return
-        # Remove old sketch actors
-        for name in list(self.plotter.actors.keys()):
-            if name.startswith("sk_closed_"):
-                self._remove_actor(name)
         if self.in_sketch_mode:
             return
+        wanted: Dict[str, Tuple[object, str]] = {}  # name -> (ent, fp)  # type: ignore
         for f in self._doc.features:
             if f.type is not FeatureType.SKETCH or f.sketch is None or not f.visible:
                 continue
             for ent in f.sketch.entities:
-                pdata = _entity_polydata(ent, f.sketch)
-                self.plotter.add_mesh(
-                    pdata, color=SKETCH_COLOR, line_width=2,
-                    name=f"sk_closed_{f.id}_{ent.id}", pickable=False, render=False,
-                )
-        self._request_render()
+                name = f"sk_closed_{f.id}_{ent.id}"
+                fp = _entity_fingerprint(ent, selected=False)
+                wanted[name] = (ent, fp)
+        # Remove stale
+        for name in list(self._closed_sketch_fps.keys()):
+            if name not in wanted:
+                self._remove_actor(name)
+                self._closed_sketch_fps.pop(name, None)
+        # Upsert changed only
+        dirty = False
+        for name, (ent, fp) in wanted.items():
+            if self._closed_sketch_fps.get(name) == fp and name in self.plotter.actors:
+                continue
+            self._remove_actor(name)
+            # find parent sketch
+            sk = None
+            for f in self._doc.features:
+                if f.type is FeatureType.SKETCH and f.sketch is not None:
+                    if any(e.id == ent.id for e in f.sketch.entities):
+                        sk = f.sketch
+                        break
+            if sk is None:
+                continue
+            pdata = _entity_polydata(ent, sk)
+            self.plotter.add_mesh(
+                pdata,
+                color=SKETCH_COLOR,
+                line_width=2.5,
+                name=name,
+                pickable=False,
+                render=False,
+            )
+            self._apply_sketch_actor_priority(name)
+            self._closed_sketch_fps[name] = fp
+            dirty = True
+        if dirty:
+            self._request_render()
 
     def _rebuild_all_sketch_entities(self) -> None:
+        """Incremental: upsert changed entities, drop removed ones."""
         if self._sketch_ctrl is None:
             return
+        present = {e.id: e for e in self._sketch_ctrl.sketch.entities}
         for eid in list(self._sketch_entity_actors):
-            self._remove_actor(f"sk_e_{eid}")
-        self._sketch_entity_actors.clear()
+            if eid not in present:
+                self._remove_actor(f"sk_e_{eid}")
+                self._sketch_entity_actors.discard(eid)
+                self._sketch_entity_fps.pop(eid, None)
         for ent in self._sketch_ctrl.sketch.entities:
             self._upsert_entity_actor(ent)
         self._update_handles_visual()
@@ -684,13 +759,19 @@ class Viewport(QWidget):
         if not self.plotter or self._sketch_ctrl is None:
             return
         name = f"sk_e_{ent.id}"
+        selected = ent.id == self._sketch_ctrl.selected_entity_id
+        fp = _entity_fingerprint(ent, selected=selected)
+        if self._sketch_entity_fps.get(ent.id) == fp and name in self.plotter.actors:
+            return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
         pdata = _entity_polydata(ent, self._sketch_ctrl.sketch)
-        col = SKETCH_PREVIEW if ent.id == self._sketch_ctrl.selected_entity_id else SKETCH_COLOR
+        col = SKETCH_PREVIEW if selected else SKETCH_COLOR
         self.plotter.add_mesh(
-            pdata, color=col, line_width=2.5, name=name, pickable=False, render=False
+            pdata, color=col, line_width=2.8, name=name, pickable=False, render=False
         )
+        self._apply_sketch_actor_priority(name)
         self._sketch_entity_actors.add(ent.id)
+        self._sketch_entity_fps[ent.id] = fp
 
     def _clear_preview(self) -> None:
         self._remove_actor("__sk_preview")

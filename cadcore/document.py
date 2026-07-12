@@ -105,6 +105,118 @@ def first_closed_profile(sketch: Sketch) -> Optional[SketchEntity]:
     return None
 
 
+def _point_in_rect(uv: Tuple[float, float], rect: RectEntity, *, margin: float = 0.0) -> bool:
+    u0, u1 = sorted([rect.c0[0], rect.c1[0]])
+    v0, v1 = sorted([rect.c0[1], rect.c1[1]])
+    return (u0 + margin <= uv[0] <= u1 - margin) and (v0 + margin <= uv[1] <= v1 - margin)
+
+
+def _profile_contains(outer: SketchEntity, inner: SketchEntity) -> bool:
+    """True if ``inner`` is strictly inside ``outer`` (both closed profiles)."""
+    if not is_closed_profile(outer) or not is_closed_profile(inner):
+        return False
+    if outer is inner or outer.id == inner.id:
+        return False
+    # Rectangle outer
+    if isinstance(outer, RectEntity):
+        if isinstance(inner, CircleEntity):
+            # circle disk strictly inside rectangle
+            return (
+                _point_in_rect(inner.center, outer, margin=inner.radius + 1e-9)
+            )
+        if isinstance(inner, RectEntity):
+            for c in inner.corners():
+                if not _point_in_rect(c, outer, margin=1e-9):
+                    return False
+            return True
+    # Circle outer
+    if isinstance(outer, CircleEntity):
+        if isinstance(inner, CircleEntity):
+            d = float(
+                np.hypot(
+                    inner.center[0] - outer.center[0],
+                    inner.center[1] - outer.center[1],
+                )
+            )
+            return d + inner.radius < outer.radius - 1e-9
+        if isinstance(inner, RectEntity):
+            for c in inner.corners():
+                d = float(
+                    np.hypot(c[0] - outer.center[0], c[1] - outer.center[1])
+                )
+                if d >= outer.radius - 1e-9:
+                    return False
+            return True
+    return False
+
+
+@dataclass
+class ResolvedProfiles:
+    """Outer boundary + optional hole loops for extrude/pad."""
+
+    outer: SketchEntity
+    holes: List[SketchEntity] = field(default_factory=list)
+
+
+def resolve_profiles(
+    sketch: Sketch,
+    *,
+    preferred_outer_id: int = -1,
+) -> ResolvedProfiles:
+    """Resolve closed sketch entities into an outer boundary + hole loops.
+
+    - Single closed profile → outer only (backward compatible).
+    - Nested (outer contains others) → outer + inners as holes.
+    - Disjoint closed profiles (none contains the others) → ValueError
+      (ambiguous; GUI should offer a picker).
+    """
+    closed = [e for e in sketch.entities if is_closed_profile(e)]
+    if not closed:
+        raise ValueError("sketch has no closed profile (rectangle or circle)")
+    if len(closed) == 1:
+        return ResolvedProfiles(outer=closed[0], holes=[])
+
+    # If user picked a specific outer, use it and treat contained profiles as holes
+    if preferred_outer_id >= 0:
+        outer = next((e for e in closed if e.id == preferred_outer_id), None)
+        if outer is None:
+            raise ValueError(f"sketch has no closed profile id={preferred_outer_id}")
+        holes = [e for e in closed if e.id != outer.id and _profile_contains(outer, e)]
+        # Any other closed profile neither outer nor hole → still ambiguous
+        others = [
+            e
+            for e in closed
+            if e.id != outer.id and e not in holes and not _profile_contains(e, outer)
+        ]
+        if others:
+            raise ValueError(
+                "ambiguous profiles: multiple disjoint closed profiles; "
+                "select which profile to extrude"
+            )
+        return ResolvedProfiles(outer=outer, holes=holes)
+
+    # Find roots: not contained by any other closed profile
+    roots: List[SketchEntity] = []
+    for e in closed:
+        if any(_profile_contains(o, e) for o in closed if o.id != e.id):
+            continue
+        roots.append(e)
+
+    if len(roots) == 0:
+        # Shouldn't happen (cycle); fall back to first
+        return ResolvedProfiles(outer=closed[0], holes=[])
+
+    if len(roots) > 1:
+        raise ValueError(
+            "ambiguous profiles: multiple disjoint closed profiles; "
+            "select which profile to extrude"
+        )
+
+    outer = roots[0]
+    holes = [e for e in closed if e.id != outer.id and _profile_contains(outer, e)]
+    return ResolvedProfiles(outer=outer, holes=holes)
+
+
 def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
     """Deep copy of a sketch (safe for worker threads)."""
     if sk is None:
@@ -291,22 +403,23 @@ class Document:
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
             raise ValueError("extrude requires a valid sketch feature")
         sketch = skf.sketch
-        if profile_entity_id >= 0:
-            ent = sketch.find_entity(profile_entity_id)
-            if ent is None:
-                raise ValueError(f"sketch has no entity id={profile_entity_id}")
-        else:
-            ent = first_closed_profile(sketch)
-            if ent is None:
-                raise ValueError("sketch has no closed profile (rectangle or circle)")
-            profile_entity_id = ent.id
+        # Resolve outer + nested holes (or raise if ambiguous disjoint profiles)
+        resolved = resolve_profiles(sketch, preferred_outer_id=profile_entity_id)
+        ent = resolved.outer
+        profile_entity_id = ent.id
         if not is_closed_profile(ent):
             raise ValueError("profile is not a closed rectangle/circle (or is degenerate)")
         dist = float(distance)
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
-        # Validate by building once (also catches open types)
-        _ = extrude_profile(ent, dist, sketch.frame, segments=int(segments))
+        # Validate by building once (also catches open types / holes)
+        _ = extrude_profile(
+            ent,
+            dist,
+            sketch.frame,
+            segments=int(segments),
+            holes=resolved.holes,
+        )
         self._extrude_count += 1
         f = Feature(
             type=FeatureType.EXTRUDE,
@@ -504,14 +617,18 @@ class Document:
             if skf is None or skf.sketch is None:
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
-            else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
                 return None
             mesh = extrude_profile(
-                ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+                resolved.outer,
+                f.depth,
+                sketch.frame,
+                segments=max(3, int(f.segments)),
+                holes=resolved.holes,
             )
         elif f.type is FeatureType.FILLET:
             skf = self.find(f.operand_a)

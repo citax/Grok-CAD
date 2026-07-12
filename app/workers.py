@@ -15,6 +15,7 @@ from cadcore.document import (
     first_closed_profile,
     is_boolean,
     is_reference_plane,
+    resolve_profiles,
     sketch_fingerprint,
 )
 from cadcore.mesh import Mesh
@@ -123,15 +124,19 @@ def evaluate_solids_snapshot(
                 cache[fid] = None
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
-            else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
                 cache[fid] = None
                 return None
             mesh = extrude_profile(
-                ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+                resolved.outer,
+                f.depth,
+                sketch.frame,
+                segments=max(3, int(f.segments)),
+                holes=resolved.holes,
             )
         elif f.type is FeatureType.FILLET:
             skf = by_id.get(f.operand_a)

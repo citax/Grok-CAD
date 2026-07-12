@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -727,8 +727,12 @@ def extrude_profile(
     frame: "PlaneFrame",
     *,
     segments: int = 64,
+    holes: Optional[Sequence[Union["RectEntity", "CircleEntity", "SketchEntity"]]] = None,
 ) -> Mesh:
     """Extrude a closed sketch profile (Rectangle or Circle) into a watertight solid.
+
+    Optional ``holes`` are closed profiles nested inside the outer boundary; they
+    are subtracted via CrossSection difference before extrude (through-holes).
 
     Open entities (e.g. lines) and degenerate geometry are rejected with ValueError.
     """
@@ -736,15 +740,50 @@ def extrude_profile(
 
     if isinstance(profile, LineEntity) or getattr(profile, "kind", None) is EntityKind.LINE:
         raise ValueError("cannot extrude open profile: line is not a closed profile")
-    if isinstance(profile, RectEntity):
-        return extrude_rectangle(profile.c0, profile.c1, distance, frame)
-    if isinstance(profile, CircleEntity):
-        return extrude_circle(
-            profile.center, profile.radius, distance, frame, segments=segments
+
+    hole_list = list(holes) if holes else []
+    if not hole_list:
+        if isinstance(profile, RectEntity):
+            return extrude_rectangle(profile.c0, profile.c1, distance, frame)
+        if isinstance(profile, CircleEntity):
+            return extrude_circle(
+                profile.center, profile.radius, distance, frame, segments=segments
+            )
+        raise ValueError(
+            f"unsupported profile type for extrude: {type(profile).__name__}"
         )
-    raise ValueError(
-        f"unsupported profile type for extrude: {type(profile).__name__}"
-    )
+
+    # Nested holes: outer CS minus each hole CS, then extrude
+    if Manifold is None or CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    segs = max(3, int(segments))
+    cs = _profile_to_cross_section(profile, circle_segments=segs)
+    for h in hole_list:
+        if isinstance(h, LineEntity) or getattr(h, "kind", None) is EntityKind.LINE:
+            raise ValueError("cannot use open profile as a hole")
+        if isinstance(h, CircleEntity):
+            hole_cs = CrossSection.circle(float(h.radius), segs)
+            cx, cy = float(h.center[0]), float(h.center[1])
+            if abs(cx) > 1e-15 or abs(cy) > 1e-15:
+                hole_cs = hole_cs.translate([cx, cy])
+        elif isinstance(h, RectEntity):
+            hole_cs = _cross_section_from_polygon(_rect_polygon_uv(h.c0, h.c1))
+        else:
+            hole_cs = _profile_to_cross_section(h, circle_segments=segs)
+        cs = cs - hole_cs
+    if cs.is_empty() or abs(float(cs.area())) <= 1e-14:
+        raise ValueError("extrude profile with holes produced empty cross-section")
+    man = Manifold.extrude(cs, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(f"manifold extrude failed: {man.status()}")
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("extrude result is not watertight")
+    return mesh
 
 
 def _normalize_axis_2d(
