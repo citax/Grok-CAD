@@ -84,14 +84,20 @@ def _mesh_to_polydata(vertices: np.ndarray, faces: np.ndarray) -> pv.PolyData:
     return pv.PolyData(vertices, face_arr)
 
 
-# Nudge sketch entity geometry toward the camera (plane normal) so it wins
-# z-order against coplanar grid/axes without fighting depth buffer noise.
-_SKETCH_DEPTH_BIAS = 0.012
+# Sketch-mode depth separation (plane normal, toward camera for entities).
+# Must be large under software-GL (llvmpipe) + parallel projection depth precision.
+# Axes/grid are pushed the opposite way for a total 2× separation.
+_SKETCH_DEPTH_BIAS = 0.35
+
+
+def _plane_bias(frame, *, toward_camera: bool = True) -> np.ndarray:
+    n = np.asarray(frame.normal, dtype=np.float64)
+    return n * (_SKETCH_DEPTH_BIAS if toward_camera else -_SKETCH_DEPTH_BIAS)
 
 
 def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
     fr = sketch.frame
-    bias = np.asarray(fr.normal, dtype=np.float64) * _SKETCH_DEPTH_BIAS
+    bias = _plane_bias(fr, toward_camera=True)
     if isinstance(ent, LineEntity):
         p0 = fr.to_world(ent.p0) + bias
         p1 = fr.to_world(ent.p1) + bias
@@ -113,6 +119,11 @@ def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
             pts.append(fr.to_world(uv) + bias)
         return pv.lines_from_points(np.array(pts, float), close=False)
     return pv.PolyData()
+
+
+def _flat_point_cloud(points: np.ndarray) -> pv.PolyData:
+    """Vertex-only PolyData for flat 2D point sprites (not spheres)."""
+    return pv.PolyData(np.asarray(points, dtype=np.float64).reshape(-1, 3))
 
 
 def _entity_fingerprint(ent: SketchEntity, *, selected: bool = False) -> str:
@@ -190,6 +201,8 @@ class Viewport(QWidget):
         # Incremental actor caches: name → fingerprint (skip unchanged)
         self._sketch_entity_fps: Dict[int, str] = {}
         self._closed_sketch_fps: Dict[str, str] = {}
+        self._sk_overlay = None  # optional 2nd-layer VTK renderer for sketch strokes
+        self._overlay_actors: Dict[str, object] = {}  # name → vtkActor on overlay layer
         self._filter: Optional[_InteractorFilter] = None
 
         self._rebuild_timer = QTimer(self)
@@ -281,9 +294,14 @@ class Viewport(QWidget):
             grid="back", location="outer", color=GRID_COLOR, font_size=9,
             xtitle="X", ytitle="Y", ztitle="Z",
         )
+        # Flat 2D origin dot (not a 3D sphere)
         self.plotter.add_mesh(
-            pv.Sphere(radius=0.07, center=(0, 0, 0), theta_resolution=8, phi_resolution=8),
-            color=TEXT_PRIMARY, name="__origin", pickable=False,
+            _flat_point_cloud(np.array([[0.0, 0.0, 0.0]])),
+            color=TEXT_PRIMARY,
+            point_size=12,
+            render_points_as_spheres=False,
+            name="__origin",
+            pickable=False,
         )
         for end, color, name in (
             ((2.4, 0, 0), AXIS_X, "__ax"),
@@ -471,6 +489,14 @@ class Viewport(QWidget):
     def _remove_actor(self, name: str) -> None:
         if not self.plotter:
             return
+        # Detach from sketch overlay first if present
+        if name in self._overlay_actors:
+            try:
+                if self._sk_overlay is not None:
+                    self._sk_overlay.RemoveActor(self._overlay_actors[name])
+            except Exception:
+                pass
+            self._overlay_actors.pop(name, None)
         try:
             self.plotter.remove_actor(name, render=False)
         except Exception:
@@ -503,6 +529,119 @@ class Viewport(QWidget):
                 prop.SetColor(*( (0.98, 0.75, 0.14) if selected else (0.60, 0.64, 0.68) ))
 
     # ----- sketch mode -----
+    def _set_parallel_projection(self, enabled: bool) -> None:
+        """Toggle orthographic (parallel) camera — true 2D sketch look."""
+        if not self.plotter:
+            return
+        try:
+            cam = self.plotter.camera
+            cam.SetParallelProjection(1 if enabled else 0)
+            if enabled:
+                # Scale so the sketch plane fills a comfortable orthographic window
+                cam.SetParallelScale(3.2)
+        except Exception:
+            try:
+                self.plotter.enable_parallel_projection() if enabled else self.plotter.disable_parallel_projection()
+            except Exception:
+                pass
+
+    def _ensure_sketch_overlay_layer(self) -> None:
+        """Layer-1 VTK renderer so sketch strokes always composite above scene."""
+        if self._sk_overlay is not None or not self.plotter:
+            return
+        try:
+            from vtkmodules.vtkRenderingCore import vtkRenderer
+
+            main = self.plotter.renderer
+            rw = self.plotter.render_window
+            ov = vtkRenderer()
+            ov.SetLayer(1)
+            ov.InteractiveOff()
+            ov.SetActiveCamera(main.GetActiveCamera())
+            # Transparent — only draw props we add (entities / preview / handles)
+            ov.SetBackground(0, 0, 0)
+            try:
+                ov.SetBackgroundAlpha(0.0)
+            except Exception:
+                pass
+            # Draw on top of layer 0 without wiping its color
+            try:
+                ov.PreserveColorBufferOn()
+            except Exception:
+                pass
+            try:
+                # Fresh depth so layer-1 lines aren't occluded by layer-0 planes
+                ov.PreserveDepthBufferOff()
+            except Exception:
+                pass
+            nlayers = 1
+            try:
+                nlayers = int(rw.GetNumberOfLayers())
+            except Exception:
+                pass
+            rw.SetNumberOfLayers(max(2, nlayers))
+            rw.AddRenderer(ov)
+            self._sk_overlay = ov
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] sketch overlay layer: {exc}", file=sys.stderr)
+            self._sk_overlay = None
+
+    def _teardown_sketch_overlay_layer(self) -> None:
+        if self._sk_overlay is None or not self.plotter:
+            self._overlay_actors.clear()
+            return
+        try:
+            rw = self.plotter.render_window
+            for name, act in list(self._overlay_actors.items()):
+                try:
+                    self._sk_overlay.RemoveActor(act)
+                except Exception:
+                    pass
+            self._overlay_actors.clear()
+            rw.RemoveRenderer(self._sk_overlay)
+        except Exception:
+            pass
+        self._sk_overlay = None
+
+    def _get_named_actor(self, name: str):
+        """Lookup actor on main plotter or sketch overlay layer."""
+        if self.plotter and name in getattr(self.plotter, "actors", {}):
+            return self.plotter.actors[name]
+        return self._overlay_actors.get(name)
+
+    def _add_overlay_mesh(self, pdata, **kwargs):
+        """add_mesh into the main plotter, then reparent actor onto sketch overlay."""
+        assert self.plotter is not None
+        name = kwargs.get("name", "")
+        self._ensure_sketch_overlay_layer()
+        # Remove prior overlay actor with same name
+        if name and name in self._overlay_actors:
+            try:
+                self._sk_overlay.RemoveActor(self._overlay_actors.pop(name))
+            except Exception:
+                self._overlay_actors.pop(name, None)
+        # Add via plotter (creates vtkActor), then move to layer-1 overlay
+        self.plotter.add_mesh(pdata, **kwargs)
+        if self._sk_overlay is None or not name:
+            return
+        try:
+            actor = self.plotter.actors.get(name)
+            if actor is None:
+                return
+            main = self.plotter.renderer
+            try:
+                main.RemoveActor(actor)
+            except Exception:
+                try:
+                    main.RemoveViewProp(actor)
+                except Exception:
+                    pass
+            self._sk_overlay.AddActor(actor)
+            # PyVista's actors dict only tracks the main renderer — keep our own map
+            self._overlay_actors[name] = actor
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] overlay reparent {name}: {exc}", file=sys.stderr)
+
     def enter_sketch(self, sketch_feature_id: int) -> None:
         if not self._ok or self._doc is None or self.plotter is None:
             return
@@ -514,16 +653,17 @@ class Viewport(QWidget):
         self._sketch_ctrl.set_tool(SketchTool.LINE)
         self.sketch_status.emit("Sketch: Line")
 
-        # Orient camera normal to plane
+        # Orient camera normal to plane + orthographic projection (flat 2D sketch)
         fr = f.sketch.frame
         dist = 10.0
         pos = fr.origin + fr.normal * dist
-        # View up along plane v_axis
         self.plotter.camera_position = [
             tuple(pos),
             tuple(fr.origin),
             tuple(fr.v_axis),
         ]
+        self._set_parallel_projection(True)
+        self._ensure_sketch_overlay_layer()
 
         self._install_sketch_filter()
         try:
@@ -544,8 +684,11 @@ class Viewport(QWidget):
             return
         self._remove_sketch_filter()
         self._clear_sketch_overlays()
+        self._teardown_sketch_overlay_layer()
         self._sketch_ctrl = None
         self._sketch_feature_id = -1
+        # Restore perspective for 3D solid viewing
+        self._set_parallel_projection(False)
         self._restyle_selection_only()
         self.refresh_sketches()
         self._request_render()
@@ -648,20 +791,28 @@ class Viewport(QWidget):
                 return pv.PolyData()
             return lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
 
+        # Push grid/axes slightly into the plane (away from camera) so entities win z-order
+        back = _plane_bias(fr, toward_camera=False)
+
+        def _shift_pts(pairs):
+            return [np.asarray(p, float) + back for p in pairs]
+
+        pts_u = _shift_pts(pts_u)
+        pts_v = _shift_pts(pts_v)
         grid = segs(pts_u).merge(segs(pts_v)) if pts_u else pv.PolyData()
         self._remove_actor("__sk_grid")
         self.plotter.add_mesh(
             grid, color=SKETCH_GRID, line_width=1, name="__sk_grid", pickable=False, render=False
         )
-        # H axis (u) and V axis (v) through origin
+        # H axis (u) and V axis (v) through origin — behind user sketch strokes
         self._remove_actor("__sk_h")
         self._remove_actor("__sk_v")
         self.plotter.add_mesh(
-            pv.Line(fr.to_world((-half, 0)), fr.to_world((half, 0))),
+            pv.Line(fr.to_world((-half, 0)) + back, fr.to_world((half, 0)) + back),
             color=SKETCH_H, line_width=2, name="__sk_h", pickable=False, render=False,
         )
         self.plotter.add_mesh(
-            pv.Line(fr.to_world((0, -half)), fr.to_world((0, half))),
+            pv.Line(fr.to_world((0, -half)) + back, fr.to_world((0, half)) + back),
             color=SKETCH_V, line_width=2, name="__sk_v", pickable=False, render=False,
         )
 
@@ -672,23 +823,35 @@ class Viewport(QWidget):
         self._sketch_entity_fps.clear()
         for n in ("__sk_grid", "__sk_h", "__sk_v", "__sk_preview", "__sk_handles", "__sk_infer"):
             self._remove_actor(n)
+        # Drop any leftover overlay props
+        for n in list(self._overlay_actors.keys()):
+            self._remove_actor(n)
 
     def _apply_sketch_actor_priority(self, name: str) -> None:
-        """Ensure sketch entity lines draw above coplanar grid/axes."""
-        if not self.plotter or name not in self.plotter.actors:
+        """Ensure sketch entity lines draw above grid/axes in the real viewport."""
+        if not self.plotter:
+            return
+        actor = self._get_named_actor(name)
+        if actor is None:
             return
         try:
-            actor = self.plotter.actors[name]
             mapper = actor.GetMapper()
             if mapper is not None:
-                # Prefer entity fragments over coincident axis/grid lines
                 mapper.SetResolveCoincidentTopologyToPolygonOffset()
                 try:
-                    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-4, -4)
+                    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-200000, -200)
                 except Exception:
-                    pass
+                    try:
+                        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-4, -4)
+                    except Exception:
+                        pass
             prop = actor.GetProperty()
-            prop.SetLineWidth(max(prop.GetLineWidth(), 2.5))
+            prop.SetLineWidth(max(prop.GetLineWidth(), 2.8))
+            prop.SetLighting(False)
+            try:
+                actor.ForceOpaqueOn()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -761,13 +924,15 @@ class Viewport(QWidget):
         name = f"sk_e_{ent.id}"
         selected = ent.id == self._sketch_ctrl.selected_entity_id
         fp = _entity_fingerprint(ent, selected=selected)
-        if self._sketch_entity_fps.get(ent.id) == fp and name in self.plotter.actors:
+        if self._sketch_entity_fps.get(ent.id) == fp and (
+            name in self.plotter.actors or name in self._overlay_actors
+        ):
             return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
         pdata = _entity_polydata(ent, self._sketch_ctrl.sketch)
         col = SKETCH_PREVIEW if selected else SKETCH_COLOR
-        self.plotter.add_mesh(
-            pdata, color=col, line_width=2.8, name=name, pickable=False, render=False
+        self._add_overlay_mesh(
+            pdata, color=col, line_width=3.0, name=name, pickable=False, render=False
         )
         self._apply_sketch_actor_priority(name)
         self._sketch_entity_actors.add(ent.id)
@@ -785,24 +950,27 @@ class Viewport(QWidget):
             return
         self._clear_handles()
         ctrl = self._sketch_ctrl
+        fr = ctrl.sketch.frame
+        bias = _plane_bias(fr, toward_camera=True)
         pts = []
-        colors = []
         for h in ctrl.sketch.all_handles():
             if ctrl.selected_entity_id >= 0 and h.entity_id != ctrl.selected_entity_id:
                 if ctrl.hover_handle is None or ctrl.hover_handle.entity_id != h.entity_id:
                     continue
-            w = ctrl.sketch.frame.to_world(h.uv)
+            w = fr.to_world(h.uv) + bias
             pts.append(w)
-            hover = ctrl.hover_handle and ctrl.hover_handle.entity_id == h.entity_id and ctrl.hover_handle.name == h.name
-            colors.append(HANDLE_HOVER if hover else HANDLE_COLOR)
         if not pts:
             return
-        cloud = pv.PolyData(np.array(pts, float))
-        # Single color for simplicity (hover recolor next pass)
+        # Flat 2D dots — never spheres (on overlay layer)
         col = HANDLE_HOVER if ctrl.hover_handle else HANDLE_COLOR
-        self.plotter.add_mesh(
-            cloud, color=col, point_size=14 if ctrl.hover_handle else 10,
-            render_points_as_spheres=True, name="__sk_handles", pickable=False, render=False,
+        self._add_overlay_mesh(
+            _flat_point_cloud(np.array(pts, float)),
+            color=col,
+            point_size=14 if ctrl.hover_handle else 10,
+            render_points_as_spheres=False,
+            name="__sk_handles",
+            pickable=False,
+            render=False,
         )
 
     def _update_preview_visual(self) -> None:
@@ -816,10 +984,12 @@ class Viewport(QWidget):
         if ctrl.draw is None or not ctrl.draw.points:
             return
         fr = ctrl.sketch.frame
+        bias = _plane_bias(fr, toward_camera=True)
         p0 = ctrl.draw.points[0]
         p1 = ctrl.preview_uv
         if ctrl.tool is SketchTool.LINE:
-            pdata = pv.Line(fr.to_world(p0), fr.to_world(p1))
+            # Same depth bias as committed entities so preview wins over axes
+            pdata = pv.Line(fr.to_world(p0) + bias, fr.to_world(p1) + bias)
         elif ctrl.tool is SketchTool.RECTANGLE:
             from cadcore.sketch import EntityKind
             r = RectEntity(id=-1, kind=EntityKind.RECTANGLE, c0=p0, c1=p1)
@@ -829,16 +999,26 @@ class Viewport(QWidget):
             rad = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
             c = CircleEntity(id=-1, kind=EntityKind.CIRCLE, center=p0, radius=max(rad, 1e-6))
             pdata = _entity_polydata(c, ctrl.sketch)
-        self.plotter.add_mesh(
-            pdata, color=SKETCH_PREVIEW, line_width=2, name="__sk_preview",
-            pickable=False, render=False,
+        self._add_overlay_mesh(
+            pdata,
+            color=SKETCH_PREVIEW,
+            line_width=3.0,
+            name="__sk_preview",
+            pickable=False,
+            render=False,
         )
-        # Inference cue
+        self._apply_sketch_actor_priority("__sk_preview")
+        # Inference cue — flat 2D dot, not a sphere
         if ctrl.last_snap.kind in ("h", "v", "origin", "point"):
-            w = fr.to_world(ctrl.preview_uv)
-            self.plotter.add_mesh(
-                pv.Sphere(radius=0.05, center=w, theta_resolution=6, phi_resolution=6),
-                color=ACCENT, name="__sk_infer", pickable=False, render=False,
+            w = fr.to_world(ctrl.preview_uv) + bias
+            self._add_overlay_mesh(
+                _flat_point_cloud(np.array([w], float)),
+                color=ACCENT,
+                point_size=12,
+                render_points_as_spheres=False,
+                name="__sk_infer",
+                pickable=False,
+                render=False,
             )
 
     def _update_cursor(self) -> None:
@@ -1033,11 +1213,3 @@ class Viewport(QWidget):
     def _do_render(self) -> None:
         if self.plotter:
             self.plotter.render()
-
-    def _remove_actor(self, name: str) -> None:
-        if not self.plotter:
-            return
-        try:
-            self.plotter.remove_actor(name, render=False)
-        except Exception:
-            pass
