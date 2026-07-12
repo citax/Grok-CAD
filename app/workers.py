@@ -41,7 +41,12 @@ def feature_fingerprint(f: Feature) -> str:
         str(int(f.visible)),
         str(int(f.suppressed)),
     ]
-    if f.type in (FeatureType.EXTRUDE, FeatureType.REVOLVE, FeatureType.SKETCH):
+    if f.type in (
+        FeatureType.EXTRUDE,
+        FeatureType.REVOLVE,
+        FeatureType.FILLET,
+        FeatureType.SKETCH,
+    ):
         parts.append(sketch_fingerprint(f.sketch))
     return "|".join(parts)
 
@@ -98,6 +103,7 @@ def evaluate_solids_snapshot(
         from cadcore.mesh import (
             BooleanOp,
             boolean_op,
+            extrude_filleted_profile,
             extrude_profile,
             make_box,
             make_cylinder,
@@ -121,6 +127,26 @@ def evaluate_solids_snapshot(
                 return None
             mesh = extrude_profile(
                 ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+            )
+        elif f.type is FeatureType.FILLET:
+            skf = by_id.get(f.operand_a)
+            if skf is None or skf.sketch is None:
+                cache[fid] = None
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                cache[fid] = None
+                return None
+            mesh = extrude_filleted_profile(
+                ent,
+                f.depth,
+                sketch.frame,
+                f.radius,
+                segments=max(3, int(f.segments)),
             )
         elif f.type is FeatureType.REVOLVE:
             skf = by_id.get(f.operand_a)
@@ -185,7 +211,7 @@ def evaluate_solids_snapshot(
             continue
         # For sketch-based solids, include source sketch geometry in the fingerprint
         fp_feature = f
-        if f.type in (FeatureType.EXTRUDE, FeatureType.REVOLVE):
+        if f.type in (FeatureType.EXTRUDE, FeatureType.REVOLVE, FeatureType.FILLET):
             skf = by_id.get(f.operand_a)
             if skf is not None and skf.sketch is not None:
                 # temporary view with sketch attached for fingerprint only

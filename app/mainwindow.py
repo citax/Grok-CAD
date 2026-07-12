@@ -233,6 +233,10 @@ class MainWindow(QMainWindow):
         act_rev.setShortcut(QKeySequence("R"))
         act_rev.triggered.connect(self._revolve)
         insert_m.addAction(act_rev)
+        act_fil = QAction(fa_icon("fa5s.circle-notch", color=ACCENT), "Fillet…", self)
+        act_fil.setShortcut(QKeySequence("F"))
+        act_fil.triggered.connect(self._fillet)
+        insert_m.addAction(act_fil)
 
     def _build_toolbar(self) -> None:
         views = QToolBar("Views")
@@ -288,6 +292,16 @@ class MainWindow(QMainWindow):
         self.act_revolve.setShortcut(QKeySequence("R"))
         self.act_revolve.triggered.connect(self._revolve)
         main.addAction(self.act_revolve)
+
+        self.act_fillet = QAction(
+            fa_icon("fa5s.circle-notch", color=ACCENT), "Fillet", self
+        )
+        self.act_fillet.setToolTip(
+            "Fillet closed profile corners, then extrude into a solid (F)"
+        )
+        self.act_fillet.setShortcut(QKeySequence("F"))
+        self.act_fillet.triggered.connect(self._fillet)
+        main.addAction(self.act_fillet)
 
     def _build_sketch_toolbar(self) -> None:
         self.sketch_tb = QToolBar("Sketch")
@@ -354,6 +368,8 @@ class MainWindow(QMainWindow):
             return fa_icon("fa5s.cube", color=ACCENT)
         if ftype is FeatureType.REVOLVE:
             return fa_icon("fa5s.sync-alt", color=ACCENT)
+        if ftype is FeatureType.FILLET:
+            return fa_icon("fa5s.circle-notch", color=ACCENT)
         return fa_icon("fa5s.cube", color=TEXT_SECONDARY)
 
     def _refresh_tree(self) -> None:
@@ -411,6 +427,10 @@ class MainWindow(QMainWindow):
             self.prop_detail.setText(f"Distance = {f.depth:g}")
         elif f.type is FeatureType.REVOLVE:
             self.prop_detail.setText(f"Angle = {f.revolve_angle:g}°")
+        elif f.type is FeatureType.FILLET:
+            self.prop_detail.setText(
+                f"r={f.radius:g}, segs={f.segments}, dist={f.depth:g}"
+            )
         elif f.type is FeatureType.SKETCH and f.sketch is not None:
             n = len(f.sketch.entities)
             self.prop_detail.setText(f"{n} entit{'y' if n == 1 else 'ies'}")
@@ -637,6 +657,83 @@ class MainWindow(QMainWindow):
         self._sync_selection(feat.id)
         self.statusBar().showMessage(
             f"Created {feat.name} (angle={ang:g}°)", 3000
+        )
+
+    def _fillet(self) -> None:
+        """Fillet closed profile corners, then extrude via dialogs + rebuild worker."""
+        sid = self._resolve_closed_sketch_id()
+        skf = self.doc.find(sid) if sid >= 0 else None
+        if skf is None or skf.sketch is None:
+            QMessageBox.information(
+                self,
+                "Fillet",
+                "Create or select a sketch with a closed rectangle or circle first.",
+            )
+            self.statusBar().showMessage("Fillet needs a closed sketch profile", 4000)
+            return
+        if first_closed_profile(skf.sketch) is None:
+            QMessageBox.information(
+                self,
+                "Fillet",
+                "The sketch has no closed profile.\n"
+                "Draw a rectangle or circle, then Fillet.",
+            )
+            self.statusBar().showMessage("No closed profile to fillet", 4000)
+            return
+
+        radius, ok = QInputDialog.getDouble(
+            self,
+            "Fillet",
+            "Corner radius:",
+            0.25,
+            1e-6,
+            1e6,
+            4,
+        )
+        if not ok:
+            return
+        dist, ok = QInputDialog.getDouble(
+            self,
+            "Fillet",
+            "Extrude distance:",
+            1.0,
+            1e-6,
+            1e6,
+            4,
+        )
+        if not ok:
+            return
+        segs, ok = QInputDialog.getInt(
+            self,
+            "Fillet",
+            "Arc segments:",
+            32,
+            3,
+            512,
+        )
+        if not ok:
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self.sketch_tb.setVisible(False)
+
+        try:
+            feat = self.doc.create_fillet(
+                sid, float(dist), float(radius), segments=int(segs)
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Fillet", str(exc))
+            self.statusBar().showMessage(f"Fillet failed: {exc}", 4000)
+            return
+
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(feat.id)
+        self.statusBar().showMessage(
+            f"Created {feat.name} (r={radius:g}, segs={segs}, dist={dist:g})",
+            3000,
         )
 
     def _export_stl(self) -> None:

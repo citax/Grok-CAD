@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Sequence, Tuple, Union
 import numpy as np
 
 try:
-    from manifold3d import CrossSection, Manifold, Mesh as ManifoldMesh
+    from manifold3d import CrossSection, JoinType, Manifold, Mesh as ManifoldMesh
 except ImportError:  # pragma: no cover
     CrossSection = None  # type: ignore
+    JoinType = None  # type: ignore
     Manifold = None  # type: ignore
     ManifoldMesh = None  # type: ignore
 
@@ -331,6 +332,147 @@ def _cross_section_from_polygon(poly: Sequence[Tuple[float, float]]) -> "CrossSe
     if cs.is_empty() or abs(float(cs.area())) <= 1e-14:
         raise ValueError("degenerate profile: empty or zero-area cross-section")
     return cs
+
+
+def _profile_to_cross_section(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    *,
+    circle_segments: int = 64,
+) -> "CrossSection":
+    """Build a CrossSection from a closed sketch entity or UV polygon."""
+    from cadcore.sketch import CircleEntity, EntityKind, LineEntity, RectEntity
+
+    if isinstance(profile, (list, tuple)) and profile and not hasattr(profile, "kind"):
+        # Sequence of UV points
+        pts = profile  # type: ignore[assignment]
+        if len(pts) < 3:
+            raise ValueError("open profile: polygon must have at least 3 vertices")
+        return _cross_section_from_polygon(pts)  # type: ignore[arg-type]
+
+    if isinstance(profile, LineEntity) or getattr(profile, "kind", None) is EntityKind.LINE:
+        raise ValueError("open profile: line is not a closed profile")
+    if isinstance(profile, RectEntity):
+        return _cross_section_from_polygon(_rect_polygon_uv(profile.c0, profile.c1))
+    if isinstance(profile, CircleEntity):
+        if CrossSection is None:
+            raise RuntimeError("manifold3d is not installed")
+        r = float(profile.radius)
+        if r <= 1e-12:
+            raise ValueError("degenerate circle: radius must be positive")
+        segs = max(3, int(circle_segments))
+        cs = CrossSection.circle(r, segs)
+        cx, cy = float(profile.center[0]), float(profile.center[1])
+        if abs(cx) > 1e-15 or abs(cy) > 1e-15:
+            cs = cs.translate([cx, cy])
+        if cs.is_empty() or abs(float(cs.area())) <= 1e-14:
+            raise ValueError("degenerate circle: empty cross-section")
+        return cs
+    raise ValueError(f"unsupported profile type for fillet: {type(profile).__name__}")
+
+
+def _min_edge_length_uv(poly: Sequence[Tuple[float, float]]) -> float:
+    n = len(poly)
+    if n < 2:
+        return 0.0
+    m = float("inf")
+    for i in range(n):
+        x0, y0 = float(poly[i][0]), float(poly[i][1])
+        x1, y1 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
+        m = min(m, float(np.hypot(x1 - x0, y1 - y0)))
+    return m if np.isfinite(m) else 0.0
+
+
+def fillet_profile(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    radius: float,
+    segments: int = 32,
+) -> "CrossSection":
+    """Round every convex corner of a closed 2D profile by ``radius``.
+
+    Uses manifold3d ``CrossSection.offset`` with ``JoinType.Round``: shrink by
+    ``r`` then expand by ``r`` (dual offset). This is the dual-offset fillet
+    (inset then outset); it preserves winding and reduces area by the missing
+    corner sectors ``(4-π)r²`` on a square.
+
+    Returns a manifold3d ``CrossSection`` ready for extrude/revolve.
+    """
+    if CrossSection is None or JoinType is None:
+        raise RuntimeError("manifold3d is not installed")
+    r = float(radius)
+    if not np.isfinite(r) or r <= 1e-12:
+        raise ValueError("fillet radius must be positive (radius <= 0 is invalid)")
+    segs = max(3, int(segments))
+    # Floor arc tessellation so coarse segs still stay within ~1% area on large fillets
+    arc_segs = max(16, segs)
+
+    cs = _profile_to_cross_section(profile, circle_segments=max(arc_segs, 32))
+    area0 = float(cs.area())
+    if area0 <= 1e-14:
+        raise ValueError("degenerate profile: empty or zero-area cross-section")
+
+    # Pre-check for rectangles: r must be < half min side
+    from cadcore.sketch import RectEntity
+
+    if isinstance(profile, RectEntity):
+        u0, u1 = sorted([profile.c0[0], profile.c1[0]])
+        v0, v1 = sorted([profile.c0[1], profile.c1[1]])
+        half_min = 0.5 * min(u1 - u0, v1 - v0)
+        if r >= half_min - 1e-12:
+            raise ValueError(
+                "fillet radius too large for the profile (self-intersection)"
+            )
+    elif isinstance(profile, (list, tuple)) and profile and not hasattr(profile, "kind"):
+        min_e = _min_edge_length_uv(profile)  # type: ignore[arg-type]
+        if min_e > 0 and r >= 0.5 * min_e - 1e-12:
+            raise ValueError(
+                "fillet radius too large for the profile (self-intersection)"
+            )
+
+    # Dual-offset fillet: inset by r (round), then outset by r (round).
+    # (Outset-then-inset does not round convex exterior corners in Clipper2.)
+    inset = cs.offset(-r, JoinType.Round, 2.0, arc_segs)
+    if inset.is_empty() or abs(float(inset.area())) <= 1e-14:
+        raise ValueError(
+            "fillet radius too large for the profile (self-intersection)"
+        )
+    filleted = inset.offset(r, JoinType.Round, 2.0, arc_segs)
+    if filleted.is_empty() or abs(float(filleted.area())) <= 1e-14:
+        raise ValueError(
+            "fillet radius too large for the profile (self-intersection)"
+        )
+    # Area should strictly decrease for a positive fillet on a polygonal profile
+    # with corners (circles are already smooth — area nearly unchanged).
+    area1 = float(filleted.area())
+    if area1 > area0 + 1e-6 * max(area0, 1.0):
+        raise ValueError(
+            "fillet radius too large for the profile (self-intersection)"
+        )
+    return filleted
+
+
+def extrude_filleted_profile(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    distance: float,
+    frame: "PlaneFrame",
+    radius: float,
+    *,
+    segments: int = 32,
+) -> Mesh:
+    """Fillet a closed profile by ``radius``, then extrude by ``distance`` along normal."""
+    if Manifold is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    cs = fillet_profile(profile, radius, segments=segments)
+    man = Manifold.extrude(cs, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(f"manifold extrude of filleted profile failed: {man.status()}")
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("filleted extrude result is not watertight")
+    return mesh
 
 
 def extrude_polygon(

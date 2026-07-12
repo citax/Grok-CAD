@@ -12,6 +12,7 @@ from cadcore.mesh import (
     BooleanOp,
     Mesh,
     boolean_op,
+    extrude_filleted_profile,
     extrude_profile,
     make_box,
     make_cylinder,
@@ -35,6 +36,7 @@ class FeatureType(Enum):
     SKETCH = auto()
     EXTRUDE = auto()  # pad closed sketch profile along plane normal
     REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
+    FILLET = auto()  # fillet closed profile corners, then extrude
     # Kernel primitives (not primary UI path)
     BOX = auto()
     SPHERE = auto()
@@ -52,6 +54,7 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.SKETCH: "Sketch",
         FeatureType.EXTRUDE: "Extrude",
         FeatureType.REVOLVE: "Revolve",
+        FeatureType.FILLET: "Fillet",
         FeatureType.BOX: "Box",
         FeatureType.SPHERE: "Sphere",
         FeatureType.CYLINDER: "Cylinder",
@@ -192,6 +195,7 @@ class Document:
     _sketch_count: int = 0
     _extrude_count: int = 0
     _revolve_count: int = 0
+    _fillet_count: int = 0
 
     def add_feature(self, f: Feature) -> int:
         f.id = self._next_id
@@ -227,6 +231,7 @@ class Document:
         self._sketch_count = 0
         self._extrude_count = 0
         self._revolve_count = 0
+        self._fillet_count = 0
 
     def seed_reference_planes(self) -> None:
         have = {f.type for f in self.features}
@@ -364,6 +369,62 @@ class Document:
         self.add_feature(f)
         return f
 
+    def create_fillet(
+        self,
+        sketch_id: int,
+        distance: float,
+        radius: float,
+        *,
+        segments: int = 32,
+        profile_entity_id: int = -1,
+    ) -> Feature:
+        """Fillet a closed sketch profile by ``radius``, then extrude by ``distance``.
+
+        Raises ValueError for open profiles, non-positive radius, radius too large
+        for the profile (self-intersection), or bad distance.
+        """
+        skf = self.find(sketch_id)
+        if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
+            raise ValueError("fillet requires a valid sketch feature")
+        sketch = skf.sketch
+        if profile_entity_id >= 0:
+            ent = sketch.find_entity(profile_entity_id)
+            if ent is None:
+                raise ValueError(f"sketch has no entity id={profile_entity_id}")
+        else:
+            ent = first_closed_profile(sketch)
+            if ent is None:
+                raise ValueError("sketch has no closed profile (rectangle or circle)")
+            profile_entity_id = ent.id
+        if not is_closed_profile(ent):
+            raise ValueError("open profile: not a closed rectangle/circle")
+        dist = float(distance)
+        if not np.isfinite(dist) or dist <= 1e-12:
+            raise ValueError("extrude distance must be a positive finite number")
+        rad = float(radius)
+        if not np.isfinite(rad) or rad <= 1e-12:
+            raise ValueError("fillet radius must be positive (radius <= 0 is invalid)")
+        # Validate by building once (catches r too large / open)
+        _ = extrude_filleted_profile(
+            ent,
+            dist,
+            sketch.frame,
+            rad,
+            segments=int(segments),
+        )
+        self._fillet_count += 1
+        f = Feature(
+            type=FeatureType.FILLET,
+            name=f"Fillet{self._fillet_count}",
+            depth=dist,
+            radius=rad,
+            segments=int(segments),
+            operand_a=sketch_id,
+            profile_entity_id=int(profile_entity_id),
+        )
+        self.add_feature(f)
+        return f
+
     def evaluate_feature(self, fid: int) -> Optional[Mesh]:
         f = self.find(fid)
         if f is None or f.suppressed or is_reference_plane(f.type):
@@ -383,6 +444,24 @@ class Document:
                 return None
             mesh = extrude_profile(
                 ent, f.depth, sketch.frame, segments=max(3, int(f.segments))
+            )
+        elif f.type is FeatureType.FILLET:
+            skf = self.find(f.operand_a)
+            if skf is None or skf.sketch is None:
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                return None
+            mesh = extrude_filleted_profile(
+                ent,
+                f.depth,
+                sketch.frame,
+                f.radius,
+                segments=max(3, int(f.segments)),
             )
         elif f.type is FeatureType.REVOLVE:
             skf = self.find(f.operand_a)
