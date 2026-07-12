@@ -37,6 +37,7 @@ def feature_fingerprint(f: Feature) -> str:
         f"{f.revolve_angle:.6g}",
         f"{f.axis_origin[0]:.6g},{f.axis_origin[1]:.6g}",
         f"{f.axis_direction[0]:.6g},{f.axis_direction[1]:.6g}",
+        f"{f.hole_center_u:.6g},{f.hole_center_v:.6g}",
         f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
         str(int(f.visible)),
         str(int(f.suppressed)),
@@ -45,6 +46,7 @@ def feature_fingerprint(f: Feature) -> str:
         FeatureType.EXTRUDE,
         FeatureType.REVOLVE,
         FeatureType.FILLET,
+        FeatureType.POCKET,
         FeatureType.SKETCH,
     ):
         parts.append(sketch_fingerprint(f.sketch))
@@ -75,6 +77,8 @@ def snapshot_features(doc: Document) -> List[Feature]:
                 revolve_angle=f.revolve_angle,
                 axis_origin=tuple(f.axis_origin),  # type: ignore[arg-type]
                 axis_direction=tuple(f.axis_direction),  # type: ignore[arg-type]
+                hole_center_u=f.hole_center_u,
+                hole_center_v=f.hole_center_v,
                 visible=f.visible,
                 suppressed=f.suppressed,
             )
@@ -104,6 +108,7 @@ def evaluate_solids_snapshot(
             BooleanOp,
             boolean_op,
             extrude_filleted_profile,
+            extrude_pocketed_profile,
             extrude_profile,
             make_box,
             make_cylinder,
@@ -145,6 +150,27 @@ def evaluate_solids_snapshot(
                 ent,
                 f.depth,
                 sketch.frame,
+                f.radius,
+                segments=max(3, int(f.segments)),
+            )
+        elif f.type is FeatureType.POCKET:
+            skf = by_id.get(f.operand_a)
+            if skf is None or skf.sketch is None:
+                cache[fid] = None
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                cache[fid] = None
+                return None
+            mesh = extrude_pocketed_profile(
+                ent,
+                f.depth,
+                sketch.frame,
+                (f.hole_center_u, f.hole_center_v),
                 f.radius,
                 segments=max(3, int(f.segments)),
             )
@@ -211,7 +237,12 @@ def evaluate_solids_snapshot(
             continue
         # For sketch-based solids, include source sketch geometry in the fingerprint
         fp_feature = f
-        if f.type in (FeatureType.EXTRUDE, FeatureType.REVOLVE, FeatureType.FILLET):
+        if f.type in (
+            FeatureType.EXTRUDE,
+            FeatureType.REVOLVE,
+            FeatureType.FILLET,
+            FeatureType.POCKET,
+        ):
             skf = by_id.get(f.operand_a)
             if skf is not None and skf.sketch is not None:
                 # temporary view with sketch attached for fingerprint only
@@ -234,6 +265,8 @@ def evaluate_solids_snapshot(
                     revolve_angle=f.revolve_angle,
                     axis_origin=f.axis_origin,
                     axis_direction=f.axis_direction,
+                    hole_center_u=f.hole_center_u,
+                    hole_center_v=f.hole_center_v,
                     visible=f.visible,
                     suppressed=f.suppressed,
                 )

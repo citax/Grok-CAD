@@ -237,6 +237,10 @@ class MainWindow(QMainWindow):
         act_fil.setShortcut(QKeySequence("F"))
         act_fil.triggered.connect(self._fillet)
         insert_m.addAction(act_fil)
+        act_pok = QAction(fa_icon("fa5s.dot-circle", color=ACCENT), "Pocket…", self)
+        act_pok.setShortcut(QKeySequence("P"))
+        act_pok.triggered.connect(self._pocket)
+        insert_m.addAction(act_pok)
 
     def _build_toolbar(self) -> None:
         views = QToolBar("Views")
@@ -302,6 +306,16 @@ class MainWindow(QMainWindow):
         self.act_fillet.setShortcut(QKeySequence("F"))
         self.act_fillet.triggered.connect(self._fillet)
         main.addAction(self.act_fillet)
+
+        self.act_pocket = QAction(
+            fa_icon("fa5s.dot-circle", color=ACCENT), "Pocket", self
+        )
+        self.act_pocket.setToolTip(
+            "Cut a circular through-hole pocket and extrude into a solid (P)"
+        )
+        self.act_pocket.setShortcut(QKeySequence("P"))
+        self.act_pocket.triggered.connect(self._pocket)
+        main.addAction(self.act_pocket)
 
     def _build_sketch_toolbar(self) -> None:
         self.sketch_tb = QToolBar("Sketch")
@@ -370,6 +384,8 @@ class MainWindow(QMainWindow):
             return fa_icon("fa5s.sync-alt", color=ACCENT)
         if ftype is FeatureType.FILLET:
             return fa_icon("fa5s.circle-notch", color=ACCENT)
+        if ftype is FeatureType.POCKET:
+            return fa_icon("fa5s.dot-circle", color=ACCENT)
         return fa_icon("fa5s.cube", color=TEXT_SECONDARY)
 
     def _refresh_tree(self) -> None:
@@ -430,6 +446,11 @@ class MainWindow(QMainWindow):
         elif f.type is FeatureType.FILLET:
             self.prop_detail.setText(
                 f"r={f.radius:g}, segs={f.segments}, dist={f.depth:g}"
+            )
+        elif f.type is FeatureType.POCKET:
+            self.prop_detail.setText(
+                f"hole r={f.radius:g}, center=({f.hole_center_u:g},{f.hole_center_v:g}), "
+                f"dist={f.depth:g}"
             )
         elif f.type is FeatureType.SKETCH and f.sketch is not None:
             n = len(f.sketch.entities)
@@ -734,6 +755,88 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Created {feat.name} (r={radius:g}, segs={segs}, dist={dist:g})",
             3000,
+        )
+
+    def _pocket(self) -> None:
+        """Circular through-hole pocket + extrude via dialogs and worker rebuild."""
+        sid = self._resolve_closed_sketch_id()
+        skf = self.doc.find(sid) if sid >= 0 else None
+        if skf is None or skf.sketch is None:
+            QMessageBox.information(
+                self,
+                "Pocket",
+                "Create or select a sketch with a closed rectangle or circle first.",
+            )
+            self.statusBar().showMessage("Pocket needs a closed sketch profile", 4000)
+            return
+        if first_closed_profile(skf.sketch) is None:
+            QMessageBox.information(
+                self,
+                "Pocket",
+                "The sketch has no closed profile.\n"
+                "Draw a rectangle or circle, then Pocket.",
+            )
+            self.statusBar().showMessage("No closed profile for pocket", 4000)
+            return
+
+        hr, ok = QInputDialog.getDouble(
+            self, "Pocket", "Hole radius:", 0.5, 1e-6, 1e6, 4
+        )
+        if not ok:
+            return
+        dist, ok = QInputDialog.getDouble(
+            self, "Pocket", "Extrude distance:", 1.0, 1e-6, 1e6, 4
+        )
+        if not ok:
+            return
+        # Default hole center at profile centroid for rectangles
+        cx, cy = 0.0, 0.0
+        ent = first_closed_profile(skf.sketch)
+        if ent is not None:
+            from cadcore.sketch import RectEntity, CircleEntity
+
+            if isinstance(ent, RectEntity):
+                cx = 0.5 * (ent.c0[0] + ent.c1[0])
+                cy = 0.5 * (ent.c0[1] + ent.c1[1])
+            elif isinstance(ent, CircleEntity):
+                cx, cy = ent.center[0], ent.center[1]
+        cx, ok = QInputDialog.getDouble(
+            self, "Pocket", "Hole center U:", cx, -1e6, 1e6, 4
+        )
+        if not ok:
+            return
+        cy, ok = QInputDialog.getDouble(
+            self, "Pocket", "Hole center V:", cy, -1e6, 1e6, 4
+        )
+        if not ok:
+            return
+        segs, ok = QInputDialog.getInt(self, "Pocket", "Hole segments:", 32, 3, 512)
+        if not ok:
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self.sketch_tb.setVisible(False)
+
+        try:
+            feat = self.doc.create_pocket(
+                sid,
+                float(dist),
+                float(hr),
+                (float(cx), float(cy)),
+                segments=int(segs),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Pocket", str(exc))
+            self.statusBar().showMessage(f"Pocket failed: {exc}", 4000)
+            return
+
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(feat.id)
+        self.statusBar().showMessage(
+            f"Created {feat.name} (hole r={hr:g}, dist={dist:g})", 3000
         )
 
     def _export_stl(self) -> None:

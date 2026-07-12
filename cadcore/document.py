@@ -13,6 +13,7 @@ from cadcore.mesh import (
     Mesh,
     boolean_op,
     extrude_filleted_profile,
+    extrude_pocketed_profile,
     extrude_profile,
     make_box,
     make_cylinder,
@@ -37,6 +38,7 @@ class FeatureType(Enum):
     EXTRUDE = auto()  # pad closed sketch profile along plane normal
     REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
     FILLET = auto()  # fillet closed profile corners, then extrude
+    POCKET = auto()  # circular through-hole pocket then extrude
     # Kernel primitives (not primary UI path)
     BOX = auto()
     SPHERE = auto()
@@ -55,6 +57,7 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.EXTRUDE: "Extrude",
         FeatureType.REVOLVE: "Revolve",
         FeatureType.FILLET: "Fillet",
+        FeatureType.POCKET: "Pocket",
         FeatureType.BOX: "Box",
         FeatureType.SPHERE: "Sphere",
         FeatureType.CYLINDER: "Cylinder",
@@ -182,6 +185,9 @@ class Feature:
     revolve_angle: float = 360.0
     axis_origin: Tuple[float, float] = (0.0, 0.0)
     axis_direction: Tuple[float, float] = (0.0, 1.0)  # default: sketch V-axis
+    # Pocket: radius = hole radius; hole_center_u/v = hole center in sketch UV
+    hole_center_u: float = 0.0
+    hole_center_v: float = 0.0
     visible: bool = True
     suppressed: bool = False
 
@@ -196,6 +202,7 @@ class Document:
     _extrude_count: int = 0
     _revolve_count: int = 0
     _fillet_count: int = 0
+    _pocket_count: int = 0
 
     def add_feature(self, f: Feature) -> int:
         f.id = self._next_id
@@ -232,6 +239,7 @@ class Document:
         self._extrude_count = 0
         self._revolve_count = 0
         self._fillet_count = 0
+        self._pocket_count = 0
 
     def seed_reference_planes(self) -> None:
         have = {f.type for f in self.features}
@@ -425,6 +433,66 @@ class Document:
         self.add_feature(f)
         return f
 
+    def create_pocket(
+        self,
+        sketch_id: int,
+        distance: float,
+        hole_radius: float,
+        hole_center: Tuple[float, float] = (0.0, 0.0),
+        *,
+        segments: int = 32,
+        profile_entity_id: int = -1,
+    ) -> Feature:
+        """Cut a circular through-hole in a closed sketch profile, then extrude.
+
+        Raises ValueError for bad hole radius, hole out of bounds, edge-touching
+        (non-manifold) holes, or open profiles.
+        """
+        skf = self.find(sketch_id)
+        if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
+            raise ValueError("pocket requires a valid sketch feature")
+        sketch = skf.sketch
+        if profile_entity_id >= 0:
+            ent = sketch.find_entity(profile_entity_id)
+            if ent is None:
+                raise ValueError(f"sketch has no entity id={profile_entity_id}")
+        else:
+            ent = first_closed_profile(sketch)
+            if ent is None:
+                raise ValueError("sketch has no closed profile (rectangle or circle)")
+            profile_entity_id = ent.id
+        if not is_closed_profile(ent):
+            raise ValueError("open profile: not a closed rectangle/circle")
+        dist = float(distance)
+        if not np.isfinite(dist) or dist <= 1e-12:
+            raise ValueError("extrude distance must be a positive finite number")
+        hr = float(hole_radius)
+        if not np.isfinite(hr) or hr <= 1e-12:
+            raise ValueError("hole radius must be positive (hole_radius <= 0 is invalid)")
+        hc = (float(hole_center[0]), float(hole_center[1]))
+        _ = extrude_pocketed_profile(
+            ent,
+            dist,
+            sketch.frame,
+            hc,
+            hr,
+            segments=int(segments),
+        )
+        self._pocket_count += 1
+        f = Feature(
+            type=FeatureType.POCKET,
+            name=f"Pocket{self._pocket_count}",
+            depth=dist,
+            radius=hr,
+            segments=int(segments),
+            operand_a=sketch_id,
+            profile_entity_id=int(profile_entity_id),
+            hole_center_u=hc[0],
+            hole_center_v=hc[1],
+        )
+        self.add_feature(f)
+        return f
+
     def evaluate_feature(self, fid: int) -> Optional[Mesh]:
         f = self.find(fid)
         if f is None or f.suppressed or is_reference_plane(f.type):
@@ -460,6 +528,25 @@ class Document:
                 ent,
                 f.depth,
                 sketch.frame,
+                f.radius,
+                segments=max(3, int(f.segments)),
+            )
+        elif f.type is FeatureType.POCKET:
+            skf = self.find(f.operand_a)
+            if skf is None or skf.sketch is None:
+                return None
+            sketch = skf.sketch
+            if f.profile_entity_id >= 0:
+                ent = sketch.find_entity(f.profile_entity_id)
+            else:
+                ent = first_closed_profile(sketch)
+            if ent is None:
+                return None
+            mesh = extrude_pocketed_profile(
+                ent,
+                f.depth,
+                sketch.frame,
+                (f.hole_center_u, f.hole_center_v),
                 f.radius,
                 segments=max(3, int(f.segments)),
             )

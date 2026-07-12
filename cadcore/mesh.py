@@ -475,6 +475,181 @@ def extrude_filleted_profile(
     return mesh
 
 
+def _profile_aabb(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+) -> Tuple[float, float, float, float]:
+    """Axis-aligned UV bounds (u0, v0, u1, v1) of a closed profile."""
+    from cadcore.sketch import CircleEntity, RectEntity
+
+    if isinstance(profile, RectEntity):
+        u0, u1 = sorted([float(profile.c0[0]), float(profile.c1[0])])
+        v0, v1 = sorted([float(profile.c0[1]), float(profile.c1[1])])
+        return u0, v0, u1, v1
+    if isinstance(profile, CircleEntity):
+        cx, cy, r = float(profile.center[0]), float(profile.center[1]), float(profile.radius)
+        return cx - r, cy - r, cx + r, cy + r
+    if isinstance(profile, (list, tuple)) and profile and not hasattr(profile, "kind"):
+        us = [float(p[0]) for p in profile]  # type: ignore[union-attr]
+        vs = [float(p[1]) for p in profile]  # type: ignore[union-attr]
+        return min(us), min(vs), max(us), max(vs)
+    # Fallback via CrossSection bounds
+    cs = _profile_to_cross_section(profile)
+    b = cs.bounds()  # (minx, miny, maxx, maxy)
+    return float(b[0]), float(b[1]), float(b[2]), float(b[3])
+
+
+def profile_with_hole(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    hole_center: Sequence[float],
+    hole_radius: float,
+    segments: int = 32,
+) -> "CrossSection":
+    """Subtract a circular hole from a closed profile via CrossSection difference.
+
+    Preserves outer winding; returns a manifold3d CrossSection with a hole contour.
+    """
+    if CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    hr = float(hole_radius)
+    if not np.isfinite(hr) or hr <= 1e-12:
+        raise ValueError("hole radius must be positive (hole_radius <= 0 is invalid)")
+    cx, cy = float(hole_center[0]), float(hole_center[1])
+    if not (np.isfinite(cx) and np.isfinite(cy)):
+        raise ValueError("hole center must be finite")
+    segs = max(3, int(segments))
+
+    outer = _profile_to_cross_section(profile, circle_segments=max(segs, 32))
+    area0 = float(outer.area())
+    if area0 <= 1e-14:
+        raise ValueError("degenerate profile: empty or zero-area cross-section")
+
+    # Hole disk must lie strictly inside the profile AABB.
+    # Touching an edge is rejected as non-manifold; any excursion outside as OOB.
+    u0, v0, u1, v1 = _profile_aabb(profile)
+    eps = 1e-9
+    strictly_inside = (
+        cx - hr > u0 + eps
+        and cx + hr < u1 - eps
+        and cy - hr > v0 + eps
+        and cy + hr < v1 - eps
+    )
+    if not strictly_inside:
+        part_outside = (
+            cx - hr < u0 - eps
+            or cx + hr > u1 + eps
+            or cy - hr < v0 - eps
+            or cy + hr > v1 + eps
+        )
+        if part_outside:
+            raise ValueError("hole reaches outside the profile bounds")
+        raise ValueError(
+            "hole would make the profile non-manifold (touches an edge)"
+        )
+
+    hole = CrossSection.circle(hr, segs)
+    if abs(cx) > 1e-15 or abs(cy) > 1e-15:
+        hole = hole.translate([cx, cy])
+    hole_area = float(hole.area())
+    if hole.is_empty() or hole_area <= 1e-14:
+        raise ValueError("degenerate hole: empty cross-section")
+
+    result = outer - hole
+    if result.is_empty():
+        raise ValueError(
+            "hole would make the profile non-manifold (empty difference)"
+        )
+    area1 = float(result.area())
+    # Expected: outer area reduced by ~hole area; if almost unchanged, hole missed
+    if area1 >= area0 - 1e-6 * max(area0, 1.0):
+        raise ValueError("hole reaches outside the profile bounds")
+    # If hole is only partially inside, area drop is less than full hole area
+    expected = area0 - hole_area
+    if area1 > expected + 0.05 * max(hole_area, 1.0):
+        # Partial overlap — treat as out of bounds / invalid
+        raise ValueError("hole reaches outside the profile bounds")
+    # Contour count should be ≥2 (outer + hole) for a simple through-hole
+    try:
+        ncont = int(result.num_contour())
+    except Exception:
+        ncont = 0
+    if ncont < 2:
+        raise ValueError(
+            "hole would make the profile non-manifold (missing hole contour)"
+        )
+    return result
+
+
+def extrude_pocketed_profile(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    distance: float,
+    frame: "PlaneFrame",
+    hole_center: Sequence[float],
+    hole_radius: float,
+    *,
+    segments: int = 32,
+) -> Mesh:
+    """Pocket a circular through-hole from a closed profile, then extrude."""
+    if Manifold is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    cs = profile_with_hole(profile, hole_center, hole_radius, segments=segments)
+    man = Manifold.extrude(cs, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(f"manifold extrude of pocketed profile failed: {man.status()}")
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("pocketed extrude result is not watertight")
+    return mesh
+
+
+def extrude_pocketed_filleted_profile(
+    profile: Union["RectEntity", "CircleEntity", "SketchEntity", Sequence[Tuple[float, float]]],
+    distance: float,
+    frame: "PlaneFrame",
+    *,
+    fillet_radius: float,
+    hole_center: Sequence[float],
+    hole_radius: float,
+    segments: int = 32,
+) -> Mesh:
+    """Fillet outer corners, subtract a circular hole, then extrude (canonical ref)."""
+    if Manifold is None or CrossSection is None:
+        raise RuntimeError("manifold3d is not installed")
+    dist = float(distance)
+    if not np.isfinite(dist) or dist <= 1e-12:
+        raise ValueError("extrude distance must be a positive finite number")
+    # Fillet outer profile first, then pocket the hole into the filleted CS
+    filleted = fillet_profile(profile, fillet_radius, segments=segments)
+    # Re-validate hole against original AABB (conservative) via profile_with_hole on original
+    # but apply hole to the filleted section for geometry:
+    hr = float(hole_radius)
+    if not np.isfinite(hr) or hr <= 1e-12:
+        raise ValueError("hole radius must be positive (hole_radius <= 0 is invalid)")
+    # Containment check uses original profile AABB
+    _ = profile_with_hole(profile, hole_center, hole_radius, segments=segments)
+    segs = max(3, int(segments))
+    cx, cy = float(hole_center[0]), float(hole_center[1])
+    hole = CrossSection.circle(hr, segs)
+    if abs(cx) > 1e-15 or abs(cy) > 1e-15:
+        hole = hole.translate([cx, cy])
+    pocketed = filleted - hole
+    if pocketed.is_empty():
+        raise ValueError("hole would make the profile non-manifold (empty difference)")
+    man = Manifold.extrude(pocketed, dist)
+    if not _status_ok(man.status()) or man.is_empty():
+        raise RuntimeError(
+            f"manifold extrude of pocketed-filleted profile failed: {man.status()}"
+        )
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("pocketed-filleted extrude result is not watertight")
+    return mesh
+
+
 def extrude_polygon(
     polygon_uv: Sequence[Tuple[float, float]],
     distance: float,
