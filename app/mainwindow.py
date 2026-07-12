@@ -43,6 +43,8 @@ from cadcore.document import (
     resolve_profiles,
 )
 from cadcore.mesh import write_stl_binary
+from cadcore.sketch import LineEntity, line_length, set_line_length, snapshot_entity
+from cadcore.units import Unit, format_length, from_mm, parse_length, to_mm
 
 
 class MainWindow(QMainWindow):
@@ -198,10 +200,59 @@ class MainWindow(QMainWindow):
         file_m.addAction(act_exit)
 
         edit_m = self.menuBar().addMenu("&Edit")
+        self.act_undo = QAction(fa_icon("fa5s.undo"), "&Undo", self)
+        self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)  # Ctrl+Z
+        self.act_undo.triggered.connect(self._undo)
+        edit_m.addAction(self.act_undo)
+        self.act_redo = QAction(fa_icon("fa5s.redo"), "&Redo", self)
+        self.act_redo.setShortcuts(
+            [QKeySequence.StandardKey.Redo, QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")]
+        )
+        self.act_redo.triggered.connect(self._redo)
+        edit_m.addAction(self.act_redo)
+        edit_m.addSeparator()
+        self.act_cut = QAction(fa_icon("fa5s.cut"), "Cu&t", self)
+        self.act_cut.setShortcut(QKeySequence.StandardKey.Cut)  # Ctrl+X
+        self.act_cut.triggered.connect(self._cut)
+        edit_m.addAction(self.act_cut)
+        self.act_copy = QAction(fa_icon("fa5s.copy"), "&Copy", self)
+        self.act_copy.setShortcut(QKeySequence.StandardKey.Copy)  # Ctrl+C
+        self.act_copy.triggered.connect(self._copy)
+        edit_m.addAction(self.act_copy)
+        self.act_paste = QAction(fa_icon("fa5s.paste"), "&Paste", self)
+        self.act_paste.setShortcut(QKeySequence.StandardKey.Paste)  # Ctrl+V
+        self.act_paste.triggered.connect(self._paste)
+        edit_m.addAction(self.act_paste)
+        edit_m.addSeparator()
+        self.act_set_length = QAction(fa_icon("fa5s.ruler"), "Set Line &Length…", self)
+        self.act_set_length.setShortcut(QKeySequence("Ctrl+L"))
+        self.act_set_length.triggered.connect(self._set_line_length)
+        edit_m.addAction(self.act_set_length)
+        edit_m.addSeparator()
         act_del = QAction(fa_icon("fa5s.trash-alt"), "Delete Feature", self)
         act_del.setShortcut(QKeySequence.StandardKey.Delete)
         act_del.triggered.connect(self._delete_selected)
         edit_m.addAction(act_del)
+
+        settings_m = self.menuBar().addMenu("&Settings")
+        unit_m = settings_m.addMenu("&Units")
+        self._unit_group = QActionGroup(self)
+        self._unit_group.setExclusive(True)
+        self._unit_actions = {}
+        for u, label in (
+            (Unit.MM, "Millimetres (mm)"),
+            (Unit.CM, "Centimetres (cm)"),
+            (Unit.INCH, "Inches (in)"),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(u.value)
+            if u is Unit.MM:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked=False, unit=u: self._set_unit(unit))
+            self._unit_group.addAction(act)
+            unit_m.addAction(act)
+            self._unit_actions[u] = act
 
         view_m = self.menuBar().addMenu("&View")
         for label, key, icon_name in (
@@ -938,19 +989,145 @@ class MainWindow(QMainWindow):
 
     def _delete_selected(self) -> None:
         if self.viewport.in_sketch_mode:
-            self.statusBar().showMessage("Exit sketch before deleting features", 3000)
+            # In sketch mode Delete removes the selected entity (undoable)
+            ctrl = self.viewport._sketch_ctrl
+            if ctrl is None or ctrl.selected_entity_id < 0:
+                self.statusBar().showMessage("Select a sketch entity to delete", 2500)
+                return
+            sid = self.viewport._sketch_feature_id
+            eid = ctrl.selected_entity_id
+            if self.doc.delete_entity(sid, eid):
+                ctrl.selected_entity_id = -1
+                self.viewport.sync_sketch_visuals()
+                self.statusBar().showMessage("Entity deleted", 2000)
             return
         fid = self.doc.selected_id
         f = self.doc.find(fid)
         if f and is_reference_plane(f.type):
             QMessageBox.information(self, "Delete", "Reference planes cannot be deleted.")
             return
-        if self.doc.remove_feature(fid):
+        if self.doc.delete_feature_undoable(fid):
             self.viewport.schedule_rebuild()
             self.viewport.refresh_sketches()
             self._refresh_tree()
             self._sync_selection(self.doc.selected_id)
             self.statusBar().showMessage("Feature deleted", 2000)
+
+    def _active_sketch_id(self) -> int:
+        if self.viewport.in_sketch_mode and self.viewport._sketch_feature_id >= 0:
+            return int(self.viewport._sketch_feature_id)
+        f = self.doc.find(self.doc.selected_id)
+        if f is not None and f.type is FeatureType.SKETCH:
+            return f.id
+        return -1
+
+    def _undo(self) -> None:
+        if not self.doc.undo():
+            self.statusBar().showMessage("Nothing to undo", 1500)
+            return
+        if self.viewport.in_sketch_mode:
+            self.viewport.sync_sketch_visuals()
+        else:
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(self.doc.selected_id)
+        self.statusBar().showMessage("Undo", 1500)
+
+    def _redo(self) -> None:
+        if not self.doc.redo():
+            self.statusBar().showMessage("Nothing to redo", 1500)
+            return
+        if self.viewport.in_sketch_mode:
+            self.viewport.sync_sketch_visuals()
+        else:
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(self.doc.selected_id)
+        self.statusBar().showMessage("Redo", 1500)
+
+    def _copy(self) -> None:
+        sid = self._active_sketch_id()
+        ctrl = self.viewport._sketch_ctrl if self.viewport.in_sketch_mode else None
+        eid = ctrl.selected_entity_id if ctrl is not None else -1
+        if sid < 0 or eid < 0:
+            self.statusBar().showMessage("Select a sketch entity to copy", 2500)
+            return
+        if self.doc.copy_entity(sid, eid):
+            self.statusBar().showMessage("Copied", 1500)
+
+    def _cut(self) -> None:
+        sid = self._active_sketch_id()
+        ctrl = self.viewport._sketch_ctrl if self.viewport.in_sketch_mode else None
+        eid = ctrl.selected_entity_id if ctrl is not None else -1
+        if sid < 0 or eid < 0:
+            self.statusBar().showMessage("Select a sketch entity to cut", 2500)
+            return
+        if self.doc.cut_entity(sid, eid):
+            if ctrl is not None:
+                ctrl.selected_entity_id = -1
+            if self.viewport.in_sketch_mode:
+                self.viewport.sync_sketch_visuals()
+            self.statusBar().showMessage("Cut", 1500)
+
+    def _paste(self) -> None:
+        sid = self._active_sketch_id()
+        if sid < 0:
+            self.statusBar().showMessage("Open a sketch to paste", 2500)
+            return
+        ent = self.doc.paste_entity(sid)
+        if ent is None:
+            self.statusBar().showMessage("Clipboard empty", 1500)
+            return
+        if self.viewport.in_sketch_mode and self.viewport._sketch_ctrl is not None:
+            self.viewport._sketch_ctrl.selected_entity_id = ent.id
+            self.viewport.sync_sketch_visuals()
+        self.statusBar().showMessage(f"Pasted entity {ent.id}", 2000)
+
+    def _set_unit(self, unit: Unit) -> None:
+        self.doc.set_display_unit(unit)
+        act = self._unit_actions.get(unit)
+        if act is not None:
+            act.setChecked(True)
+        if self.viewport.in_sketch_mode:
+            self.viewport.refresh_dim_labels()
+        self.statusBar().showMessage(f"Units: {unit.label}", 2000)
+
+    def _set_line_length(self) -> None:
+        """Dialog: set selected line length in current display unit (undoable)."""
+        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            QMessageBox.information(
+                self, "Set Length", "Enter sketch mode and select a line first."
+            )
+            return
+        ctrl = self.viewport._sketch_ctrl
+        ent = ctrl.sketch.find_entity(ctrl.selected_entity_id)
+        if not isinstance(ent, LineEntity):
+            QMessageBox.information(self, "Set Length", "Select a line entity first.")
+            return
+        unit = self.doc.display_unit
+        cur_mm = line_length(ent)
+        cur_disp = from_mm(cur_mm, unit)
+        val, ok = QInputDialog.getDouble(
+            self,
+            "Set Line Length",
+            f"Length ({unit.label}):",
+            cur_disp,
+            1e-6,
+            1e9,
+            4,
+        )
+        if not ok:
+            return
+        before = snapshot_entity(ent)
+        set_line_length(ent, to_mm(val, unit), free_end="p1")
+        after = snapshot_entity(ent)
+        self.doc.record_entity_move(self.viewport._sketch_feature_id, before, after)
+        self.viewport.sync_sketch_visuals()
+        self.statusBar().showMessage(
+            f"Length → {format_length(line_length(ent), unit)}", 2500
+        )
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if self.viewport.in_sketch_mode:

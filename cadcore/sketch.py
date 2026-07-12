@@ -241,6 +241,23 @@ class Sketch:
                 return e
         return None
 
+    def remove_entity(self, eid: int) -> Optional[SketchEntity]:
+        """Remove entity by id; return it if found."""
+        for i, e in enumerate(self.entities):
+            if e.id == eid:
+                return self.entities.pop(i)
+        return None
+
+    def insert_entity(self, ent: SketchEntity, index: Optional[int] = None) -> None:
+        """Insert an existing entity (keeps its id). Bumps _next_entity_id."""
+        if self.find_entity(ent.id) is not None:
+            return
+        if index is None or index < 0 or index > len(self.entities):
+            self.entities.append(ent)
+        else:
+            self.entities.insert(index, ent)
+        self._next_entity_id = max(self._next_entity_id, int(ent.id) + 1)
+
     def all_handles(self) -> List[Handle]:
         hs: List[Handle] = []
         for e in self.entities:
@@ -257,3 +274,126 @@ class Sketch:
             elif isinstance(e, CircleEntity):
                 pts.append(e.center)
         return pts
+
+    def unique_endpoints(self, *, tol: float = 1e-9) -> List[Vec2]:
+        """Deduped entity endpoints / connection points (excludes bare origin unless used)."""
+        raw: List[Vec2] = []
+        for e in self.entities:
+            if isinstance(e, LineEntity):
+                raw.extend([e.p0, e.p1])
+            elif isinstance(e, RectEntity):
+                raw.extend(e.corners())
+            elif isinstance(e, CircleEntity):
+                raw.append(e.center)
+        out: List[Vec2] = []
+        for p in raw:
+            if any(abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol for q in out):
+                continue
+            out.append((float(p[0]), float(p[1])))
+        return out
+
+
+def line_length(ent: LineEntity) -> float:
+    """World-UV length of a line (internal mm)."""
+    return float(np.hypot(ent.p1[0] - ent.p0[0], ent.p1[1] - ent.p0[1]))
+
+
+def set_line_length(ent: LineEntity, length: float, *, free_end: str = "p1") -> None:
+    """Move free endpoint along the line direction so length becomes ``length`` (mm)."""
+    L = max(1e-12, float(length))
+    if free_end == "p0":
+        fixed, free = ent.p1, ent.p0
+        set_free = "p0"
+    else:
+        fixed, free = ent.p0, ent.p1
+        set_free = "p1"
+    du = free[0] - fixed[0]
+    dv = free[1] - fixed[1]
+    cur = float(np.hypot(du, dv))
+    if cur < 1e-12:
+        # Degenerate: extend along +u
+        nu, nv = 1.0, 0.0
+    else:
+        nu, nv = du / cur, dv / cur
+    new_free = (fixed[0] + nu * L, fixed[1] + nv * L)
+    ent.set_handle(set_free, new_free)
+
+
+def snapshot_entity(ent: SketchEntity) -> dict:
+    """Serializable snapshot of a sketch entity (for history / clipboard)."""
+    if isinstance(ent, LineEntity):
+        return {
+            "kind": "line",
+            "id": int(ent.id),
+            "p0": (float(ent.p0[0]), float(ent.p0[1])),
+            "p1": (float(ent.p1[0]), float(ent.p1[1])),
+        }
+    if isinstance(ent, RectEntity):
+        return {
+            "kind": "rect",
+            "id": int(ent.id),
+            "c0": (float(ent.c0[0]), float(ent.c0[1])),
+            "c1": (float(ent.c1[0]), float(ent.c1[1])),
+        }
+    if isinstance(ent, CircleEntity):
+        return {
+            "kind": "circle",
+            "id": int(ent.id),
+            "center": (float(ent.center[0]), float(ent.center[1])),
+            "radius": float(ent.radius),
+        }
+    raise TypeError(f"unsupported entity type {type(ent)!r}")
+
+
+def restore_entity(data: dict) -> SketchEntity:
+    """Rebuild an entity from snapshot_entity() output."""
+    kind = data["kind"]
+    eid = int(data["id"])
+    if kind == "line":
+        return LineEntity(
+            id=eid, kind=EntityKind.LINE, p0=tuple(data["p0"]), p1=tuple(data["p1"])  # type: ignore[arg-type]
+        )
+    if kind == "rect":
+        return RectEntity(
+            id=eid, kind=EntityKind.RECTANGLE, c0=tuple(data["c0"]), c1=tuple(data["c1"])  # type: ignore[arg-type]
+        )
+    if kind == "circle":
+        return CircleEntity(
+            id=eid,
+            kind=EntityKind.CIRCLE,
+            center=tuple(data["center"]),  # type: ignore[arg-type]
+            radius=float(data["radius"]),
+        )
+    raise ValueError(f"unknown entity kind {kind!r}")
+
+
+def offset_entity_data(data: dict, du: float, dv: float) -> dict:
+    """Return a copy of entity snapshot translated by (du, dv)."""
+    out = dict(data)
+    if out["kind"] == "line":
+        p0, p1 = out["p0"], out["p1"]
+        out["p0"] = (p0[0] + du, p0[1] + dv)
+        out["p1"] = (p1[0] + du, p1[1] + dv)
+    elif out["kind"] == "rect":
+        c0, c1 = out["c0"], out["c1"]
+        out["c0"] = (c0[0] + du, c0[1] + dv)
+        out["c1"] = (c1[0] + du, c1[1] + dv)
+    elif out["kind"] == "circle":
+        c = out["center"]
+        out["center"] = (c[0] + du, c[1] + dv)
+    return out
+
+
+def apply_entity_snapshot(ent: SketchEntity, data: dict) -> None:
+    """Overwrite geometry of ``ent`` from a snapshot (same id/kind)."""
+    if isinstance(ent, LineEntity) and data["kind"] == "line":
+        ent.p0 = (float(data["p0"][0]), float(data["p0"][1]))
+        ent.p1 = (float(data["p1"][0]), float(data["p1"][1]))
+    elif isinstance(ent, RectEntity) and data["kind"] == "rect":
+        ent.c0 = (float(data["c0"][0]), float(data["c0"][1]))
+        ent.c1 = (float(data["c1"][0]), float(data["c1"][1]))
+    elif isinstance(ent, CircleEntity) and data["kind"] == "circle":
+        ent.center = (float(data["center"][0]), float(data["center"][1]))
+        ent.radius = max(1e-9, float(data["radius"]))
+    else:
+        raise ValueError("snapshot kind mismatch")

@@ -23,7 +23,10 @@ from cadcore.sketch import (
 # Pixel-ish tolerances converted using a scale factor (world units per pixel estimate)
 SNAP_GRID = 0.25
 SNAP_POINT = 0.15
-SNAP_HV = 0.12  # world units for H/V inference
+# Angular ortho snap: only lock to H/V when direction is within this many degrees
+SNAP_ANGLE_DEG = 7.0
+# Legacy alias kept for any external imports (no longer used for locking)
+SNAP_HV = 0.12
 
 
 class SketchTool(Enum):
@@ -127,29 +130,47 @@ class SketchController:
         if best is not None:
             u, v = best.uv
 
-        # Grid
+        # Angular H/V snap when drawing a free endpoint: only lock to ortho within
+        # ±SNAP_ANGLE_DEG; otherwise follow the cursor exactly (no grid pull that
+        # would destroy intentional free angles).
+        if drawing and self.draw and self.draw.points:
+            p0 = self.draw.points[0]
+            # Prefer point snap over angle; if not on a point, check angle
+            if best is None or best.kind != "point":
+                du = u - p0[0]
+                dv = v - p0[1]
+                length = float(np.hypot(du, dv))
+                if length > 1e-12:
+                    angle = float(np.degrees(np.arctan2(dv, du)))  # (-180, 180]
+                    orthos = (0.0, 90.0, -90.0, 180.0, -180.0)
+                    nearest = min(orthos, key=lambda o: abs(angle - o))
+                    if abs(angle - nearest) <= SNAP_ANGLE_DEG:
+                        rad = float(np.radians(nearest))
+                        u = p0[0] + length * float(np.cos(rad))
+                        v = p0[1] + length * float(np.sin(rad))
+                        kind = (
+                            "h"
+                            if abs(nearest) < 1e-9 or abs(abs(nearest) - 180.0) < 1e-9
+                            else "v"
+                        )
+                        res = SnapResult((u, v), kind, None)
+                        self.last_snap = res
+                        return res
+            # Free angle: keep exact (post point-snap) cursor
+            kind = best.kind if best else "none"
+            res = SnapResult((u, v), kind, best.ref if best else None)
+            self.last_snap = res
+            return res
+
+        # Grid (first click / non-drawing only — free-angle second point skips this)
         gu = round(u / SNAP_GRID) * SNAP_GRID
         gv = round(v / SNAP_GRID) * SNAP_GRID
         if abs(u - gu) <= SNAP_GRID * 0.35 and abs(v - gv) <= SNAP_GRID * 0.35:
-            # Prefer point snap over grid if both
             if best is None:
                 u, v = gu, gv
                 best = SnapResult((u, v), "grid")
-            else:
-                # keep point but still allow H/V
-                pass
 
-        # H/V inference when drawing a line (from first point)
         kind = best.kind if best else "none"
-        if drawing and self.draw and self.draw.points:
-            p0 = self.draw.points[0]
-            if abs(v - p0[1]) <= SNAP_HV:
-                v = p0[1]
-                kind = "h"
-            elif abs(u - p0[0]) <= SNAP_HV:
-                u = p0[0]
-                kind = "v"
-
         res = SnapResult((u, v), kind, best.ref if best else None)
         self.last_snap = res
         return res

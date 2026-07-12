@@ -45,7 +45,10 @@ from cadcore.sketch import (
     Sketch,
     SketchEntity,
     Vec2,
+    line_length,
+    snapshot_entity,
 )
+from cadcore.units import format_length
 
 PLANE_COLORS = {
     FeatureType.PLANE_FRONT: PLANE_FRONT,
@@ -665,8 +668,12 @@ class Viewport(QWidget):
             self.plotter.interactor.setFocus()
         except Exception:
             pass
+        self._dim_label_names: Set[str] = set()
+        self._drag_before: Optional[dict] = None
         self._draw_sketch_overlay()
         self._rebuild_all_sketch_entities()
+        self._update_junction_dots()
+        self._update_dim_labels()
         self._restyle_selection_only()
         self._request_render()
         plane = self._doc.find(f.plane_id)
@@ -720,9 +727,13 @@ class Viewport(QWidget):
         msg = self._sketch_ctrl.confirm_current()
         if msg:
             ent = self._sketch_ctrl.sketch.entities[-1]
+            if self._doc is not None and self._sketch_feature_id >= 0:
+                self._doc.record_entity_add(self._sketch_feature_id, ent)
             self._upsert_entity_actor(ent)
             self._clear_preview()
             self._update_handles_visual()
+            self._update_junction_dots()
+            self._update_dim_labels()
             self.sketch_status.emit(f"Sketch: {msg}")
             self._request_render()
 
@@ -808,8 +819,21 @@ class Viewport(QWidget):
             self._remove_actor(f"sk_e_{name}")
         self._sketch_entity_actors.clear()
         self._sketch_entity_fps.clear()
-        for n in ("__sk_grid", "__sk_h", "__sk_v", "__sk_preview", "__sk_handles", "__sk_infer"):
+        for n in (
+            "__sk_grid",
+            "__sk_h",
+            "__sk_v",
+            "__sk_preview",
+            "__sk_handles",
+            "__sk_infer",
+            "__sk_junctions",
+            "__sk_dims",
+        ):
             self._remove_actor(n)
+        # Drop per-line dim labels if any
+        for name in list(getattr(self, "_dim_label_names", set()) or set()):
+            self._remove_actor(name)
+        self._dim_label_names = set()
         # Drop any leftover overlay props
         for n in list(self._overlay_actors.keys()):
             self._remove_actor(n)
@@ -904,6 +928,135 @@ class Viewport(QWidget):
         for ent in self._sketch_ctrl.sketch.entities:
             self._upsert_entity_actor(ent)
         self._update_handles_visual()
+        self._update_junction_dots()
+        self._update_dim_labels()
+
+    def sync_sketch_visuals(self) -> None:
+        """Full resync after undo/redo/paste/unit change (clears ghost actors).
+
+        Drops every sketch-entity actor from plotter.actors AND overlay_actors,
+        clears the fingerprint cache, then rebuilds from the document sketch.
+        """
+        if not self.plotter or self._sketch_ctrl is None:
+            return
+        # Purge entity actors by name from both maps
+        for eid in list(self._sketch_entity_actors):
+            self._remove_actor(f"sk_e_{eid}")
+        self._sketch_entity_actors.clear()
+        self._sketch_entity_fps.clear()
+        # Also sweep any leftover sk_e_* in overlay/plotter
+        for name in list(self._overlay_actors.keys()):
+            if name.startswith("sk_e_"):
+                self._remove_actor(name)
+        if self.plotter:
+            for name in list(self.plotter.actors.keys()):
+                if name.startswith("sk_e_"):
+                    self._remove_actor(name)
+        for ent in self._sketch_ctrl.sketch.entities:
+            self._upsert_entity_actor(ent)
+        self._update_handles_visual()
+        self._update_junction_dots()
+        self._update_dim_labels()
+        self._request_render()
+
+    def refresh_dim_labels(self) -> None:
+        """Recompute length labels (e.g. after unit change)."""
+        self._update_dim_labels()
+        self._request_render()
+
+    def _update_junction_dots(self) -> None:
+        """Flat on-plane dots at unique entity endpoints / connection points."""
+        if not self.plotter or self._sketch_ctrl is None:
+            return
+        self._remove_actor("__sk_junctions")
+        pts_uv = self._sketch_ctrl.sketch.unique_endpoints()
+        if not pts_uv:
+            return
+        fr = self._sketch_ctrl.sketch.frame
+        pts = np.array([fr.to_world(p) for p in pts_uv], float)
+        self._add_overlay_mesh(
+            _flat_point_cloud(pts),
+            color=SKETCH_GRID,
+            point_size=7,
+            render_points_as_spheres=False,
+            name="__sk_junctions",
+            pickable=False,
+            render=False,
+            opacity=0.55,
+        )
+
+    def _update_dim_labels(self) -> None:
+        """Line-length labels at midpoints in the current display unit."""
+        if not self.plotter or self._sketch_ctrl is None or self._doc is None:
+            return
+        # Clear previous labels
+        for name in list(getattr(self, "_dim_label_names", set()) or set()):
+            self._remove_actor(name)
+        self._dim_label_names = set()
+        self._remove_actor("__sk_dims")
+        unit = self._doc.display_unit
+        fr = self._sketch_ctrl.sketch.frame
+        points = []
+        labels = []
+        for ent in self._sketch_ctrl.sketch.entities:
+            if not isinstance(ent, LineEntity):
+                continue
+            mid = ent.midpoint()
+            w = fr.to_world(mid)
+            points.append(w)
+            labels.append(format_length(line_length(ent), unit))
+        if not points:
+            return
+        try:
+            # Single multi-label actor on the main plotter (visible with sketch camera)
+            actor = self.plotter.add_point_labels(
+                np.array(points, float),
+                labels,
+                name="__sk_dims",
+                font_size=14,
+                text_color=TEXT_PRIMARY,
+                point_size=0,
+                shape=None,
+                always_visible=True,
+                pickable=False,
+                render=False,
+                show_points=False,
+            )
+            self._dim_label_names.add("__sk_dims")
+            _ = actor
+        except Exception as exc:  # noqa: BLE001
+            # Fallback: one label actor per line
+            print(f"[viewport] dim labels: {exc}", file=sys.stderr)
+            for i, (pt, lab) in enumerate(zip(points, labels)):
+                name = f"__sk_dim_{i}"
+                try:
+                    self.plotter.add_point_labels(
+                        np.array([pt], float),
+                        [lab],
+                        name=name,
+                        font_size=14,
+                        text_color=TEXT_PRIMARY,
+                        point_size=0,
+                        shape=None,
+                        always_visible=True,
+                        pickable=False,
+                        render=False,
+                        show_points=False,
+                    )
+                    self._dim_label_names.add(name)
+                except Exception:
+                    pass
+
+    def dim_label_texts(self) -> list:
+        """Return current line-length label strings (for tests / verification)."""
+        if self._sketch_ctrl is None or self._doc is None:
+            return []
+        unit = self._doc.display_unit
+        out = []
+        for ent in self._sketch_ctrl.sketch.entities:
+            if isinstance(ent, LineEntity):
+                out.append(format_length(line_length(ent), unit))
+        return out
 
     def _upsert_entity_actor(self, ent: SketchEntity) -> None:
         if not self.plotter or self._sketch_ctrl is None:
@@ -1071,6 +1224,7 @@ class Viewport(QWidget):
             if ent:
                 self._upsert_entity_actor(ent)
             self._update_handles_visual()
+            self._update_dim_labels()
         else:
             self._update_preview_visual()
             if self._sketch_ctrl.hover_handle != prev_hover:
@@ -1084,14 +1238,27 @@ class Viewport(QWidget):
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             return
+        # Snapshot before drag for undoable move
+        self._drag_before = None
+        if self._sketch_ctrl.tool == SketchTool.SELECT:
+            # peek handle/entity under cursor
+            h = self._sketch_ctrl.pick_handle(uv)
+            if h is not None:
+                ent0 = self._sketch_ctrl.sketch.find_entity(h.entity_id)
+                if ent0 is not None:
+                    self._drag_before = snapshot_entity(ent0)
         msg = self._sketch_ctrl.on_press(uv)
         sk = self._sketch_ctrl.sketch
         if msg in ("Line", "Rectangle", "Circle"):
             # new entity added — last one
             ent = sk.entities[-1]
+            if self._doc is not None and self._sketch_feature_id >= 0:
+                self._doc.record_entity_add(self._sketch_feature_id, ent)
             self._upsert_entity_actor(ent)
             self._clear_preview()
             self._update_handles_visual()
+            self._update_junction_dots()
+            self._update_dim_labels()
             self.sketch_status.emit(f"Sketch: {msg}")
         elif msg and msg.startswith("Drag"):
             self.sketch_status.emit(f"Sketch: {msg}")
@@ -1108,6 +1275,7 @@ class Viewport(QWidget):
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             self._sketch_ctrl.drag = None
+            self._drag_before = None
             return
         was = self._sketch_ctrl.drag
         self._sketch_ctrl.on_release(uv)
@@ -1115,8 +1283,20 @@ class Viewport(QWidget):
             ent = self._sketch_ctrl.sketch.find_entity(was.entity_id)
             if ent:
                 self._upsert_entity_actor(ent)
+                if (
+                    self._doc is not None
+                    and self._sketch_feature_id >= 0
+                    and self._drag_before is not None
+                ):
+                    after = snapshot_entity(ent)
+                    self._doc.record_entity_move(
+                        self._sketch_feature_id, self._drag_before, after
+                    )
             self._update_handles_visual()
+            self._update_junction_dots()
+            self._update_dim_labels()
             self.sketch_status.emit(f"{self._sketch_ctrl.sketch.name} — edited")
+        self._drag_before = None
         self._request_render()
 
     # ----- pick / views -----

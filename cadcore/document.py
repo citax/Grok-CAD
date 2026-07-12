@@ -27,7 +27,12 @@ from cadcore.sketch import (
     RectEntity,
     Sketch,
     SketchEntity,
+    apply_entity_snapshot,
+    offset_entity_data,
+    restore_entity,
+    snapshot_entity,
 )
+from cadcore.units import Unit
 
 
 class FeatureType(Enum):
@@ -304,17 +309,159 @@ class Feature:
     suppressed: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Undo / redo command stack
+# ---------------------------------------------------------------------------
+
+PASTE_UV_DELTA: Tuple[float, float] = (5.0, 5.0)  # mm offset for paste
+
+
+class HistoryCommand:
+    """Base undoable command."""
+
+    def undo(self, doc: "Document") -> None:
+        raise NotImplementedError
+
+    def redo(self, doc: "Document") -> None:
+        raise NotImplementedError
+
+    def description(self) -> str:
+        return self.__class__.__name__
+
+
+class EntityAddCommand(HistoryCommand):
+    def __init__(self, sketch_id: int, entity_data: dict, index: Optional[int] = None) -> None:
+        self.sketch_id = int(sketch_id)
+        self.entity_data = dict(entity_data)
+        self.index = index
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        ent = restore_entity(self.entity_data)
+        sk.insert_entity(ent, self.index)
+
+    def undo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        sk.remove_entity(int(self.entity_data["id"]))
+
+    def description(self) -> str:
+        return f"Add {self.entity_data.get('kind', 'entity')}"
+
+
+class EntityDeleteCommand(HistoryCommand):
+    def __init__(self, sketch_id: int, entity_data: dict, index: int) -> None:
+        self.sketch_id = int(sketch_id)
+        self.entity_data = dict(entity_data)
+        self.index = int(index)
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        sk.remove_entity(int(self.entity_data["id"]))
+
+    def undo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        ent = restore_entity(self.entity_data)
+        sk.insert_entity(ent, self.index)
+
+    def description(self) -> str:
+        return f"Delete {self.entity_data.get('kind', 'entity')}"
+
+
+class EntityMoveCommand(HistoryCommand):
+    def __init__(self, sketch_id: int, before: dict, after: dict) -> None:
+        self.sketch_id = int(sketch_id)
+        self.before = dict(before)
+        self.after = dict(after)
+        assert before["id"] == after["id"]
+
+    def redo(self, doc: "Document") -> None:
+        ent = _entity_of(doc, self.sketch_id, int(self.after["id"]))
+        apply_entity_snapshot(ent, self.after)
+
+    def undo(self, doc: "Document") -> None:
+        ent = _entity_of(doc, self.sketch_id, int(self.before["id"]))
+        apply_entity_snapshot(ent, self.before)
+
+    def description(self) -> str:
+        return "Move entity"
+
+
+class FeatureAddCommand(HistoryCommand):
+    def __init__(self, feature: "Feature", index: Optional[int] = None) -> None:
+        self.feature = feature
+        self.index = index
+
+    def redo(self, doc: "Document") -> None:
+        if doc.find(self.feature.id) is not None:
+            return
+        if self.index is None or self.index < 0 or self.index > len(doc.features):
+            doc.features.append(self.feature)
+        else:
+            doc.features.insert(self.index, self.feature)
+        doc.selected_id = self.feature.id
+        doc._next_id = max(doc._next_id, self.feature.id + 1)
+
+    def undo(self, doc: "Document") -> None:
+        doc.features = [x for x in doc.features if x.id != self.feature.id]
+        if doc.selected_id == self.feature.id:
+            doc.selected_id = doc.features[0].id if doc.features else -1
+
+    def description(self) -> str:
+        return f"Add feature {self.feature.name}"
+
+
+class FeatureDeleteCommand(HistoryCommand):
+    def __init__(self, feature: "Feature", index: int) -> None:
+        self.feature = feature
+        self.index = int(index)
+
+    def redo(self, doc: "Document") -> None:
+        doc.features = [x for x in doc.features if x.id != self.feature.id]
+        if doc.selected_id == self.feature.id:
+            doc.selected_id = doc.features[0].id if doc.features else -1
+
+    def undo(self, doc: "Document") -> None:
+        if doc.find(self.feature.id) is not None:
+            return
+        idx = max(0, min(self.index, len(doc.features)))
+        doc.features.insert(idx, self.feature)
+        doc.selected_id = self.feature.id
+
+    def description(self) -> str:
+        return f"Delete feature {self.feature.name}"
+
+
+def _sketch_of(doc: "Document", sketch_id: int) -> Sketch:
+    f = doc.find(sketch_id)
+    if f is None or f.sketch is None:
+        raise ValueError(f"no sketch feature id={sketch_id}")
+    return f.sketch
+
+
+def _entity_of(doc: "Document", sketch_id: int, eid: int) -> SketchEntity:
+    sk = _sketch_of(doc, sketch_id)
+    ent = sk.find_entity(eid)
+    if ent is None:
+        raise ValueError(f"no entity id={eid} in sketch {sketch_id}")
+    return ent
+
+
 @dataclass
 class Document:
     name: str = "Untitled"
     features: List[Feature] = field(default_factory=list)
     selected_id: int = -1
+    display_unit: Unit = Unit.MM
     _next_id: int = 1
     _sketch_count: int = 0
     _extrude_count: int = 0
     _revolve_count: int = 0
     _fillet_count: int = 0
     _pocket_count: int = 0
+    # History / clipboard
+    _undo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
+    _redo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
+    _clipboard: Optional[dict] = field(default=None, repr=False)
 
     def add_feature(self, f: Feature) -> int:
         f.id = self._next_id
@@ -352,6 +499,108 @@ class Document:
         self._revolve_count = 0
         self._fillet_count = 0
         self._pocket_count = 0
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._clipboard = None
+
+    # ----- history -----
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def push_command(self, cmd: HistoryCommand, *, already_done: bool = True) -> None:
+        """Record a command. If not already_done, redo() is executed first."""
+        if not already_done:
+            cmd.redo(self)
+        self._undo_stack.append(cmd)
+        self._redo_stack.clear()
+
+    def undo(self) -> bool:
+        """Undo last command. Empty stack → safe no-op (False)."""
+        if not self._undo_stack:
+            return False
+        cmd = self._undo_stack.pop()
+        cmd.undo(self)
+        self._redo_stack.append(cmd)
+        return True
+
+    def redo(self) -> bool:
+        """Redo last undone command. Empty stack → safe no-op (False)."""
+        if not self._redo_stack:
+            return False
+        cmd = self._redo_stack.pop()
+        cmd.redo(self)
+        self._undo_stack.append(cmd)
+        return True
+
+    def record_entity_add(self, sketch_id: int, ent: SketchEntity) -> None:
+        """Entity already in sketch; push undoable add (clears redo)."""
+        sk = _sketch_of(self, sketch_id)
+        idx = next((i for i, e in enumerate(sk.entities) if e.id == ent.id), len(sk.entities) - 1)
+        self.push_command(EntityAddCommand(sketch_id, snapshot_entity(ent), idx))
+
+    def delete_entity(self, sketch_id: int, eid: int) -> bool:
+        """Delete sketch entity (undoable)."""
+        sk = _sketch_of(self, sketch_id)
+        idx = next((i for i, e in enumerate(sk.entities) if e.id == eid), -1)
+        if idx < 0:
+            return False
+        data = snapshot_entity(sk.entities[idx])
+        sk.remove_entity(eid)
+        self.push_command(EntityDeleteCommand(sketch_id, data, idx))
+        return True
+
+    def record_entity_move(self, sketch_id: int, before: dict, after: dict) -> None:
+        """Record geometry change if before != after."""
+        if before == after:
+            return
+        self.push_command(EntityMoveCommand(sketch_id, before, after))
+
+    def record_feature_add(self, f: Feature) -> None:
+        """Feature already added; push undoable feature-add."""
+        idx = next((i for i, x in enumerate(self.features) if x.id == f.id), len(self.features) - 1)
+        self.push_command(FeatureAddCommand(f, idx))
+
+    def delete_feature_undoable(self, fid: int) -> bool:
+        """Delete non-plane feature and push undo command."""
+        f = self.find(fid)
+        if f is None or is_reference_plane(f.type):
+            return False
+        idx = next(i for i, x in enumerate(self.features) if x.id == fid)
+        self.features = [x for x in self.features if x.id != fid]
+        if self.selected_id == fid:
+            self.selected_id = self.features[0].id if self.features else -1
+        self.push_command(FeatureDeleteCommand(f, idx))
+        return True
+
+    # ----- clipboard -----
+    def copy_entity(self, sketch_id: int, eid: int) -> bool:
+        ent = _entity_of(self, sketch_id, eid)
+        self._clipboard = snapshot_entity(ent)
+        # Drop id so paste always allocates a new one
+        return True
+
+    def cut_entity(self, sketch_id: int, eid: int) -> bool:
+        if not self.copy_entity(sketch_id, eid):
+            return False
+        return self.delete_entity(sketch_id, eid)
+
+    def paste_entity(self, sketch_id: int) -> Optional[SketchEntity]:
+        """Paste clipboard as new entity offset by PASTE_UV_DELTA (undoable)."""
+        if self._clipboard is None:
+            return None
+        sk = _sketch_of(self, sketch_id)
+        data = offset_entity_data(self._clipboard, PASTE_UV_DELTA[0], PASTE_UV_DELTA[1])
+        data["id"] = int(sk._next_entity_id)
+        ent = restore_entity(data)
+        sk.insert_entity(ent)
+        self.push_command(EntityAddCommand(sketch_id, snapshot_entity(ent), len(sk.entities) - 1))
+        return ent
+
+    def set_display_unit(self, unit: Unit) -> None:
+        self.display_unit = Unit(unit)
 
     def seed_reference_planes(self) -> None:
         have = {f.type for f in self.features}
@@ -385,6 +634,7 @@ class Document:
             sketch=sketch,
         )
         self.add_feature(f)
+        self.record_feature_add(f)
         return f
 
     def create_extrude(
@@ -430,6 +680,7 @@ class Document:
             profile_entity_id=int(profile_entity_id),
         )
         self.add_feature(f)
+        self.record_feature_add(f)
         return f
 
     def create_revolve(
@@ -488,6 +739,7 @@ class Document:
             axis_direction=ax_d,
         )
         self.add_feature(f)
+        self.record_feature_add(f)
         return f
 
     def create_fillet(
@@ -544,6 +796,7 @@ class Document:
             profile_entity_id=int(profile_entity_id),
         )
         self.add_feature(f)
+        self.record_feature_add(f)
         return f
 
     def create_pocket(
@@ -604,6 +857,7 @@ class Document:
             hole_center_v=hc[1],
         )
         self.add_feature(f)
+        self.record_feature_add(f)
         return f
 
     def evaluate_feature(self, fid: int) -> Optional[Mesh]:
