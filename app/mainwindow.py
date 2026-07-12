@@ -1072,17 +1072,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cut", 1500)
 
     def _paste(self) -> None:
-        sid = self._active_sketch_id()
-        if sid < 0:
-            self.statusBar().showMessage("Open a sketch to paste", 2500)
+        """Paste only into a live editable sketch — no silent document/undo pollution."""
+        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            self.statusBar().showMessage("Enter sketch mode to paste", 2500)
             return
-        ent = self.doc.paste_entity(sid)
+        sid = int(self.viewport._sketch_feature_id)
+        if sid < 0:
+            self.statusBar().showMessage("Enter sketch mode to paste", 2500)
+            return
+        if self.doc._clipboard is None:
+            self.statusBar().showMessage("Clipboard empty", 1500)
+            return
+        place = self.viewport.sketch_cursor_uv()
+        ent = self.doc.paste_entity(sid, place_uv=place)
         if ent is None:
             self.statusBar().showMessage("Clipboard empty", 1500)
             return
-        if self.viewport.in_sketch_mode and self.viewport._sketch_ctrl is not None:
-            self.viewport._sketch_ctrl.selected_entity_id = ent.id
-            self.viewport.sync_sketch_visuals()
+        # Always refresh the viewport after a successful paste
+        self.viewport._sketch_ctrl.selected_entity_id = ent.id
+        self.viewport.sync_sketch_visuals()
         self.statusBar().showMessage(f"Pasted entity {ent.id}", 2000)
 
     def _set_unit(self, unit: Unit) -> None:
@@ -1153,6 +1161,17 @@ class MainWindow(QMainWindow):
                         self._sync_sketch_tool_ui(ctrl.tool)
                 return
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if self.viewport._try_commit_length_buffer():
+                    return
                 self.viewport.sketch_confirm()
                 return
+            if event.key() == Qt.Key.Key_Backspace:
+                if self.viewport._length_buffer:
+                    self.viewport._length_buffer = self.viewport._length_buffer[:-1]
+                    self.viewport._emit_length_buffer_status()
+                    return
+            text = event.text() or ""
+            if text and (text.isdigit() or text in ".-"):
+                if self.viewport._accept_length_char(text):
+                    return
         super().keyPressEvent(event)

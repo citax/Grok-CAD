@@ -112,6 +112,34 @@ class SketchController:
                 self.draw.points.append(self.preview_uv)
         return self._try_finish_draw()
 
+    def commit_line_length(self, length_mm: float) -> Optional[str]:
+        """Finish an in-progress line at exact ``length_mm`` along current direction.
+
+        Direction is from p0 toward ``preview_uv`` if set and non-zero, else +u.
+        Returns ``\"Line\"`` on success, else None.
+        """
+        if self.tool is not SketchTool.LINE:
+            return None
+        if self.draw is None or len(self.draw.points) != 1:
+            return None
+        L = float(length_mm)
+        if not np.isfinite(L) or L <= 1e-12:
+            return None
+        p0 = self.draw.points[0]
+        if self.preview_uv is not None:
+            du = self.preview_uv[0] - p0[0]
+            dv = self.preview_uv[1] - p0[1]
+        else:
+            du, dv = 1.0, 0.0
+        nrm = float(np.hypot(du, dv))
+        if nrm < 1e-12:
+            du, dv = 1.0, 0.0
+            nrm = 1.0
+        nu, nv = du / nrm, dv / nrm
+        p1 = (p0[0] + nu * L, p0[1] + nv * L)
+        self.draw.points.append(p1)
+        return self._try_finish_draw()
+
     # --- snapping ---
     def snap(self, uv: Vec2, *, drawing: bool = False) -> SnapResult:
         u, v = float(uv[0]), float(uv[1])

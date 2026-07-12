@@ -123,6 +123,38 @@ def _flat_point_cloud(points: np.ndarray) -> pv.PolyData:
     return pv.PolyData(np.asarray(points, dtype=np.float64).reshape(-1, 3))
 
 
+# Origin glyph size (world units / mm)
+ORIGIN_CROSS_HALF = 0.14
+ORIGIN_RING_R = 0.09
+ORIGIN_RING_N = 36
+
+
+def _origin_glyph_polydata(
+    *,
+    half: float = ORIGIN_CROSS_HALF,
+    ring_r: float = ORIGIN_RING_R,
+    ring_n: int = ORIGIN_RING_N,
+) -> pv.PolyData:
+    """Flat crosshair + thin ring centered at world origin (XY), not a sphere/point.
+
+    Geometry lies in z=0 (Front plane origin). Modest size for soft-GL readability.
+    """
+    # Crosshair arms
+    h_line = pv.Line((-half, 0.0, 0.0), (half, 0.0, 0.0))
+    v_line = pv.Line((0.0, -half, 0.0), (0.0, half, 0.0))
+    # Thin ring
+    ang = np.linspace(0.0, 2.0 * np.pi, ring_n + 1)
+    ring_pts = np.column_stack(
+        [ring_r * np.cos(ang), ring_r * np.sin(ang), np.zeros_like(ang)]
+    )
+    ring = pv.lines_from_points(ring_pts, close=False)
+    # Tiny center mark (very short cross, still a line — not a GL point sprite)
+    c = 0.025
+    c_h = pv.Line((-c, 0.0, 0.0), (c, 0.0, 0.0))
+    c_v = pv.Line((0.0, -c, 0.0), (0.0, c, 0.0))
+    return h_line.merge([v_line, ring, c_h, c_v])
+
+
 def _entity_fingerprint(ent: SketchEntity, *, selected: bool = False) -> str:
     """Geometry + style key for incremental actor upserts."""
     if isinstance(ent, LineEntity):
@@ -158,11 +190,25 @@ class _InteractorFilter(QObject):
             return True
         if et == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_Escape:
+                self.vp._clear_length_buffer()
                 self.vp.sketch_escape()
                 return True
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # Prefer committing typed length if buffer has digits
+                if self.vp._try_commit_length_buffer():
+                    return True
                 self.vp.sketch_confirm()
                 return True
+            if event.key() == Qt.Key.Key_Backspace:
+                if self.vp._length_buffer:
+                    self.vp._length_buffer = self.vp._length_buffer[:-1]
+                    self.vp._emit_length_buffer_status()
+                    return True
+            # Inline numeric length while drawing a line
+            text = event.text() or ""
+            if text and (text.isdigit() or text in ".-"):
+                if self.vp._accept_length_char(text):
+                    return True
         # Block middle/right orbit while sketching
         if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
             if event.button() != Qt.MouseButton.LeftButton:
@@ -212,6 +258,14 @@ class Viewport(QWidget):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(16)
         self._render_timer.timeout.connect(self._do_render)
+        # Longer coalesce during live resize/maximize (soft-GL is expensive)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(50)
+        self._resize_timer.timeout.connect(self._end_resize_coalesce)
+        self._resizing = False
+        self._length_buffer: str = ""
+        self._last_sketch_uv: Optional[Vec2] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -291,12 +345,11 @@ class Viewport(QWidget):
             grid="back", location="outer", color=GRID_COLOR, font_size=9,
             xtitle="X", ytitle="Y", ztitle="Z",
         )
-        # Flat 2D origin dot (not a 3D sphere)
+        # Flat crosshair + ring origin glyph (not a single GL point, not a sphere)
         self.plotter.add_mesh(
-            _flat_point_cloud(np.array([[0.0, 0.0, 0.0]])),
+            _origin_glyph_polydata(),
             color=TEXT_PRIMARY,
-            point_size=12,
-            render_points_as_spheres=False,
+            line_width=2.0,
             name="__origin",
             pickable=False,
         )
@@ -476,12 +529,27 @@ class Viewport(QWidget):
         self._request_render()
 
     def _request_render(self) -> None:
-        if self._ok and not self._render_timer.isActive():
+        if not self._ok:
+            return
+        # During resize use a longer debounce so maximize doesn't thrash llvmpipe
+        interval = 48 if self._resizing else 16
+        self._render_timer.setInterval(interval)
+        if not self._render_timer.isActive():
             self._render_timer.start()
 
     def _do_render(self) -> None:
         if self.plotter:
             self.plotter.render()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._resizing = True
+        self._resize_timer.start()  # restarts → coalesce until resize settles
+        self._request_render()
+        super().resizeEvent(event)
+
+    def _end_resize_coalesce(self) -> None:
+        self._resizing = False
+        self._request_render()
 
     def _remove_actor(self, name: str) -> None:
         if not self.plotter:
@@ -670,6 +738,8 @@ class Viewport(QWidget):
             pass
         self._dim_label_names: Set[str] = set()
         self._drag_before: Optional[dict] = None
+        self._clear_length_buffer()
+        self._last_sketch_uv = (0.0, 0.0)
         self._draw_sketch_overlay()
         self._rebuild_all_sketch_entities()
         self._update_junction_dots()
@@ -686,6 +756,7 @@ class Viewport(QWidget):
         self._remove_sketch_filter()
         self._clear_sketch_overlays()
         self._teardown_sketch_overlay_layer()
+        self._clear_length_buffer()
         self._sketch_ctrl = None
         self._sketch_feature_id = -1
         # Restore perspective for 3D solid viewing
@@ -694,6 +765,14 @@ class Viewport(QWidget):
         self.refresh_sketches()
         self._request_render()
         self.sketch_exited.emit()
+
+    def sketch_cursor_uv(self) -> Optional[Vec2]:
+        """Last known sketch-plane UV under the cursor (for paste placement)."""
+        if self._sketch_ctrl is None:
+            return None
+        if self._sketch_ctrl.preview_uv is not None:
+            return self._sketch_ctrl.preview_uv
+        return self._last_sketch_uv
 
     def set_sketch_tool(self, tool: SketchTool) -> None:
         if self._sketch_ctrl is None:
@@ -965,11 +1044,11 @@ class Viewport(QWidget):
         self._request_render()
 
     def _update_junction_dots(self) -> None:
-        """Flat on-plane dots at unique entity endpoints / connection points."""
+        """Flat faint dots only at shared connection points (≥2 entities meet)."""
         if not self.plotter or self._sketch_ctrl is None:
             return
         self._remove_actor("__sk_junctions")
-        pts_uv = self._sketch_ctrl.sketch.unique_endpoints()
+        pts_uv = self._sketch_ctrl.sketch.shared_endpoints()
         if not pts_uv:
             return
         fr = self._sketch_ctrl.sketch.frame
@@ -977,39 +1056,44 @@ class Viewport(QWidget):
         self._add_overlay_mesh(
             _flat_point_cloud(pts),
             color=SKETCH_GRID,
-            point_size=7,
+            point_size=5,
             render_points_as_spheres=False,
             name="__sk_junctions",
             pickable=False,
             render=False,
-            opacity=0.55,
+            opacity=0.35,
         )
 
     def _update_dim_labels(self) -> None:
-        """Line-length labels at midpoints in the current display unit."""
+        """Length label only for the selected (or hovered) line — reduces clutter."""
         if not self.plotter or self._sketch_ctrl is None or self._doc is None:
             return
-        # Clear previous labels
         for name in list(getattr(self, "_dim_label_names", set()) or set()):
             self._remove_actor(name)
         self._dim_label_names = set()
         self._remove_actor("__sk_dims")
         unit = self._doc.display_unit
         fr = self._sketch_ctrl.sketch.frame
+        ctrl = self._sketch_ctrl
+        show_ids = set()
+        if ctrl.selected_entity_id >= 0:
+            show_ids.add(ctrl.selected_entity_id)
+        if ctrl.hover_handle is not None:
+            show_ids.add(ctrl.hover_handle.entity_id)
         points = []
         labels = []
-        for ent in self._sketch_ctrl.sketch.entities:
+        for ent in ctrl.sketch.entities:
             if not isinstance(ent, LineEntity):
                 continue
+            if ent.id not in show_ids:
+                continue
             mid = ent.midpoint()
-            w = fr.to_world(mid)
-            points.append(w)
+            points.append(fr.to_world(mid))
             labels.append(format_length(line_length(ent), unit))
         if not points:
             return
         try:
-            # Single multi-label actor on the main plotter (visible with sketch camera)
-            actor = self.plotter.add_point_labels(
+            self.plotter.add_point_labels(
                 np.array(points, float),
                 labels,
                 name="__sk_dims",
@@ -1023,40 +1107,43 @@ class Viewport(QWidget):
                 show_points=False,
             )
             self._dim_label_names.add("__sk_dims")
-            _ = actor
         except Exception as exc:  # noqa: BLE001
-            # Fallback: one label actor per line
             print(f"[viewport] dim labels: {exc}", file=sys.stderr)
-            for i, (pt, lab) in enumerate(zip(points, labels)):
-                name = f"__sk_dim_{i}"
-                try:
-                    self.plotter.add_point_labels(
-                        np.array([pt], float),
-                        [lab],
-                        name=name,
-                        font_size=14,
-                        text_color=TEXT_PRIMARY,
-                        point_size=0,
-                        shape=None,
-                        always_visible=True,
-                        pickable=False,
-                        render=False,
-                        show_points=False,
-                    )
-                    self._dim_label_names.add(name)
-                except Exception:
-                    pass
 
     def dim_label_texts(self) -> list:
-        """Return current line-length label strings (for tests / verification)."""
+        """Label strings currently shown (selected/hovered lines only)."""
         if self._sketch_ctrl is None or self._doc is None:
             return []
         unit = self._doc.display_unit
+        ctrl = self._sketch_ctrl
+        show_ids = set()
+        if ctrl.selected_entity_id >= 0:
+            show_ids.add(ctrl.selected_entity_id)
+        if ctrl.hover_handle is not None:
+            show_ids.add(ctrl.hover_handle.entity_id)
         out = []
-        for ent in self._sketch_ctrl.sketch.entities:
-            if isinstance(ent, LineEntity):
+        for ent in ctrl.sketch.entities:
+            if isinstance(ent, LineEntity) and ent.id in show_ids:
                 out.append(format_length(line_length(ent), unit))
         return out
+
+    def labeled_entity_ids(self) -> list:
+        """Entity ids that currently have a dimension label."""
+        if self._sketch_ctrl is None:
+            return []
+        ctrl = self._sketch_ctrl
+        ids = []
+        if ctrl.selected_entity_id >= 0:
+            ent = ctrl.sketch.find_entity(ctrl.selected_entity_id)
+            if isinstance(ent, LineEntity):
+                ids.append(ent.id)
+        if ctrl.hover_handle is not None:
+            hid = ctrl.hover_handle.entity_id
+            if hid not in ids:
+                ent = ctrl.sketch.find_entity(hid)
+                if isinstance(ent, LineEntity):
+                    ids.append(hid)
+        return ids
 
     def _upsert_entity_actor(self, ent: SketchEntity) -> None:
         if not self.plotter or self._sketch_ctrl is None:
@@ -1216,6 +1303,7 @@ class Viewport(QWidget):
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             return
+        self._last_sketch_uv = uv
         prev_hover = self._sketch_ctrl.hover_handle
         self._sketch_ctrl.on_move(uv)
         # Incremental: only update dragged entity or preview
@@ -1370,10 +1458,66 @@ class Viewport(QWidget):
         self._request_render()
         self.status_message.emit("Zoom to fit")
 
-    def _request_render(self) -> None:
-        if self._ok and not self._render_timer.isActive():
-            self._render_timer.start()
+    # ----- inline length while drawing -----
+    def _clear_length_buffer(self) -> None:
+        self._length_buffer = ""
 
-    def _do_render(self) -> None:
-        if self.plotter:
-            self.plotter.render()
+    def _emit_length_buffer_status(self) -> None:
+        if not self._length_buffer:
+            return
+        unit = self._doc.display_unit if self._doc else None
+        suf = unit.label if unit is not None else "mm"
+        self.sketch_status.emit(f"Length: {self._length_buffer} {suf}  (Enter to commit)")
+
+    def _accept_length_char(self, ch: str) -> bool:
+        """Accumulate a typed char into the length buffer if drawing a line."""
+        if self._sketch_ctrl is None:
+            return False
+        if self._sketch_ctrl.tool is not SketchTool.LINE:
+            return False
+        if not self._sketch_ctrl.is_drawing():
+            return False
+        # only after first endpoint
+        if self._sketch_ctrl.draw is None or len(self._sketch_ctrl.draw.points) != 1:
+            return False
+        if ch == "." and "." in self._length_buffer:
+            return True  # consume, ignore second dot
+        if ch == "-" and self._length_buffer:
+            return True  # no mid-number minus
+        if ch == "-" and not self._length_buffer:
+            return True  # ignore leading minus for length
+        self._length_buffer += ch
+        self._emit_length_buffer_status()
+        return True
+
+    def _try_commit_length_buffer(self) -> bool:
+        """If buffer has a valid length, commit the line at that distance."""
+        if not self._length_buffer or self._sketch_ctrl is None or self._doc is None:
+            return False
+        if self._sketch_ctrl.tool is not SketchTool.LINE:
+            return False
+        if not self._sketch_ctrl.is_drawing():
+            return False
+        try:
+            from cadcore.units import to_mm
+
+            display_val = float(self._length_buffer)
+            length_mm = to_mm(display_val, self._doc.display_unit)
+        except ValueError:
+            self._clear_length_buffer()
+            return False
+        msg = self._sketch_ctrl.commit_line_length(length_mm)
+        self._clear_length_buffer()
+        if not msg:
+            return False
+        ent = self._sketch_ctrl.sketch.entities[-1]
+        if self._sketch_feature_id >= 0:
+            self._doc.record_entity_add(self._sketch_feature_id, ent)
+        self._upsert_entity_actor(ent)
+        self._clear_preview()
+        self._update_handles_visual()
+        self._update_junction_dots()
+        self._update_dim_labels()
+        self.sketch_status.emit(f"Sketch: {msg} ({display_val:g} {self._doc.display_unit.label})")
+        self._request_render()
+        return True

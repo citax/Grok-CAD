@@ -24,6 +24,7 @@ def test_copy_paste_offsets_and_new_id():
     assert pasted is not None
     assert isinstance(pasted, LineEntity)
     assert pasted.id != line.id
+    # first paste uses 1 * PASTE_UV_DELTA
     assert abs(pasted.p0[0] - (1.0 + PASTE_UV_DELTA[0])) < 1e-9
     assert abs(pasted.p0[1] - (2.0 + PASTE_UV_DELTA[1])) < 1e-9
     assert abs(pasted.p1[0] - (4.0 + PASTE_UV_DELTA[0])) < 1e-9
@@ -52,7 +53,6 @@ def test_cut_copies_and_deletes():
     eid = line.id
     assert doc.cut_entity(skf.id, eid)
     assert sk.find_entity(eid) is None
-    # paste restores a duplicate (offset)
     pasted = doc.paste_entity(skf.id)
     assert pasted is not None
     assert sk.find_entity(eid) is None
@@ -65,7 +65,6 @@ def test_paste_empty_clipboard_noop():
 
 
 def test_paste_on_plane_world():
-    """Pasted geometry stays on the sketch plane in world coords."""
     import numpy as np
 
     doc, skf = _front_sketch()
@@ -77,5 +76,5 @@ def test_paste_on_plane_world():
     fr = sk.frame
     for uv in (p.p0, p.p1):
         w = fr.to_world(uv)
-        dev = abs(float(np.dot(fr.normal, w - fr.origin)))
+        dev = abs(float(np.dot(fr.normal, np.asarray(w) - fr.origin)))
         assert dev < 1e-9

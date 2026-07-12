@@ -292,6 +292,35 @@ class Sketch:
             out.append((float(p[0]), float(p[1])))
         return out
 
+    def shared_endpoints(self, *, tol: float = 1e-9) -> List[Vec2]:
+        """Endpoints that appear on ≥2 entities (true junctions / connections)."""
+        raw: List[Vec2] = []
+        for e in self.entities:
+            if isinstance(e, LineEntity):
+                raw.extend([e.p0, e.p1])
+            elif isinstance(e, RectEntity):
+                raw.extend(e.corners())
+            elif isinstance(e, CircleEntity):
+                raw.append(e.center)
+        clusters: List[List[Vec2]] = []
+        for p in raw:
+            placed = False
+            for cl in clusters:
+                q = cl[0]
+                if abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol:
+                    cl.append(p)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([p])
+        out: List[Vec2] = []
+        for cl in clusters:
+            if len(cl) >= 2:
+                u = sum(x[0] for x in cl) / len(cl)
+                v = sum(x[1] for x in cl) / len(cl)
+                out.append((float(u), float(v)))
+        return out
+
 
 def line_length(ent: LineEntity) -> float:
     """World-UV length of a line (internal mm)."""

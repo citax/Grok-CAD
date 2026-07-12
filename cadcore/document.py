@@ -313,7 +313,7 @@ class Feature:
 # Undo / redo command stack
 # ---------------------------------------------------------------------------
 
-PASTE_UV_DELTA: Tuple[float, float] = (5.0, 5.0)  # mm offset for paste
+PASTE_UV_DELTA: Tuple[float, float] = (5.0, 5.0)  # mm step between consecutive pastes
 
 
 class HistoryCommand:
@@ -446,6 +446,21 @@ def _entity_of(doc: "Document", sketch_id: int, eid: int) -> SketchEntity:
     return ent
 
 
+def _entity_anchor_uv(data: dict) -> Tuple[float, float]:
+    """Anchor UV for paste placement (line p0 / rect c0 / circle center)."""
+    kind = data.get("kind")
+    if kind == "line":
+        p = data["p0"]
+        return (float(p[0]), float(p[1]))
+    if kind == "rect":
+        p = data["c0"]
+        return (float(p[0]), float(p[1]))
+    if kind == "circle":
+        p = data["center"]
+        return (float(p[0]), float(p[1]))
+    return (0.0, 0.0)
+
+
 @dataclass
 class Document:
     name: str = "Untitled"
@@ -462,6 +477,7 @@ class Document:
     _undo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
     _redo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
     _clipboard: Optional[dict] = field(default=None, repr=False)
+    _paste_n: int = 0  # consecutive paste count (reset on copy); advances offset
 
     def add_feature(self, f: Feature) -> int:
         f.id = self._next_id
@@ -502,6 +518,7 @@ class Document:
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._clipboard = None
+        self._paste_n = 0
 
     # ----- history -----
     def can_undo(self) -> bool:
@@ -579,7 +596,7 @@ class Document:
     def copy_entity(self, sketch_id: int, eid: int) -> bool:
         ent = _entity_of(self, sketch_id, eid)
         self._clipboard = snapshot_entity(ent)
-        # Drop id so paste always allocates a new one
+        self._paste_n = 0  # next paste starts a new offset sequence
         return True
 
     def cut_entity(self, sketch_id: int, eid: int) -> bool:
@@ -587,12 +604,38 @@ class Document:
             return False
         return self.delete_entity(sketch_id, eid)
 
-    def paste_entity(self, sketch_id: int) -> Optional[SketchEntity]:
-        """Paste clipboard as new entity offset by PASTE_UV_DELTA (undoable)."""
+    def paste_entity(
+        self,
+        sketch_id: int,
+        *,
+        place_uv: Optional[Tuple[float, float]] = None,
+    ) -> Optional[SketchEntity]:
+        """Paste clipboard as a new entity (undoable).
+
+        Offset advances cumulatively so repeated Ctrl+V never stacks on itself.
+        If ``place_uv`` is given, the entity's anchor (p0 / c0 / center) is placed
+        there, then staggered by ``(paste_n-1) * PASTE_UV_DELTA``.
+        Without ``place_uv``, offset is ``paste_n * PASTE_UV_DELTA`` from the
+        clipboard geometry.
+        """
         if self._clipboard is None:
             return None
         sk = _sketch_of(self, sketch_id)
-        data = offset_entity_data(self._clipboard, PASTE_UV_DELTA[0], PASTE_UV_DELTA[1])
+        self._paste_n += 1
+        n = self._paste_n
+        data = dict(self._clipboard)
+        if place_uv is not None:
+            anchor = _entity_anchor_uv(data)
+            du = float(place_uv[0]) - anchor[0]
+            dv = float(place_uv[1]) - anchor[1]
+            # Stagger subsequent pastes at the same cursor so they never overlap
+            du += (n - 1) * PASTE_UV_DELTA[0]
+            dv += (n - 1) * PASTE_UV_DELTA[1]
+            data = offset_entity_data(data, du, dv)
+        else:
+            data = offset_entity_data(
+                data, n * PASTE_UV_DELTA[0], n * PASTE_UV_DELTA[1]
+            )
         data["id"] = int(sk._next_entity_id)
         ent = restore_entity(data)
         sk.insert_entity(ent)
