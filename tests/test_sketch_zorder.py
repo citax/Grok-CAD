@@ -1,32 +1,63 @@
 """Sketch-mode rendering invariants (no hanging full Viewport under offscreen).
 
-Full end-to-end pixel proof is the xcb script that prints SKETCH_2D_OK through
-the real MainWindow.enter_sketch path. These tests lock the pure invariants:
-parallel projection helpers, depth bias, and flat (non-sphere) point clouds.
+Full end-to-end proof is the xcb script that prints SKETCH_ONPLANE_OK through
+the real MainWindow.enter_sketch path (on-plane after exit + in-sketch z-order).
+These tests lock pure geometry invariants: entity polydata lies exactly on the
+sketch plane, flat (non-sphere) point clouds, and overlay-layer helpers exist.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from app.viewport import (
-    _SKETCH_DEPTH_BIAS,
     _entity_polydata,
     _flat_point_cloud,
-    _plane_bias,
 )
 from cadcore.sketch import PlaneFrame, Sketch
 
+PLANES = ("PLANE_FRONT", "PLANE_TOP", "PLANE_RIGHT")
 
-def test_entity_bias_toward_camera_vs_axis_back():
-    fr = PlaneFrame.from_plane_type("PLANE_FRONT")
+
+def _max_plane_deviation(pts: np.ndarray, fr: PlaneFrame) -> float:
+    """max |n · (p − origin)| over polydata points."""
+    n = np.asarray(fr.normal, float)
+    o = np.asarray(fr.origin, float)
+    pts = np.asarray(pts, float).reshape(-1, 3)
+    if pts.size == 0:
+        return 0.0
+    return float(np.max(np.abs((pts - o) @ n)))
+
+
+@pytest.mark.parametrize("plane", PLANES)
+def test_line_entity_polydata_on_plane(plane: str):
+    fr = PlaneFrame.from_plane_type(plane)
     sk = Sketch(frame=fr)
     line = sk.add_line((-2.0, 0.0), (2.0, 0.0))
     pts = np.asarray(_entity_polydata(line, sk).points, float)
-    assert pts[:, 2].mean() >= _SKETCH_DEPTH_BIAS * 0.9
-    back = _plane_bias(fr, toward_camera=False)
-    assert back[2] < 0
-    assert _SKETCH_DEPTH_BIAS >= 0.05
+    dev = _max_plane_deviation(pts, fr)
+    assert dev < 1e-6, f"{plane} line off-plane max |n·(p-o)|={dev}"
+
+
+@pytest.mark.parametrize("plane", PLANES)
+def test_rect_entity_polydata_on_plane(plane: str):
+    fr = PlaneFrame.from_plane_type(plane)
+    sk = Sketch(frame=fr)
+    rect = sk.add_rectangle((-1.0, -0.5), (1.5, 1.0))
+    pts = np.asarray(_entity_polydata(rect, sk).points, float)
+    dev = _max_plane_deviation(pts, fr)
+    assert dev < 1e-6, f"{plane} rect off-plane max |n·(p-o)|={dev}"
+
+
+@pytest.mark.parametrize("plane", PLANES)
+def test_circle_entity_polydata_on_plane(plane: str):
+    fr = PlaneFrame.from_plane_type(plane)
+    sk = Sketch(frame=fr)
+    circ = sk.add_circle((0.25, -0.3), 0.8)
+    pts = np.asarray(_entity_polydata(circ, sk).points, float)
+    dev = _max_plane_deviation(pts, fr)
+    assert dev < 1e-6, f"{plane} circle off-plane max |n·(p-o)|={dev}"
 
 
 def test_flat_point_cloud_is_vertices_only():
@@ -35,14 +66,12 @@ def test_flat_point_cloud_is_vertices_only():
     assert cloud.n_cells == 0 or cloud.n_verts == cloud.n_points
 
 
-def test_bias_applied_to_line_on_u_axis():
-    """Line on the u-axis is lifted along +normal so it is not coplanar with axes."""
-    fr = PlaneFrame.from_plane_type("PLANE_FRONT")
-    sk = Sketch(frame=fr)
-    line = sk.add_line((-1.5, 0.0), (1.5, 0.0))
-    pts = np.asarray(_entity_polydata(line, sk).points, float)
-    # Coplanar axis would have z≈0; entity z ≈ bias
-    assert np.allclose(pts[:, 2], _SKETCH_DEPTH_BIAS, atol=1e-6)
+def test_no_depth_bias_symbols_exported():
+    """Geometric depth bias must not exist — overlay layer owns z-order."""
+    import app.viewport as vp
+
+    assert not hasattr(vp, "_SKETCH_DEPTH_BIAS")
+    assert not hasattr(vp, "_plane_bias")
 
 
 def test_set_parallel_projection_helper_exists():

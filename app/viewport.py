@@ -84,27 +84,21 @@ def _mesh_to_polydata(vertices: np.ndarray, faces: np.ndarray) -> pv.PolyData:
     return pv.PolyData(vertices, face_arr)
 
 
-# Sketch-mode depth separation (plane normal, toward camera for entities).
-# Must be large under software-GL (llvmpipe) + parallel projection depth precision.
-# Axes/grid are pushed the opposite way for a total 2× separation.
-_SKETCH_DEPTH_BIAS = 0.35
-
-
-def _plane_bias(frame, *, toward_camera: bool = True) -> np.ndarray:
-    n = np.asarray(frame.normal, dtype=np.float64)
-    return n * (_SKETCH_DEPTH_BIAS if toward_camera else -_SKETCH_DEPTH_BIAS)
-
-
 def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
+    """Build sketch entity geometry EXACTLY on the sketch plane (no depth bias).
+
+    In-sketch z-order over grid/axes is handled solely by the layer-1 overlay
+    renderer — do not bake a normal offset into the points (that displaces the
+    closed sketch after exit when drawn on the main renderer).
+    """
     fr = sketch.frame
-    bias = _plane_bias(fr, toward_camera=True)
     if isinstance(ent, LineEntity):
-        p0 = fr.to_world(ent.p0) + bias
-        p1 = fr.to_world(ent.p1) + bias
+        p0 = fr.to_world(ent.p0)
+        p1 = fr.to_world(ent.p1)
         return pv.Line(p0, p1)
     if isinstance(ent, RectEntity):
         cs = ent.corners()
-        pts = np.array([fr.to_world(c) + bias for c in cs + [cs[0]]], float)
+        pts = np.array([fr.to_world(c) for c in cs + [cs[0]]], float)
         return pv.lines_from_points(pts, close=False)
     if isinstance(ent, CircleEntity):
         # polyline circle in plane
@@ -116,7 +110,7 @@ def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
                 ent.center[0] + ent.radius * np.cos(a),
                 ent.center[1] + ent.radius * np.sin(a),
             )
-            pts.append(fr.to_world(uv) + bias)
+            pts.append(fr.to_world(uv))
         return pv.lines_from_points(np.array(pts, float), close=False)
     return pv.PolyData()
 
@@ -782,7 +776,8 @@ class Viewport(QWidget):
             c = fr.to_world((-half, t))
             d = fr.to_world((half, t))
             pts_v.extend([c, d])
-        # Build multiline via segments
+        # Build multiline via segments — exactly on the sketch plane (no depth bias).
+        # In-sketch z-order over grid/axes is handled solely by the layer-1 overlay.
         def segs(pairs):
             lines = []
             for i in range(0, len(pairs), 2):
@@ -791,28 +786,20 @@ class Viewport(QWidget):
                 return pv.PolyData()
             return lines[0].merge(lines[1:]) if len(lines) > 1 else lines[0]
 
-        # Push grid/axes slightly into the plane (away from camera) so entities win z-order
-        back = _plane_bias(fr, toward_camera=False)
-
-        def _shift_pts(pairs):
-            return [np.asarray(p, float) + back for p in pairs]
-
-        pts_u = _shift_pts(pts_u)
-        pts_v = _shift_pts(pts_v)
         grid = segs(pts_u).merge(segs(pts_v)) if pts_u else pv.PolyData()
         self._remove_actor("__sk_grid")
         self.plotter.add_mesh(
             grid, color=SKETCH_GRID, line_width=1, name="__sk_grid", pickable=False, render=False
         )
-        # H axis (u) and V axis (v) through origin — behind user sketch strokes
+        # H axis (u) and V axis (v) through origin — coplanar with user strokes
         self._remove_actor("__sk_h")
         self._remove_actor("__sk_v")
         self.plotter.add_mesh(
-            pv.Line(fr.to_world((-half, 0)) + back, fr.to_world((half, 0)) + back),
+            pv.Line(fr.to_world((-half, 0)), fr.to_world((half, 0))),
             color=SKETCH_H, line_width=2, name="__sk_h", pickable=False, render=False,
         )
         self.plotter.add_mesh(
-            pv.Line(fr.to_world((0, -half)) + back, fr.to_world((0, half)) + back),
+            pv.Line(fr.to_world((0, -half)), fr.to_world((0, half))),
             color=SKETCH_V, line_width=2, name="__sk_v", pickable=False, render=False,
         )
 
@@ -951,17 +938,15 @@ class Viewport(QWidget):
         self._clear_handles()
         ctrl = self._sketch_ctrl
         fr = ctrl.sketch.frame
-        bias = _plane_bias(fr, toward_camera=True)
         pts = []
         for h in ctrl.sketch.all_handles():
             if ctrl.selected_entity_id >= 0 and h.entity_id != ctrl.selected_entity_id:
                 if ctrl.hover_handle is None or ctrl.hover_handle.entity_id != h.entity_id:
                     continue
-            w = fr.to_world(h.uv) + bias
-            pts.append(w)
+            pts.append(fr.to_world(h.uv))
         if not pts:
             return
-        # Flat 2D dots — never spheres (on overlay layer)
+        # Flat 2D dots on-plane — never spheres (overlay layer handles z-order)
         col = HANDLE_HOVER if ctrl.hover_handle else HANDLE_COLOR
         self._add_overlay_mesh(
             _flat_point_cloud(np.array(pts, float)),
@@ -984,12 +969,11 @@ class Viewport(QWidget):
         if ctrl.draw is None or not ctrl.draw.points:
             return
         fr = ctrl.sketch.frame
-        bias = _plane_bias(fr, toward_camera=True)
         p0 = ctrl.draw.points[0]
         p1 = ctrl.preview_uv
         if ctrl.tool is SketchTool.LINE:
-            # Same depth bias as committed entities so preview wins over axes
-            pdata = pv.Line(fr.to_world(p0) + bias, fr.to_world(p1) + bias)
+            # Exactly on-plane; overlay layer composites above grid/axes
+            pdata = pv.Line(fr.to_world(p0), fr.to_world(p1))
         elif ctrl.tool is SketchTool.RECTANGLE:
             from cadcore.sketch import EntityKind
             r = RectEntity(id=-1, kind=EntityKind.RECTANGLE, c0=p0, c1=p1)
@@ -1008,9 +992,9 @@ class Viewport(QWidget):
             render=False,
         )
         self._apply_sketch_actor_priority("__sk_preview")
-        # Inference cue — flat 2D dot, not a sphere
+        # Inference cue — flat 2D dot on-plane, not a sphere
         if ctrl.last_snap.kind in ("h", "v", "origin", "point"):
-            w = fr.to_world(ctrl.preview_uv) + bias
+            w = fr.to_world(ctrl.preview_uv)
             self._add_overlay_mesh(
                 _flat_point_cloud(np.array([w], float)),
                 color=ACCENT,
