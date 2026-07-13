@@ -307,6 +307,7 @@ class Viewport(QWidget):
         self._saved_size: Optional[Tuple[int, int]] = None
         self._perf_method = _PERF_METHOD
         self._draw_lod_active: bool = False
+        self._draw_saved_size: Optional[Tuple[int, int]] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -550,8 +551,11 @@ class Viewport(QWidget):
     def _begin_draw_lod(self) -> None:
         """LOD while actively drawing/dragging in sketch mode (not only camera).
 
-        Hides labels/junctions/grid AND committed sketch entity actors so each
-        mouse-move only composites the rubber-band preview (big soft-GL win).
+        Two attacks on soft-GL jank:
+        1) Hide labels/junctions/grid and committed sketch actors (less geometry).
+        2) Drop render resolution once to ~50% linear (~25% pixels) for the whole
+           stroke — fill-rate is the real bottleneck at large windows; set size
+           once at start, restore once at end (no per-move SetSize thrash).
         """
         if self._draw_lod_active:
             return
@@ -565,6 +569,20 @@ class Viewport(QWidget):
                     act.SetVisibility(0)
                 except Exception:
                     pass
+        # Fill-rate: lower render resolution once for the entire draw interaction
+        if self.plotter is not None and self._draw_saved_size is None:
+            try:
+                w, h = self.plotter.window_size
+                self._draw_saved_size = (int(w), int(h))
+                sw, sh = max(64, int(w * 0.5)), max(64, int(h * 0.5))
+                self.plotter.render_window.SetSize(sw, sh)
+            except Exception:
+                self._draw_saved_size = None
+        try:
+            if self.plotter is not None:
+                self.plotter.render_window.SetDesiredUpdateRate(12.0)
+        except Exception:
+            pass
         # Coalesce move renders more aggressively while drawing
         if self._render_timer:
             self._render_timer.setInterval(48)
@@ -581,6 +599,18 @@ class Viewport(QWidget):
                     act.SetVisibility(1)
                 except Exception:
                     pass
+        # Restore full resolution once (paired with SetSize in _begin_draw_lod)
+        if self.plotter is not None and self._draw_saved_size is not None:
+            try:
+                self.plotter.render_window.SetSize(*self._draw_saved_size)
+            except Exception:
+                pass
+            self._draw_saved_size = None
+        try:
+            if self.plotter is not None:
+                self.plotter.render_window.SetDesiredUpdateRate(0.0001)
+        except Exception:
+            pass
         if self._render_timer:
             self._render_timer.setInterval(16)
         # Restore full overlays from live state
