@@ -92,51 +92,46 @@ def plane_frame_for_feature(f: "Feature") -> PlaneFrame:
     return PlaneFrame.from_plane_type(f.type.name)
 
 
-def is_closed_profile(entity: SketchEntity) -> bool:
-    """True for Rectangle / Circle sketch entities with positive area."""
-    if isinstance(entity, RectEntity):
-        u0, u1 = sorted([entity.c0[0], entity.c1[0]])
-        v0, v1 = sorted([entity.c0[1], entity.c1[1]])
-        return (u1 - u0) > 1e-12 and (v1 - v0) > 1e-12
-    if isinstance(entity, CircleEntity):
-        return entity.radius > 1e-12
-    return False
+from cadcore.profiles import (  # noqa: E402  — re-export after sketch imports
+    ClosedLineLoop,
+    is_closed_profile,
+    list_closed_profiles,
+    point_in_profile,
+    profile_polygon_uv,
+)
 
 
-def first_closed_profile(sketch: Sketch) -> Optional[SketchEntity]:
+def first_closed_profile(sketch: Sketch) -> Optional[object]:
+    """First rectangle/circle entity or detected closed line loop."""
     for e in sketch.entities:
         if is_closed_profile(e):
             return e
-    return None
+    try:
+        from cadcore.profiles import find_closed_line_loops
+
+        loops = find_closed_line_loops(sketch)
+        return loops[0] if loops else None
+    except ValueError:
+        return None
 
 
-def _point_in_rect(uv: Tuple[float, float], rect: RectEntity, *, margin: float = 0.0) -> bool:
-    u0, u1 = sorted([rect.c0[0], rect.c1[0]])
-    v0, v1 = sorted([rect.c0[1], rect.c1[1]])
-    return (u0 + margin <= uv[0] <= u1 - margin) and (v0 + margin <= uv[1] <= v1 - margin)
+def _profile_id(p: object) -> int:
+    return int(getattr(p, "id", -1))
 
 
-def _profile_contains(outer: SketchEntity, inner: SketchEntity) -> bool:
+def _profile_contains(outer: object, inner: object) -> bool:
     """True if ``inner`` is strictly inside ``outer`` (both closed profiles)."""
     if not is_closed_profile(outer) or not is_closed_profile(inner):
         return False
-    if outer is inner or outer.id == inner.id:
+    if outer is inner or _profile_id(outer) == _profile_id(inner):
         return False
-    # Rectangle outer
-    if isinstance(outer, RectEntity):
-        if isinstance(inner, CircleEntity):
-            # circle disk strictly inside rectangle
-            return (
-                _point_in_rect(inner.center, outer, margin=inner.radius + 1e-9)
-            )
-        if isinstance(inner, RectEntity):
-            for c in inner.corners():
-                if not _point_in_rect(c, outer, margin=1e-9):
-                    return False
-            return True
-    # Circle outer
-    if isinstance(outer, CircleEntity):
-        if isinstance(inner, CircleEntity):
+    # Sample key points of inner
+    if isinstance(inner, CircleEntity):
+        pts = [inner.center]
+        # also require full disk: center + margin handled via radius in point_in
+        if isinstance(outer, RectEntity):
+            return point_in_profile(inner.center, outer, margin=inner.radius + 1e-9)
+        if isinstance(outer, CircleEntity):
             d = float(
                 np.hypot(
                     inner.center[0] - outer.center[0],
@@ -144,23 +139,24 @@ def _profile_contains(outer: SketchEntity, inner: SketchEntity) -> bool:
                 )
             )
             return d + inner.radius < outer.radius - 1e-9
-        if isinstance(inner, RectEntity):
-            for c in inner.corners():
-                d = float(
-                    np.hypot(c[0] - outer.center[0], c[1] - outer.center[1])
-                )
-                if d >= outer.radius - 1e-9:
-                    return False
-            return True
-    return False
+        if isinstance(outer, ClosedLineLoop):
+            return point_in_profile(inner.center, outer)
+        return False
+    if isinstance(inner, RectEntity):
+        pts = inner.corners()
+    elif isinstance(inner, ClosedLineLoop):
+        pts = list(inner.vertices)
+    else:
+        return False
+    return all(point_in_profile(c, outer, margin=1e-9) for c in pts)
 
 
 @dataclass
 class ResolvedProfiles:
     """Outer boundary + optional hole loops for extrude/pad."""
 
-    outer: SketchEntity
-    holes: List[SketchEntity] = field(default_factory=list)
+    outer: object  # SketchEntity | ClosedLineLoop
+    holes: List[object] = field(default_factory=list)
 
 
 def resolve_profiles(
@@ -168,30 +164,40 @@ def resolve_profiles(
     *,
     preferred_outer_id: int = -1,
 ) -> ResolvedProfiles:
-    """Resolve closed sketch entities into an outer boundary + hole loops.
+    """Resolve closed sketch entities / line-loops into outer + hole loops.
 
     - Single closed profile → outer only (backward compatible).
     - Nested (outer contains others) → outer + inners as holes.
     - Disjoint closed profiles (none contains the others) → ValueError
       (ambiguous; GUI should offer a picker).
+    - Closed line-segment loops count as profiles (see cadcore.profiles).
     """
-    closed = [e for e in sketch.entities if is_closed_profile(e)]
-    if not closed:
-        raise ValueError("sketch has no closed profile (rectangle or circle)")
+    closed = list_closed_profiles(sketch)
     if len(closed) == 1:
         return ResolvedProfiles(outer=closed[0], holes=[])
 
     # If user picked a specific outer, use it and treat contained profiles as holes
-    if preferred_outer_id >= 0:
-        outer = next((e for e in closed if e.id == preferred_outer_id), None)
+    if preferred_outer_id != -1:
+        outer = next((e for e in closed if _profile_id(e) == preferred_outer_id), None)
+        # Also: preferred may be a line id belonging to a loop
+        if outer is None:
+            for e in closed:
+                if isinstance(e, ClosedLineLoop) and preferred_outer_id in e.line_ids:
+                    outer = e
+                    break
         if outer is None:
             raise ValueError(f"sketch has no closed profile id={preferred_outer_id}")
-        holes = [e for e in closed if e.id != outer.id and _profile_contains(outer, e)]
-        # Any other closed profile neither outer nor hole → still ambiguous
+        holes = [
+            e
+            for e in closed
+            if _profile_id(e) != _profile_id(outer) and _profile_contains(outer, e)
+        ]
         others = [
             e
             for e in closed
-            if e.id != outer.id and e not in holes and not _profile_contains(e, outer)
+            if _profile_id(e) != _profile_id(outer)
+            and e not in holes
+            and not _profile_contains(e, outer)
         ]
         if others:
             raise ValueError(
@@ -201,14 +207,17 @@ def resolve_profiles(
         return ResolvedProfiles(outer=outer, holes=holes)
 
     # Find roots: not contained by any other closed profile
-    roots: List[SketchEntity] = []
+    roots: List[object] = []
     for e in closed:
-        if any(_profile_contains(o, e) for o in closed if o.id != e.id):
+        if any(
+            _profile_contains(o, e)
+            for o in closed
+            if _profile_id(o) != _profile_id(e)
+        ):
             continue
         roots.append(e)
 
     if len(roots) == 0:
-        # Shouldn't happen (cycle); fall back to first
         return ResolvedProfiles(outer=closed[0], holes=[])
 
     if len(roots) > 1:
@@ -218,7 +227,11 @@ def resolve_profiles(
         )
 
     outer = roots[0]
-    holes = [e for e in closed if e.id != outer.id and _profile_contains(outer, e)]
+    holes = [
+        e
+        for e in closed
+        if _profile_id(e) != _profile_id(outer) and _profile_contains(outer, e)
+    ]
     return ResolvedProfiles(outer=outer, holes=holes)
 
 

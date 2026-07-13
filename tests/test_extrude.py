@@ -128,7 +128,7 @@ def test_document_extrude_rejects_open_only_sketch():
     assert skf is not None and skf.sketch is not None
     skf.sketch.add_line((0, 0), (1, 0))
     assert first_closed_profile(skf.sketch) is None
-    with pytest.raises(ValueError, match="closed profile"):
+    with pytest.raises(ValueError, match="closed profile|open chain"):
         doc.create_extrude(skf.id, 1.0)
 
 

@@ -304,8 +304,10 @@ class Viewport(QWidget):
         assert self.plotter is not None
         rw = self.plotter.render_window
         try:
+            # Software GL (llvmpipe) is fill-rate bound at large windows —
+            # never enable MSAA; keep interactive rate modest.
             rw.SetMultiSamples(0)
-            rw.SetDesiredUpdateRate(30.0)
+            rw.SetDesiredUpdateRate(20.0)
             rw.SetStillUpdateRate(0.0001)
         except Exception:
             pass
@@ -341,10 +343,7 @@ class Viewport(QWidget):
 
     def _setup_helpers(self) -> None:
         assert self.plotter is not None
-        self.plotter.show_bounds(
-            grid="back", location="outer", color=GRID_COLOR, font_size=9,
-            xtitle="X", ytitle="Y", ztitle="Z",
-        )
+        # No environment bounds box — keeps the scene uncluttered.
         # Flat crosshair + ring origin glyph (not a single GL point, not a sphere)
         self.plotter.add_mesh(
             _origin_glyph_polydata(),
@@ -353,19 +352,32 @@ class Viewport(QWidget):
             name="__origin",
             pickable=False,
         )
-        for end, color, name in (
-            ((2.4, 0, 0), AXIS_X, "__ax"),
-            ((0, 2.4, 0), AXIS_Y, "__ay"),
-            ((0, 0, 2.4), AXIS_Z, "__az"),
+        # Neutral, faint world axes (not loud RGB) — low-opacity grey lines
+        axis_color = GRID_COLOR
+        for end, name in (
+            ((2.4, 0, 0), "__ax"),
+            ((0, 2.4, 0), "__ay"),
+            ((0, 0, 2.4), "__az"),
         ):
             self.plotter.add_mesh(
-                pv.Line((0, 0, 0), end), color=color, line_width=3, name=name, pickable=False
+                pv.Line((0, 0, 0), end),
+                color=axis_color,
+                line_width=1.5,
+                name=name,
+                pickable=False,
+                opacity=0.35,
             )
+        # Small corner orientation widget only (unobtrusive)
         try:
             self.plotter.add_axes(
-                line_width=2, xlabel="X", ylabel="Y", zlabel="Z",
-                x_color=AXIS_X, y_color=AXIS_Y, z_color=AXIS_Z,
-                viewport=(0.0, 0.0, 0.18, 0.18),
+                line_width=1,
+                xlabel="X",
+                ylabel="Y",
+                zlabel="Z",
+                x_color=GRID_COLOR,
+                y_color=GRID_COLOR,
+                z_color=GRID_COLOR,
+                viewport=(0.0, 0.0, 0.12, 0.12),
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
@@ -380,7 +392,9 @@ class Viewport(QWidget):
             print(f"[viewport] picking: {exc}", file=sys.stderr)
 
     def _setup_interaction_lod(self) -> None:
+        """Throttle VTK render rate during camera drag; never rebuild scene."""
         assert self.plotter is not None
+        self._interacting = False
         try:
             iren = self.plotter.iren.interactor
         except Exception:
@@ -389,16 +403,20 @@ class Viewport(QWidget):
         def on_start(_o=None, _e=None) -> None:
             if self.in_sketch_mode:
                 return
+            self._interacting = True
             try:
-                self.plotter.render_window.SetDesiredUpdateRate(45.0)
+                # Lower interactive FPS under soft-GL to cut fill-rate jank
+                self.plotter.render_window.SetDesiredUpdateRate(12.0)
             except Exception:
                 pass
 
         def on_end(_o=None, _e=None) -> None:
+            self._interacting = False
             try:
                 self.plotter.render_window.SetDesiredUpdateRate(0.0001)
             except Exception:
                 pass
+            # One final still render — no feature rebuild on pure camera move
             self._request_render()
 
         for ev in ("StartInteractionEvent", "LeftButtonPressEvent"):
@@ -531,8 +549,13 @@ class Viewport(QWidget):
     def _request_render(self) -> None:
         if not self._ok:
             return
-        # During resize use a longer debounce so maximize doesn't thrash llvmpipe
-        interval = 48 if self._resizing else 16
+        # Longer debounce during resize / camera interaction (soft-GL fill-rate)
+        if self._resizing:
+            interval = 80
+        elif getattr(self, "_interacting", False):
+            interval = 48
+        else:
+            interval = 16
         self._render_timer.setInterval(interval)
         if not self._render_timer.isActive():
             self._render_timer.start()
@@ -542,8 +565,11 @@ class Viewport(QWidget):
             self.plotter.render()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
+        # Coalesce paints while the window is being dragged/maximized.
+        # Pure camera/window resize must NOT rebuild sketch/solid actors.
         self._resizing = True
-        self._resize_timer.start()  # restarts → coalesce until resize settles
+        self._resize_timer.setInterval(80)
+        self._resize_timer.start()  # restarts → settle
         self._request_render()
         super().resizeEvent(event)
 

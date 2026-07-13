@@ -339,8 +339,12 @@ def _profile_to_cross_section(
     *,
     circle_segments: int = 64,
 ) -> "CrossSection":
-    """Build a CrossSection from a closed sketch entity or UV polygon."""
+    """Build a CrossSection from a closed sketch entity, line-loop, or UV polygon."""
+    from cadcore.profiles import ClosedLineLoop
     from cadcore.sketch import CircleEntity, EntityKind, LineEntity, RectEntity
+
+    if isinstance(profile, ClosedLineLoop):
+        return _cross_section_from_polygon(profile.vertices)
 
     if isinstance(profile, (list, tuple)) and profile and not hasattr(profile, "kind"):
         # Sequence of UV points
@@ -736,6 +740,7 @@ def extrude_profile(
 
     Open entities (e.g. lines) and degenerate geometry are rejected with ValueError.
     """
+    from cadcore.profiles import ClosedLineLoop
     from cadcore.sketch import CircleEntity, EntityKind, LineEntity, RectEntity
 
     if isinstance(profile, LineEntity) or getattr(profile, "kind", None) is EntityKind.LINE:
@@ -749,6 +754,8 @@ def extrude_profile(
             return extrude_circle(
                 profile.center, profile.radius, distance, frame, segments=segments
             )
+        if isinstance(profile, ClosedLineLoop):
+            return extrude_polygon(profile.vertices, distance, frame)
         raise ValueError(
             f"unsupported profile type for extrude: {type(profile).__name__}"
         )
@@ -976,6 +983,7 @@ def revolve_profile(
 
     Open entities, axis-crossing profiles, and non-positive angles are rejected.
     """
+    from cadcore.profiles import ClosedLineLoop
     from cadcore.sketch import CircleEntity, EntityKind, LineEntity, RectEntity
 
     if isinstance(profile, LineEntity) or getattr(profile, "kind", None) is EntityKind.LINE:
@@ -994,6 +1002,15 @@ def revolve_profile(
         return revolve_circle(
             profile.center,
             profile.radius,
+            frame,
+            axis_origin=axis_origin,
+            axis_direction=axis_direction,
+            angle_degrees=angle_degrees,
+            segments=segments,
+        )
+    if isinstance(profile, ClosedLineLoop):
+        return revolve_polygon(
+            profile.vertices,
             frame,
             axis_origin=axis_origin,
             axis_direction=axis_direction,
