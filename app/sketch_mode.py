@@ -1,4 +1,4 @@
-"""Sketch mode controller: tools, snapping, handle editing (logic only)."""
+"""Sketch mode controller: tools, snapping, handle editing, polyline chaining."""
 
 from __future__ import annotations
 
@@ -20,13 +20,14 @@ from cadcore.sketch import (
     Vec2,
 )
 
-# Pixel-ish tolerances converted using a scale factor (world units per pixel estimate)
+# Default world-unit fallbacks (used when no pixel scale is supplied)
 SNAP_GRID = 0.25
 SNAP_POINT = 0.15
-# Angular ortho snap: only lock to H/V when direction is within this many degrees
 SNAP_ANGLE_DEG = 7.0
-# Legacy alias kept for any external imports (no longer used for locking)
-SNAP_HV = 0.12
+SNAP_HV = 0.12  # legacy
+# Preferred screen-space snap radius (pixels) — converted to world via camera
+SNAP_POINT_PX = 14.0
+# Auto-close / chain-start snap uses the same point tolerance
 
 
 class SketchTool(Enum):
@@ -39,7 +40,7 @@ class SketchTool(Enum):
 @dataclass
 class SnapResult:
     uv: Vec2
-    kind: str  # "grid" | "point" | "origin" | "h" | "v" | "none"
+    kind: str  # "grid" | "point" | "origin" | "h" | "v" | "none" | "chain_start"
     ref: Optional[Vec2] = None
 
 
@@ -49,14 +50,17 @@ class DragState:
     handle_name: str
     handle_kind: HandleKind
     start_uv: Vec2
-    # For whole-entity moves (midpoint / center)
     start_entity_snapshot: object = None
 
 
 @dataclass
 class DrawState:
     tool: SketchTool
-    points: List[Vec2] = field(default_factory=list)  # committed clicks so far
+    points: List[Vec2] = field(default_factory=list)
+    # Polyline chain: first point of the whole chain (for auto-close)
+    chain_start: Optional[Vec2] = None
+    # How many segments already committed in this chain
+    chain_segments: int = 0
 
 
 class SketchController:
@@ -69,6 +73,15 @@ class SketchController:
         self.selected_entity_id: int = -1
         self.preview_uv: Optional[Vec2] = None
         self.last_snap: SnapResult = SnapResult((0, 0), "none")
+        # World-unit point snap radius; viewport overwrites from pixel scale
+        self.snap_point_tol: float = SNAP_POINT
+        self.snap_grid: float = SNAP_GRID
+
+    def set_snap_world_tol(self, point_tol: float, *, grid: Optional[float] = None) -> None:
+        """Update world-space snap tolerances (from pixel radius × world/px)."""
+        self.snap_point_tol = max(1e-9, float(point_tol))
+        if grid is not None:
+            self.snap_grid = max(1e-9, float(grid))
 
     def set_tool(self, tool: SketchTool) -> None:
         self.tool = tool
@@ -80,11 +93,16 @@ class SketchController:
             self.hover_handle = None
 
     def is_drawing(self) -> bool:
-        """True if an entity is mid-placement (has at least one click)."""
         return self.draw is not None and len(self.draw.points) > 0
 
+    def in_line_chain(self) -> bool:
+        return (
+            self.draw is not None
+            and self.draw.tool is SketchTool.LINE
+            and self.draw.chain_start is not None
+        )
+
     def cancel_drawing(self) -> bool:
-        """Cancel in-progress entity. Returns True if something was cancelled."""
         if self.draw is None and self.drag is None:
             return False
         self.draw = None
@@ -93,17 +111,28 @@ class SketchController:
         return True
 
     def cancel(self) -> None:
-        """Legacy: clear drawing/drag state without tool change."""
         self.cancel_drawing()
 
-    def confirm_current(self) -> Optional[str]:
-        """Finish in-progress entity using preview as last point (Enter).
+    def end_line_chain(self) -> Optional[str]:
+        """Finish an open polyline without placing another point (Enter / double-click)."""
+        if self.draw is None or self.draw.tool is not SketchTool.LINE:
+            return None
+        n = self.draw.chain_segments
+        self.draw = None
+        self.preview_uv = None
+        return f"ChainEnd:{n}" if n > 0 else "ChainEnd:0"
 
-        Returns entity kind name if committed, else None.
-        """
+    def confirm_current(self) -> Optional[str]:
+        """Enter: commit current rubber-band point, or end line chain if idle mid-chain."""
         if self.draw is None or not self.draw.points:
             return None
-        # Need a second point: use preview if available, else abort
+        # Mid-chain with only the continuing start point → end chain
+        if (
+            self.draw.tool is SketchTool.LINE
+            and len(self.draw.points) == 1
+            and self.draw.chain_segments > 0
+        ):
+            return self.end_line_chain()
         if self.preview_uv is None:
             if len(self.draw.points) < 2:
                 return None
@@ -113,11 +142,6 @@ class SketchController:
         return self._try_finish_draw()
 
     def commit_line_length(self, length_mm: float) -> Optional[str]:
-        """Finish an in-progress line at exact ``length_mm`` along current direction.
-
-        Direction is from p0 toward ``preview_uv`` if set and non-zero, else +u.
-        Returns ``\"Line\"`` on success, else None.
-        """
         if self.tool is not SketchTool.LINE:
             return None
         if self.draw is None or len(self.draw.points) != 1:
@@ -142,71 +166,86 @@ class SketchController:
 
     # --- snapping ---
     def snap(self, uv: Vec2, *, drawing: bool = False) -> SnapResult:
+        """Snap with point-priority over grid; point tol is ``snap_point_tol`` (world)."""
         u, v = float(uv[0]), float(uv[1])
-        # Origin
-        if abs(u) <= SNAP_POINT and abs(v) <= SNAP_POINT:
-            return SnapResult((0.0, 0.0), "origin")
+        ptol = self.snap_point_tol
 
-        # Existing points
+        # Prefer nearest existing endpoint / origin (point snap over grid)
         best: Optional[SnapResult] = None
-        best_d = SNAP_POINT
-        for p in self.sketch.snap_targets():
+        best_d = ptol
+        targets = list(self.sketch.snap_targets())  # includes origin
+        if (
+            drawing
+            and self.draw
+            and self.draw.tool is SketchTool.LINE
+            and self.draw.chain_start is not None
+            and self.draw.chain_segments >= 2
+        ):
+            targets.append(self.draw.chain_start)
+        for p in targets:
             d = float(np.hypot(u - p[0], v - p[1]))
             if d < best_d:
                 best_d = d
-                best = SnapResult((p[0], p[1]), "point", p)
+                if abs(p[0]) < 1e-15 and abs(p[1]) < 1e-15:
+                    kind = "origin"
+                elif (
+                    self.draw
+                    and self.draw.chain_start is not None
+                    and abs(p[0] - self.draw.chain_start[0]) < 1e-12
+                    and abs(p[1] - self.draw.chain_start[1]) < 1e-12
+                ):
+                    kind = "chain_start"
+                else:
+                    kind = "point"
+                best = SnapResult((float(p[0]), float(p[1])), kind, p)
         if best is not None:
-            u, v = best.uv
+            self.last_snap = best
+            return best
 
-        # Angular H/V snap when drawing a free endpoint: only lock to ortho within
-        # ±SNAP_ANGLE_DEG; otherwise follow the cursor exactly (no grid pull that
-        # would destroy intentional free angles).
+        # Angular H/V when drawing free endpoint
         if drawing and self.draw and self.draw.points:
             p0 = self.draw.points[0]
-            # Prefer point snap over angle; if not on a point, check angle
-            if best is None or best.kind != "point":
-                du = u - p0[0]
-                dv = v - p0[1]
-                length = float(np.hypot(du, dv))
-                if length > 1e-12:
-                    angle = float(np.degrees(np.arctan2(dv, du)))  # (-180, 180]
-                    orthos = (0.0, 90.0, -90.0, 180.0, -180.0)
-                    nearest = min(orthos, key=lambda o: abs(angle - o))
-                    if abs(angle - nearest) <= SNAP_ANGLE_DEG:
-                        rad = float(np.radians(nearest))
-                        u = p0[0] + length * float(np.cos(rad))
-                        v = p0[1] + length * float(np.sin(rad))
-                        kind = (
-                            "h"
-                            if abs(nearest) < 1e-9 or abs(abs(nearest) - 180.0) < 1e-9
-                            else "v"
-                        )
-                        res = SnapResult((u, v), kind, None)
-                        self.last_snap = res
-                        return res
-            # Free angle: keep exact (post point-snap) cursor
-            kind = best.kind if best else "none"
-            res = SnapResult((u, v), kind, best.ref if best else None)
+            du = u - p0[0]
+            dv = v - p0[1]
+            length = float(np.hypot(du, dv))
+            if length > 1e-12:
+                angle = float(np.degrees(np.arctan2(dv, du)))
+                orthos = (0.0, 90.0, -90.0, 180.0, -180.0)
+                nearest = min(orthos, key=lambda o: abs(angle - o))
+                if abs(angle - nearest) <= SNAP_ANGLE_DEG:
+                    rad = float(np.radians(nearest))
+                    u = p0[0] + length * float(np.cos(rad))
+                    v = p0[1] + length * float(np.sin(rad))
+                    kind = (
+                        "h"
+                        if abs(nearest) < 1e-9 or abs(abs(nearest) - 180.0) < 1e-9
+                        else "v"
+                    )
+                    res = SnapResult((u, v), kind, None)
+                    self.last_snap = res
+                    return res
+            # Free angle — no grid pull
+            res = SnapResult((u, v), "none", None)
             self.last_snap = res
             return res
 
-        # Grid (first click / non-drawing only — free-angle second point skips this)
-        gu = round(u / SNAP_GRID) * SNAP_GRID
-        gv = round(v / SNAP_GRID) * SNAP_GRID
-        if abs(u - gu) <= SNAP_GRID * 0.35 and abs(v - gv) <= SNAP_GRID * 0.35:
-            if best is None:
-                u, v = gu, gv
-                best = SnapResult((u, v), "grid")
+        # Grid only when not free-drawing a second point and no point snap
+        g = self.snap_grid
+        gu = round(u / g) * g
+        gv = round(v / g) * g
+        if abs(u - gu) <= g * 0.35 and abs(v - gv) <= g * 0.35:
+            res = SnapResult((gu, gv), "grid")
+            self.last_snap = res
+            return res
 
-        kind = best.kind if best else "none"
-        res = SnapResult((u, v), kind, best.ref if best else None)
+        res = SnapResult((u, v), "none")
         self.last_snap = res
         return res
 
-    # --- handles ---
-    def pick_handle(self, uv: Vec2, tol: float = SNAP_POINT) -> Optional[Handle]:
+    def pick_handle(self, uv: Vec2, tol: Optional[float] = None) -> Optional[Handle]:
+        t = self.snap_point_tol if tol is None else float(tol)
         best: Optional[Handle] = None
-        best_d = tol
+        best_d = t
         for h in self.sketch.all_handles():
             d = float(np.hypot(uv[0] - h.uv[0], uv[1] - h.uv[1]))
             if d < best_d:
@@ -214,10 +253,10 @@ class SketchController:
                 best = h
         return best
 
-    def pick_entity_body(self, uv: Vec2, tol: float = SNAP_POINT) -> Optional[int]:
-        """Pick line/circle by proximity to geometry (not only handles)."""
+    def pick_entity_body(self, uv: Vec2, tol: Optional[float] = None) -> Optional[int]:
+        t = self.snap_point_tol if tol is None else float(tol)
         best_id = -1
-        best_d = tol
+        best_d = t
         for e in self.sketch.entities:
             d = self._dist_to_entity(e, uv)
             if d < best_d:
@@ -252,13 +291,10 @@ class SketchController:
             self.preview_uv = sn.uv
 
     def on_press(self, raw_uv: Vec2) -> Optional[str]:
-        """Returns a short status message if any."""
         if self.tool == SketchTool.SELECT:
             h = self.pick_handle(raw_uv)
             if h is not None:
                 self.selected_entity_id = h.entity_id
-                ent = self.sketch.find_entity(h.entity_id)
-                snap = ent  # snapshot not deep — store start uv
                 self.drag = DragState(
                     entity_id=h.entity_id,
                     handle_name=h.name,
@@ -276,7 +312,7 @@ class SketchController:
         sn = self.snap(raw_uv, drawing=True)
         uv = sn.uv
         if self.draw is None:
-            self.draw = DrawState(tool=self.tool, points=[uv])
+            self.draw = DrawState(tool=self.tool, points=[uv], chain_start=None, chain_segments=0)
             return f"Place next point ({self.tool.name.title()})"
         self.draw.points.append(uv)
         return self._try_finish_draw()
@@ -302,8 +338,37 @@ class SketchController:
         pts = self.draw.points
         tool = self.draw.tool
         if tool is SketchTool.LINE and len(pts) >= 2:
-            self.sketch.add_line(pts[0], pts[1])
-            self.draw = None
+            p0 = (float(pts[-2][0]), float(pts[-2][1]))
+            p1 = (float(pts[-1][0]), float(pts[-1][1]))
+            # Auto-close onto chain start (exact shared coordinates)
+            closed = False
+            if (
+                self.draw.chain_start is not None
+                and self.draw.chain_segments >= 2
+            ):
+                cs = self.draw.chain_start
+                if float(np.hypot(p1[0] - cs[0], p1[1] - cs[1])) <= self.snap_point_tol:
+                    p1 = (float(cs[0]), float(cs[1]))
+                    closed = True
+            # Degenerate zero-length: ignore
+            if float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])) < 1e-12:
+                self.draw.points.pop()
+                return None
+            self.sketch.add_line(p0, p1)
+            self.draw.chain_segments += 1
+            if self.draw.chain_start is None:
+                self.draw.chain_start = p0
+            if closed:
+                self.draw = None
+                self.preview_uv = None
+                return "LineClosed"
+            # Continue chain from exact endpoint
+            self.draw = DrawState(
+                tool=SketchTool.LINE,
+                points=[p1],
+                chain_start=self.draw.chain_start,
+                chain_segments=self.draw.chain_segments,
+            )
             return "Line"
         if tool is SketchTool.RECTANGLE and len(pts) >= 2:
             self.sketch.add_rectangle(pts[0], pts[1])

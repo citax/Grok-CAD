@@ -13,7 +13,7 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from pyvistaqt import QtInteractor
 
-from app.sketch_mode import SketchController, SketchTool
+from app.sketch_mode import SNAP_POINT_PX, SketchController, SketchTool
 from app.theme import (
     ACCENT,
     TEXT_PRIMARY,
@@ -56,6 +56,26 @@ PLANE_COLORS = {
     FeatureType.PLANE_RIGHT: PLANE_RIGHT,
 }
 PLANE_HALF = 2.5
+
+# Performance ablation / final tuning (software-GL).
+# GROK_PERF_METHOD: none | a | b | c | d | e | final
+#   a = reduced interactive resolution during drag/resize
+#   b = LOD: hide labels/junctions/overlay heavy props while interacting
+#   c = batch static sketch lines into fewer actors (closed sketches)
+#   d = disable MSAA/transparency while interacting
+#   e = aggressive render coalesce
+#   final = combination of methods that helped in ablation
+import os as _os
+
+_PERF_METHOD = (_os.environ.get("GROK_PERF_METHOD") or "final").strip().lower()
+
+
+def _perf_enabled(*methods: str) -> bool:
+    if _PERF_METHOD == "final":
+        # Ablation winners (llvmpipe @ 300 ents): c (batch) ≫ b (LOD) ≥ e (coalesce).
+        # a (scaled res) and d (MSAA off) did not help or regressed maximize/drag.
+        return any(m in ("b", "c", "e") for m in methods)
+    return _PERF_METHOD in methods
 
 
 def _plane_surface(ftype: FeatureType, half: float = PLANE_HALF) -> pv.PolyData:
@@ -182,6 +202,11 @@ class _InteractorFilter(QObject):
         if et == QEvent.Type.MouseMove:
             self.vp._sketch_mouse_move(event.position().x(), event.position().y())
             return True  # consume — lock camera
+        if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+            # Double-click ends a polyline chain
+            if self.vp._sketch_ctrl and self.vp._sketch_ctrl.in_line_chain():
+                self.vp._end_line_chain()
+                return True
         if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
             self.vp._sketch_mouse_press(event.position().x(), event.position().y())
             return True
@@ -266,6 +291,10 @@ class Viewport(QWidget):
         self._resizing = False
         self._length_buffer: str = ""
         self._last_sketch_uv: Optional[Vec2] = None
+        self._interacting = False
+        self._lod_hidden: bool = False
+        self._saved_size: Optional[Tuple[int, int]] = None
+        self._perf_method = _PERF_METHOD
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -392,7 +421,7 @@ class Viewport(QWidget):
             print(f"[viewport] picking: {exc}", file=sys.stderr)
 
     def _setup_interaction_lod(self) -> None:
-        """Throttle VTK render rate during camera drag; never rebuild scene."""
+        """Throttle VTK during camera drag; optional LOD / scaled render (perf methods)."""
         assert self.plotter is not None
         self._interacting = False
         try:
@@ -403,21 +432,10 @@ class Viewport(QWidget):
         def on_start(_o=None, _e=None) -> None:
             if self.in_sketch_mode:
                 return
-            self._interacting = True
-            try:
-                # Lower interactive FPS under soft-GL to cut fill-rate jank
-                self.plotter.render_window.SetDesiredUpdateRate(12.0)
-            except Exception:
-                pass
+            self._begin_interaction_lod()
 
         def on_end(_o=None, _e=None) -> None:
-            self._interacting = False
-            try:
-                self.plotter.render_window.SetDesiredUpdateRate(0.0001)
-            except Exception:
-                pass
-            # One final still render — no feature rebuild on pure camera move
-            self._request_render()
+            self._end_interaction_lod()
 
         for ev in ("StartInteractionEvent", "LeftButtonPressEvent"):
             try:
@@ -427,6 +445,79 @@ class Viewport(QWidget):
         for ev in ("EndInteractionEvent", "LeftButtonReleaseEvent"):
             try:
                 iren.AddObserver(ev, on_end)
+            except Exception:
+                pass
+
+    def _begin_interaction_lod(self) -> None:
+        if self._interacting:
+            return
+        self._interacting = True
+        if not self.plotter:
+            return
+        try:
+            self.plotter.render_window.SetDesiredUpdateRate(12.0)
+        except Exception:
+            pass
+        # (a) lower interactive resolution
+        if _perf_enabled("a"):
+            try:
+                w, h = self.plotter.window_size
+                self._saved_size = (int(w), int(h))
+                # 50% linear scale → ~25% pixels (soft-GL fill-rate win)
+                sw, sh = max(64, int(w * 0.5)), max(64, int(h * 0.5))
+                self.plotter.render_window.SetSize(sw, sh)
+            except Exception:
+                self._saved_size = None
+        # (b) hide heavy overlays
+        if _perf_enabled("b"):
+            self._set_interaction_lod_visible(False)
+        # (d) force opaque / no MSAA while interacting
+        if _perf_enabled("d"):
+            try:
+                self.plotter.render_window.SetMultiSamples(0)
+                ren = self.plotter.renderer
+                ren.SetUseDepthPeeling(0)
+            except Exception:
+                pass
+
+    def _end_interaction_lod(self) -> None:
+        if not self._interacting and not self._lod_hidden and self._saved_size is None:
+            return
+        self._interacting = False
+        if not self.plotter:
+            return
+        try:
+            self.plotter.render_window.SetDesiredUpdateRate(0.0001)
+        except Exception:
+            pass
+        if _perf_enabled("a") and self._saved_size is not None:
+            try:
+                self.plotter.render_window.SetSize(*self._saved_size)
+            except Exception:
+                pass
+            self._saved_size = None
+        if _perf_enabled("b"):
+            self._set_interaction_lod_visible(True)
+        # Still render only — no feature rebuild on pure camera move
+        self._request_render()
+
+    def _set_interaction_lod_visible(self, visible: bool) -> None:
+        """Hide/show labels, junctions, plane edges while interacting (method b)."""
+        self._lod_hidden = not visible
+        if not self.plotter:
+            return
+        names = []
+        names.extend(getattr(self, "_dim_label_names", set()) or set())
+        names.extend(["__sk_junctions", "__sk_dims", "__sk_grid"])
+        for n in list(self.plotter.actors.keys()):
+            if n.startswith("edge_"):
+                names.append(n)
+        for n in names:
+            act = self._get_named_actor(n)
+            if act is None:
+                continue
+            try:
+                act.SetVisibility(1 if visible else 0)
             except Exception:
                 pass
 
@@ -549,13 +640,21 @@ class Viewport(QWidget):
     def _request_render(self) -> None:
         if not self._ok:
             return
-        # Longer debounce during resize / camera interaction (soft-GL fill-rate)
-        if self._resizing:
-            interval = 80
-        elif getattr(self, "_interacting", False):
-            interval = 48
+        # (e) aggressive coalesce during resize / interaction
+        if _perf_enabled("e"):
+            if self._resizing:
+                interval = 120
+            elif getattr(self, "_interacting", False):
+                interval = 64
+            else:
+                interval = 24
         else:
-            interval = 16
+            if self._resizing:
+                interval = 80
+            elif getattr(self, "_interacting", False):
+                interval = 48
+            else:
+                interval = 16
         self._render_timer.setInterval(interval)
         if not self._render_timer.isActive():
             self._render_timer.start()
@@ -568,14 +667,22 @@ class Viewport(QWidget):
         # Coalesce paints while the window is being dragged/maximized.
         # Pure camera/window resize must NOT rebuild sketch/solid actors.
         self._resizing = True
-        self._resize_timer.setInterval(80)
+        if _perf_enabled("a"):
+            # Also scale down during live resize (same as interaction)
+            if not self._interacting:
+                self._begin_interaction_lod()
+        settle = 120 if _perf_enabled("e") else 80
+        self._resize_timer.setInterval(settle)
         self._resize_timer.start()  # restarts → settle
         self._request_render()
         super().resizeEvent(event)
 
     def _end_resize_coalesce(self) -> None:
         self._resizing = False
-        self._request_render()
+        if _perf_enabled("a") and self._interacting:
+            self._end_interaction_lod()
+        else:
+            self._request_render()
 
     def _remove_actor(self, name: str) -> None:
         if not self.plotter:
@@ -826,21 +933,77 @@ class Viewport(QWidget):
         self.sketch_status.emit("Exited sketch")
 
     def sketch_confirm(self) -> None:
-        """Enter: finish current entity using rubber-band end point."""
+        """Enter: finish rubber-band segment, or end polyline chain if mid-chain."""
         if self._sketch_ctrl is None:
             return
+        n_before = len(self._sketch_ctrl.sketch.entities)
         msg = self._sketch_ctrl.confirm_current()
-        if msg:
-            ent = self._sketch_ctrl.sketch.entities[-1]
-            if self._doc is not None and self._sketch_feature_id >= 0:
-                self._doc.record_entity_add(self._sketch_feature_id, ent)
-            self._upsert_entity_actor(ent)
+        if not msg:
+            return
+        if msg.startswith("ChainEnd"):
             self._clear_preview()
             self._update_handles_visual()
             self._update_junction_dots()
             self._update_dim_labels()
-            self.sketch_status.emit(f"Sketch: {msg}")
+            self.sketch_status.emit("Sketch: polyline finished")
             self._request_render()
+            return
+        # New entity committed
+        if len(self._sketch_ctrl.sketch.entities) > n_before:
+            ent = self._sketch_ctrl.sketch.entities[-1]
+            if self._doc is not None and self._sketch_feature_id >= 0:
+                self._doc.record_entity_add(self._sketch_feature_id, ent)
+            self._upsert_entity_actor(ent)
+            self._update_junction_dots()
+            self._update_dim_labels()
+        if msg == "Line" and self._sketch_ctrl.is_drawing():
+            # Chaining continues — keep preview live
+            self.sketch_status.emit("Sketch: Line (chain…)")
+        else:
+            self._clear_preview()
+            self._update_handles_visual()
+            self.sketch_status.emit(f"Sketch: {msg}")
+        self._request_render()
+
+    def _end_line_chain(self) -> None:
+        if self._sketch_ctrl is None:
+            return
+        msg = self._sketch_ctrl.end_line_chain()
+        self._clear_preview()
+        self._update_handles_visual()
+        self._update_junction_dots()
+        self._update_dim_labels()
+        self.sketch_status.emit("Sketch: polyline finished" if msg else "Sketch")
+        self._request_render()
+
+    def _world_units_per_pixel(self) -> float:
+        """Convert 1 screen pixel to sketch-plane world units (for snap radius)."""
+        if not self.plotter:
+            return 1.0
+        try:
+            cam = self.plotter.camera
+            h = max(1, int(self.plotter.window_size[1]))
+            if bool(cam.GetParallelProjection()):
+                # ParallelScale = half-height of the view frustum in world units
+                return float(2.0 * cam.GetParallelScale() / h)
+            # Perspective: approx at focal distance
+            dist = float(np.linalg.norm(
+                np.asarray(cam.GetPosition()) - np.asarray(cam.GetFocalPoint())
+            ))
+            view_angle = float(cam.GetViewAngle())  # degrees
+            half_h = dist * float(np.tan(np.radians(view_angle) * 0.5))
+            return float(2.0 * half_h / h)
+        except Exception:
+            return 1.0
+
+    def _update_snap_tolerance(self) -> None:
+        """Pixel-based snap: convert SNAP_POINT_PX to world using current camera."""
+        if self._sketch_ctrl is None:
+            return
+        wpp = self._world_units_per_pixel()
+        point_tol = max(1e-9, SNAP_POINT_PX * wpp)
+        # Grid stays fixed in world (sketch units); only point snap is pixel-based
+        self._sketch_ctrl.set_snap_world_tol(point_tol)
 
     def sketch_cancel(self) -> None:
         """Back-compat alias for Esc first stage only (cancel draw)."""
@@ -977,6 +1140,10 @@ class Viewport(QWidget):
             return
         if self.in_sketch_mode:
             return
+        # (c) batch all closed sketch geometry into one actor per sketch feature
+        if _perf_enabled("c"):
+            self._refresh_sketches_batched()
+            return
         wanted: Dict[str, Tuple[object, str]] = {}  # name -> (ent, fp)  # type: ignore
         for f in self._doc.features:
             if f.type is not FeatureType.SKETCH or f.sketch is None or not f.visible:
@@ -985,18 +1152,15 @@ class Viewport(QWidget):
                 name = f"sk_closed_{f.id}_{ent.id}"
                 fp = _entity_fingerprint(ent, selected=False)
                 wanted[name] = (ent, fp)
-        # Remove stale
         for name in list(self._closed_sketch_fps.keys()):
             if name not in wanted:
                 self._remove_actor(name)
                 self._closed_sketch_fps.pop(name, None)
-        # Upsert changed only
         dirty = False
         for name, (ent, fp) in wanted.items():
             if self._closed_sketch_fps.get(name) == fp and name in self.plotter.actors:
                 continue
             self._remove_actor(name)
-            # find parent sketch
             sk = None
             for f in self._doc.features:
                 if f.type is FeatureType.SKETCH and f.sketch is not None:
@@ -1017,6 +1181,63 @@ class Viewport(QWidget):
             self._apply_sketch_actor_priority(name)
             self._closed_sketch_fps[name] = fp
             dirty = True
+        if dirty:
+            self._request_render()
+
+    def _refresh_sketches_batched(self) -> None:
+        """Merge each closed sketch's entities into a single multi-block actor."""
+        assert self.plotter is not None and self._doc is not None
+        wanted_fps: Dict[str, str] = {}
+        dirty = False
+        # Drop per-entity closed actors from non-batch mode
+        for name in list(self._closed_sketch_fps.keys()):
+            if name.startswith("sk_closed_") and "_batch_" not in name:
+                self._remove_actor(name)
+                self._closed_sketch_fps.pop(name, None)
+        for f in self._doc.features:
+            if f.type is not FeatureType.SKETCH or f.sketch is None or not f.visible:
+                continue
+            if not f.sketch.entities:
+                name = f"sk_closed_batch_{f.id}"
+                if name in self._closed_sketch_fps:
+                    self._remove_actor(name)
+                    self._closed_sketch_fps.pop(name, None)
+                continue
+            fp = "|".join(_entity_fingerprint(e) for e in f.sketch.entities)
+            name = f"sk_closed_batch_{f.id}"
+            wanted_fps[name] = fp
+            if self._closed_sketch_fps.get(name) == fp and name in self.plotter.actors:
+                continue
+            self._remove_actor(name)
+            meshes = []
+            for ent in f.sketch.entities:
+                try:
+                    meshes.append(_entity_polydata(ent, f.sketch))
+                except Exception:
+                    pass
+            if not meshes:
+                continue
+            try:
+                merged = meshes[0]
+                for m in meshes[1:]:
+                    merged = merged.merge(m)
+            except Exception:
+                merged = meshes[0]
+            self.plotter.add_mesh(
+                merged,
+                color=SKETCH_COLOR,
+                line_width=2.5,
+                name=name,
+                pickable=False,
+                render=False,
+            )
+            self._apply_sketch_actor_priority(name)
+            self._closed_sketch_fps[name] = fp
+            dirty = True
+        for name in list(self._closed_sketch_fps.keys()):
+            if name.startswith("sk_closed_batch_") and name not in wanted_fps:
+                self._remove_actor(name)
+                self._closed_sketch_fps.pop(name, None)
         if dirty:
             self._request_render()
 
@@ -1326,6 +1547,7 @@ class Viewport(QWidget):
     def _sketch_mouse_move(self, x: float, y: float) -> None:
         if self._sketch_ctrl is None:
             return
+        self._update_snap_tolerance()
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             return
@@ -1349,36 +1571,43 @@ class Viewport(QWidget):
     def _sketch_mouse_press(self, x: float, y: float) -> None:
         if self._sketch_ctrl is None:
             return
+        self._update_snap_tolerance()
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             return
         # Snapshot before drag for undoable move
         self._drag_before = None
         if self._sketch_ctrl.tool == SketchTool.SELECT:
-            # peek handle/entity under cursor
             h = self._sketch_ctrl.pick_handle(uv)
             if h is not None:
                 ent0 = self._sketch_ctrl.sketch.find_entity(h.entity_id)
                 if ent0 is not None:
                     self._drag_before = snapshot_entity(ent0)
+        n_before = len(self._sketch_ctrl.sketch.entities)
         msg = self._sketch_ctrl.on_press(uv)
         sk = self._sketch_ctrl.sketch
-        if msg in ("Line", "Rectangle", "Circle"):
-            # new entity added — last one
-            ent = sk.entities[-1]
-            if self._doc is not None and self._sketch_feature_id >= 0:
-                self._doc.record_entity_add(self._sketch_feature_id, ent)
-            self._upsert_entity_actor(ent)
-            self._clear_preview()
-            self._update_handles_visual()
+        if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
+            if len(sk.entities) > n_before:
+                ent = sk.entities[-1]
+                if self._doc is not None and self._sketch_feature_id >= 0:
+                    self._doc.record_entity_add(self._sketch_feature_id, ent)
+                self._upsert_entity_actor(ent)
             self._update_junction_dots()
             self._update_dim_labels()
-            self.sketch_status.emit(f"Sketch: {msg}")
+            if msg == "Line" and self._sketch_ctrl.is_drawing():
+                # Polyline continues from last endpoint
+                self.sketch_status.emit("Sketch: Line (chain…)")
+            else:
+                self._clear_preview()
+                self._update_handles_visual()
+                self.sketch_status.emit(
+                    "Sketch: closed polyline" if msg == "LineClosed" else f"Sketch: {msg}"
+                )
         elif msg and msg.startswith("Drag"):
             self.sketch_status.emit(f"Sketch: {msg}")
         elif msg and msg.startswith("Selected"):
             self._rebuild_all_sketch_entities()
-            self.sketch_status.emit(f"Sketch: Select")
+            self.sketch_status.emit("Sketch: Select")
         elif msg:
             self.sketch_status.emit(f"Sketch: {msg}")
         self._request_render()
