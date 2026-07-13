@@ -187,23 +187,13 @@ def resolve_profiles(
                     break
         if outer is None:
             raise ValueError(f"sketch has no closed profile id={preferred_outer_id}")
+        # Contained profiles become holes; other disjoint profiles are ignored
+        # (the user already chose which outer to extrude via the picker).
         holes = [
             e
             for e in closed
             if _profile_id(e) != _profile_id(outer) and _profile_contains(outer, e)
         ]
-        others = [
-            e
-            for e in closed
-            if _profile_id(e) != _profile_id(outer)
-            and e not in holes
-            and not _profile_contains(e, outer)
-        ]
-        if others:
-            raise ValueError(
-                "ambiguous profiles: multiple disjoint closed profiles; "
-                "select which profile to extrude"
-            )
         return ResolvedProfiles(outer=outer, holes=holes)
 
     # Find roots: not contained by any other closed profile
@@ -758,17 +748,12 @@ class Document:
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
             raise ValueError("revolve requires a valid sketch feature")
         sketch = skf.sketch
-        if profile_entity_id >= 0:
-            ent = sketch.find_entity(profile_entity_id)
-            if ent is None:
-                raise ValueError(f"sketch has no entity id={profile_entity_id}")
-        else:
-            ent = first_closed_profile(sketch)
-            if ent is None:
-                raise ValueError("sketch has no closed profile (rectangle or circle)")
-            profile_entity_id = ent.id
+        # profile_entity_id may be a ClosedLineLoop synthetic id (negative)
+        resolved = resolve_profiles(sketch, preferred_outer_id=profile_entity_id)
+        ent = resolved.outer
+        profile_entity_id = _profile_id(ent)
         if not is_closed_profile(ent):
-            raise ValueError("profile is not a closed rectangle/circle (or is degenerate)")
+            raise ValueError("profile is not a closed rectangle/circle/line-loop")
         ang = float(angle_degrees)
         if not np.isfinite(ang) or ang <= 1e-12:
             raise ValueError("revolve angle must be a positive finite number (degrees)")
@@ -816,17 +801,11 @@ class Document:
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
             raise ValueError("fillet requires a valid sketch feature")
         sketch = skf.sketch
-        if profile_entity_id >= 0:
-            ent = sketch.find_entity(profile_entity_id)
-            if ent is None:
-                raise ValueError(f"sketch has no entity id={profile_entity_id}")
-        else:
-            ent = first_closed_profile(sketch)
-            if ent is None:
-                raise ValueError("sketch has no closed profile (rectangle or circle)")
-            profile_entity_id = ent.id
+        resolved = resolve_profiles(sketch, preferred_outer_id=profile_entity_id)
+        ent = resolved.outer
+        profile_entity_id = _profile_id(ent)
         if not is_closed_profile(ent):
-            raise ValueError("open profile: not a closed rectangle/circle")
+            raise ValueError("open profile: not a closed rectangle/circle/line-loop")
         dist = float(distance)
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
@@ -874,17 +853,11 @@ class Document:
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
             raise ValueError("pocket requires a valid sketch feature")
         sketch = skf.sketch
-        if profile_entity_id >= 0:
-            ent = sketch.find_entity(profile_entity_id)
-            if ent is None:
-                raise ValueError(f"sketch has no entity id={profile_entity_id}")
-        else:
-            ent = first_closed_profile(sketch)
-            if ent is None:
-                raise ValueError("sketch has no closed profile (rectangle or circle)")
-            profile_entity_id = ent.id
+        resolved = resolve_profiles(sketch, preferred_outer_id=profile_entity_id)
+        ent = resolved.outer
+        profile_entity_id = _profile_id(ent)
         if not is_closed_profile(ent):
-            raise ValueError("open profile: not a closed rectangle/circle")
+            raise ValueError("open profile: not a closed rectangle/circle/line-loop")
         dist = float(distance)
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
@@ -945,14 +918,14 @@ class Document:
             if skf is None or skf.sketch is None:
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
-            else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
                 return None
             mesh = extrude_filleted_profile(
-                ent,
+                resolved.outer,
                 f.depth,
                 sketch.frame,
                 f.radius,
@@ -963,14 +936,14 @@ class Document:
             if skf is None or skf.sketch is None:
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
-            else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
                 return None
             mesh = extrude_pocketed_profile(
-                ent,
+                resolved.outer,
                 f.depth,
                 sketch.frame,
                 (f.hole_center_u, f.hole_center_v),
@@ -982,14 +955,14 @@ class Document:
             if skf is None or skf.sketch is None:
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
-            else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
                 return None
             mesh = revolve_profile(
-                ent,
+                resolved.outer,
                 sketch.frame,
                 axis_origin=f.axis_origin,
                 axis_direction=f.axis_direction,

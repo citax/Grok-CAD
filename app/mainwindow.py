@@ -43,7 +43,15 @@ from cadcore.document import (
     resolve_profiles,
 )
 from cadcore.mesh import write_stl_binary
-from cadcore.sketch import LineEntity, line_length, set_line_length, snapshot_entity
+from cadcore.profiles import ClosedLineLoop, list_closed_profiles
+from cadcore.sketch import (
+    CircleEntity,
+    LineEntity,
+    RectEntity,
+    line_length,
+    set_line_length,
+    snapshot_entity,
+)
 from cadcore.units import Unit, format_length, from_mm, parse_length, to_mm
 
 
@@ -621,6 +629,57 @@ class MainWindow(QMainWindow):
         """Back-compat alias."""
         return self._resolve_closed_sketch_id()
 
+    @staticmethod
+    def _profile_label(prof: object) -> str:
+        """Human-readable picker label for a closed profile (entity or line-loop)."""
+        if isinstance(prof, ClosedLineLoop):
+            n = len(prof.line_ids)
+            return f"Line loop ({n} segments) id={prof.id}"
+        if isinstance(prof, RectEntity):
+            return f"Rectangle id={prof.id}"
+        if isinstance(prof, CircleEntity):
+            return f"Circle id={prof.id}"
+        kind = type(prof).__name__.replace("Entity", "")
+        return f"{kind} id={getattr(prof, 'id', '?')}"
+
+    def _pick_closed_profile(self, sketch, *, title: str = "Select Profile") -> int:
+        """List all closed profiles (rects/circles + virtual line-loops) for user pick.
+
+        Returns preferred_outer_id for resolve_profiles / create_* methods.
+        Returns -2 if user cancelled, -1 if a single profile needs no pick.
+        Raises ValueError if there are no closed profiles.
+        """
+        try:
+            profiles = list_closed_profiles(sketch)
+        except ValueError:
+            raise
+        if not profiles:
+            raise ValueError("sketch has no closed profile")
+        # If resolve_profiles succeeds without preferred id, no pick needed
+        try:
+            resolve_profiles(sketch)
+            return -1
+        except ValueError as exc:
+            if "ambiguous" not in str(exc).lower():
+                raise
+        labels = [self._profile_label(p) for p in profiles]
+        if not labels:
+            raise ValueError("sketch has no closed profile")
+        choice, ok = QInputDialog.getItem(
+            self,
+            title,
+            "Multiple disjoint closed profiles found.\n"
+            "Select which profile to use:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return -2  # cancelled
+        idx = labels.index(choice)
+        prof = profiles[idx]
+        return int(getattr(prof, "id", -1))
+
     def _extrude(self) -> None:
         """Extrude (pad) a closed sketch profile via distance dialog + rebuild worker."""
         sid = self._resolve_closed_sketch_id()
@@ -629,7 +688,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Extrude",
-                "Create or select a sketch with a closed rectangle or circle first.",
+                "Create or select a sketch with a closed rectangle, circle, "
+                "or closed line-loop first.",
             )
             self.statusBar().showMessage(
                 "Extrude needs a closed sketch profile", 4000
@@ -640,7 +700,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Extrude",
                 "The sketch has no closed profile.\n"
-                "Draw a rectangle or circle, then Extrude.",
+                "Draw a rectangle, circle, or closed line loop, then Extrude.",
             )
             self.statusBar().showMessage("No closed profile to extrude", 4000)
             return
@@ -662,34 +722,16 @@ class MainWindow(QMainWindow):
             self.viewport.exit_sketch()
             self.sketch_tb.setVisible(False)
 
-        profile_entity_id = -1
         try:
-            # Nested holes auto-resolved; disjoint profiles raise → picker
-            resolve_profiles(skf.sketch)
-        except ValueError as exc:
-            if "ambiguous" not in str(exc).lower():
-                QMessageBox.warning(self, "Extrude", str(exc))
-                self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
-                return
-            # Profile picker for disjoint closed profiles
-            closed = [e for e in skf.sketch.entities if is_closed_profile(e)]
-            labels = []
-            for e in closed:
-                kind = type(e).__name__.replace("Entity", "")
-                labels.append(f"{kind} id={e.id}")
-            choice, ok = QInputDialog.getItem(
-                self,
-                "Select Profile",
-                "Multiple disjoint closed profiles found.\n"
-                "Select which profile to extrude:",
-                labels,
-                0,
-                False,
+            profile_entity_id = self._pick_closed_profile(
+                skf.sketch, title="Select Profile to Extrude"
             )
-            if not ok or not choice:
-                return
-            idx = labels.index(choice)
-            profile_entity_id = closed[idx].id
+        except ValueError as exc:
+            QMessageBox.warning(self, "Extrude", str(exc))
+            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
+            return
+        if profile_entity_id == -2:
+            return  # cancelled picker
 
         try:
             feat = self.doc.create_extrude(
@@ -750,7 +792,20 @@ class MainWindow(QMainWindow):
             self.sketch_tb.setVisible(False)
 
         try:
-            feat = self.doc.create_revolve(sid, angle_degrees=float(ang))
+            profile_entity_id = self._pick_closed_profile(
+                skf.sketch, title="Select Profile to Revolve"
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Revolve", str(exc))
+            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
+            return
+        if profile_entity_id == -2:
+            return
+
+        try:
+            feat = self.doc.create_revolve(
+                sid, angle_degrees=float(ang), profile_entity_id=profile_entity_id
+            )
         except ValueError as exc:
             QMessageBox.warning(self, "Revolve", str(exc))
             self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
@@ -824,8 +879,23 @@ class MainWindow(QMainWindow):
             self.sketch_tb.setVisible(False)
 
         try:
+            profile_entity_id = self._pick_closed_profile(
+                skf.sketch, title="Select Profile to Fillet"
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Fillet", str(exc))
+            self.statusBar().showMessage(f"Fillet failed: {exc}", 4000)
+            return
+        if profile_entity_id == -2:
+            return
+
+        try:
             feat = self.doc.create_fillet(
-                sid, float(dist), float(radius), segments=int(segs)
+                sid,
+                float(dist),
+                float(radius),
+                segments=int(segs),
+                profile_entity_id=profile_entity_id,
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Fillet", str(exc))
@@ -903,12 +973,24 @@ class MainWindow(QMainWindow):
             self.sketch_tb.setVisible(False)
 
         try:
+            profile_entity_id = self._pick_closed_profile(
+                skf.sketch, title="Select Profile to Pocket"
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Pocket", str(exc))
+            self.statusBar().showMessage(f"Pocket failed: {exc}", 4000)
+            return
+        if profile_entity_id == -2:
+            return
+
+        try:
             feat = self.doc.create_pocket(
                 sid,
                 float(dist),
                 float(hr),
                 (float(cx), float(cy)),
                 segments=int(segs),
+                profile_entity_id=profile_entity_id,
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Pocket", str(exc))

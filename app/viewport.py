@@ -57,6 +57,17 @@ PLANE_COLORS = {
 }
 PLANE_HALF = 2.5
 
+
+def _hex_to_rgb01(hex_color: str) -> tuple:
+    """'#RRGGBB' → (r, g, b) in 0..1."""
+    h = hex_color.lstrip("#")
+    return (
+        int(h[0:2], 16) / 255.0,
+        int(h[2:4], 16) / 255.0,
+        int(h[4:6], 16) / 255.0,
+    )
+
+
 # Performance ablation / final tuning (software-GL).
 # GROK_PERF_METHOD: none | a | b | c | d | e | final
 #   a = reduced interactive resolution during drag/resize
@@ -295,6 +306,7 @@ class Viewport(QWidget):
         self._lod_hidden: bool = False
         self._saved_size: Optional[Tuple[int, int]] = None
         self._perf_method = _PERF_METHOD
+        self._draw_lod_active: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -508,9 +520,23 @@ class Viewport(QWidget):
             return
         names = []
         names.extend(getattr(self, "_dim_label_names", set()) or set())
-        names.extend(["__sk_junctions", "__sk_dims", "__sk_grid"])
+        names.extend(
+            [
+                "__sk_junctions",
+                "__sk_dims",
+                "__sk_grid",
+                "__sk_handles",
+                "__sk_h",
+                "__sk_v",
+            ]
+        )
         for n in list(self.plotter.actors.keys()):
             if n.startswith("edge_"):
+                names.append(n)
+        for n in list(self._overlay_actors.keys()):
+            if n in ("__sk_junctions", "__sk_handles", "__sk_dims") or n.startswith(
+                "__sk_dim"
+            ):
                 names.append(n)
         for n in names:
             act = self._get_named_actor(n)
@@ -520,6 +546,48 @@ class Viewport(QWidget):
                 act.SetVisibility(1 if visible else 0)
             except Exception:
                 pass
+
+    def _begin_draw_lod(self) -> None:
+        """LOD while actively drawing/dragging in sketch mode (not only camera).
+
+        Hides labels/junctions/grid AND committed sketch entity actors so each
+        mouse-move only composites the rubber-band preview (big soft-GL win).
+        """
+        if self._draw_lod_active:
+            return
+        self._draw_lod_active = True
+        # Suppress heavy sketch chrome; keep rubber-band preview only
+        self._set_interaction_lod_visible(False)
+        # Hide committed entity strokes (restore on end)
+        for name, act in list(self._overlay_actors.items()):
+            if name.startswith("sk_e_"):
+                try:
+                    act.SetVisibility(0)
+                except Exception:
+                    pass
+        # Coalesce move renders more aggressively while drawing
+        if self._render_timer:
+            self._render_timer.setInterval(48)
+
+    def _end_draw_lod(self) -> None:
+        if not self._draw_lod_active:
+            return
+        self._draw_lod_active = False
+        self._set_interaction_lod_visible(True)
+        # Restore committed entity strokes
+        for name, act in list(self._overlay_actors.items()):
+            if name.startswith("sk_e_"):
+                try:
+                    act.SetVisibility(1)
+                except Exception:
+                    pass
+        if self._render_timer:
+            self._render_timer.setInterval(16)
+        # Restore full overlays from live state
+        self._update_junction_dots()
+        self._update_dim_labels()
+        self._update_handles_visual()
+        self._request_render()
 
     # ----- document / rebuild -----
     def set_document(self, doc: Document) -> None:
@@ -534,6 +602,7 @@ class Viewport(QWidget):
             return
         self._selected_id = fid
         self._restyle_selection_only()
+        self._request_render()
         self._request_render()
 
     def schedule_rebuild(self, *, immediate_planes: bool = False) -> None:
@@ -626,11 +695,11 @@ class Viewport(QWidget):
                 continue
             color = PLANE_COLORS[f.type]
             self.plotter.add_mesh(
-                _plane_surface(f.type), color=color, opacity=0.40, name=f"plane_{f.id}",
+                _plane_surface(f.type), color=color, opacity=0.32, name=f"plane_{f.id}",
                 pickable=True, smooth_shading=False, show_edges=False, render=False,
             )
             self.plotter.add_mesh(
-                _plane_border(f.type), color=color, line_width=3, name=f"edge_{f.id}",
+                _plane_border(f.type), color=color, line_width=2, name=f"edge_{f.id}",
                 pickable=False, render=False,
             )
         self._planes_built = True
@@ -701,10 +770,18 @@ class Viewport(QWidget):
             pass
 
     def _restyle_selection_only(self) -> None:
+        """Strong, obvious selection feedback for planes and solids."""
         if not self.plotter:
             return
+        # Gold highlight for selected plane (fill + border)
+        sel_rgb = (1.0, 0.84, 0.15)  # bright amber
+        sel_edge = (1.0, 0.95, 0.35)
         for name, actor in list(self.plotter.actors.items()):
-            if not (name.startswith("plane_") or name.startswith("solid_")):
+            if not (
+                name.startswith("plane_")
+                or name.startswith("edge_")
+                or name.startswith("solid_")
+            ):
                 continue
             try:
                 fid = int(name.split("_", 1)[1])
@@ -712,19 +789,50 @@ class Viewport(QWidget):
                 continue
             prop = actor.GetProperty()
             selected = fid == self._selected_id and not self.in_sketch_mode
+            f = self._doc.find(fid) if self._doc is not None else None
+
             if name.startswith("plane_"):
-                # Dim planes in sketch mode
-                base = 0.12 if self.in_sketch_mode else 0.40
-                prop.SetOpacity(0.52 if selected else base)
-                prop.SetEdgeVisibility(1 if selected else 0)
-                if selected:
-                    prop.SetEdgeColor(1.0, 0.92, 0.2)
-            else:
+                # Dim all planes in sketch mode; unselected stay translucent
+                if self.in_sketch_mode:
+                    prop.SetOpacity(0.10)
+                    if f is not None and is_reference_plane(f.type):
+                        prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
+                elif selected:
+                    # High opacity + warm amber so the pick is unmistakable
+                    prop.SetOpacity(0.78)
+                    prop.SetColor(*sel_rgb)
+                    prop.SetEdgeVisibility(1)
+                    prop.SetEdgeColor(*sel_edge)
+                    prop.SetLineWidth(3.0)
+                else:
+                    prop.SetOpacity(0.32)
+                    if f is not None and is_reference_plane(f.type):
+                        prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
+                    prop.SetEdgeVisibility(0)
+
+            elif name.startswith("edge_"):
+                # Border ring — thick gold when selected, soft type color otherwise
+                if self.in_sketch_mode:
+                    prop.SetOpacity(0.20)
+                    prop.SetLineWidth(1.5)
+                    if f is not None and is_reference_plane(f.type):
+                        prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
+                elif selected:
+                    prop.SetOpacity(1.0)
+                    prop.SetColor(*sel_edge)
+                    prop.SetLineWidth(5.0)
+                else:
+                    prop.SetOpacity(0.75)
+                    prop.SetLineWidth(2.0)
+                    if f is not None and is_reference_plane(f.type):
+                        prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
+
+            else:  # solid_
                 if self.in_sketch_mode:
                     prop.SetOpacity(0.25)
                 else:
                     prop.SetOpacity(1.0)
-                prop.SetColor(*( (0.98, 0.75, 0.14) if selected else (0.60, 0.64, 0.68) ))
+                prop.SetColor(*(sel_rgb if selected else (0.60, 0.64, 0.68)))
 
     # ----- sketch mode -----
     def _set_parallel_projection(self, enabled: bool) -> None:
@@ -886,6 +994,7 @@ class Viewport(QWidget):
     def exit_sketch(self) -> None:
         if not self.in_sketch_mode:
             return
+        self._end_draw_lod()
         self._remove_sketch_filter()
         self._clear_sketch_overlays()
         self._teardown_sketch_overlay_layer()
@@ -922,6 +1031,7 @@ class Viewport(QWidget):
         if self._sketch_ctrl.is_drawing() or self._sketch_ctrl.drag is not None:
             self._sketch_ctrl.cancel_drawing()
             self._sketch_ctrl.set_tool(SketchTool.SELECT)
+            self._end_draw_lod()
             self._clear_preview()
             self._update_handles_visual()
             self._update_cursor()
@@ -941,10 +1051,8 @@ class Viewport(QWidget):
         if not msg:
             return
         if msg.startswith("ChainEnd"):
+            self._end_draw_lod()
             self._clear_preview()
-            self._update_handles_visual()
-            self._update_junction_dots()
-            self._update_dim_labels()
             self.sketch_status.emit("Sketch: polyline finished")
             self._request_render()
             return
@@ -954,14 +1062,13 @@ class Viewport(QWidget):
             if self._doc is not None and self._sketch_feature_id >= 0:
                 self._doc.record_entity_add(self._sketch_feature_id, ent)
             self._upsert_entity_actor(ent)
-            self._update_junction_dots()
-            self._update_dim_labels()
         if msg == "Line" and self._sketch_ctrl.is_drawing():
             # Chaining continues — keep preview live
+            self._begin_draw_lod()
             self.sketch_status.emit("Sketch: Line (chain…)")
         else:
+            self._end_draw_lod()
             self._clear_preview()
-            self._update_handles_visual()
             self.sketch_status.emit(f"Sketch: {msg}")
         self._request_render()
 
@@ -969,10 +1076,8 @@ class Viewport(QWidget):
         if self._sketch_ctrl is None:
             return
         msg = self._sketch_ctrl.end_line_chain()
+        self._end_draw_lod()
         self._clear_preview()
-        self._update_handles_visual()
-        self._update_junction_dots()
-        self._update_dim_labels()
         self.sketch_status.emit("Sketch: polyline finished" if msg else "Sketch")
         self._request_render()
 
@@ -1553,17 +1658,26 @@ class Viewport(QWidget):
             return
         self._last_sketch_uv = uv
         prev_hover = self._sketch_ctrl.hover_handle
+        drawing = (
+            self._sketch_ctrl.is_drawing()
+            or self._sketch_ctrl.drag is not None
+        )
+        # While drawing/dragging: LOD (suppress labels/junctions/grid) + coalesce
+        if drawing:
+            self._begin_draw_lod()
         self._sketch_ctrl.on_move(uv)
-        # Incremental: only update dragged entity or preview
+        # Incremental: only update dragged entity or rubber-band preview
         if self._sketch_ctrl.drag is not None:
             ent = self._sketch_ctrl.sketch.find_entity(self._sketch_ctrl.drag.entity_id)
             if ent:
                 self._upsert_entity_actor(ent)
-            self._update_handles_visual()
-            self._update_dim_labels()
+            # Skip dim labels / full handles during drag LOD
+            if not self._draw_lod_active:
+                self._update_handles_visual()
+                self._update_dim_labels()
         else:
             self._update_preview_visual()
-            if self._sketch_ctrl.hover_handle != prev_hover:
+            if not self._draw_lod_active and self._sketch_ctrl.hover_handle != prev_hover:
                 self._update_handles_visual()
                 self._update_cursor()
         self._request_render()
@@ -1592,23 +1706,30 @@ class Viewport(QWidget):
                 if self._doc is not None and self._sketch_feature_id >= 0:
                     self._doc.record_entity_add(self._sketch_feature_id, ent)
                 self._upsert_entity_actor(ent)
-            self._update_junction_dots()
-            self._update_dim_labels()
             if msg == "Line" and self._sketch_ctrl.is_drawing():
-                # Polyline continues from last endpoint
+                # Polyline continues — keep draw LOD for next segment
+                self._begin_draw_lod()
                 self.sketch_status.emit("Sketch: Line (chain…)")
             else:
+                self._end_draw_lod()
                 self._clear_preview()
                 self._update_handles_visual()
+                self._update_junction_dots()
+                self._update_dim_labels()
                 self.sketch_status.emit(
                     "Sketch: closed polyline" if msg == "LineClosed" else f"Sketch: {msg}"
                 )
         elif msg and msg.startswith("Drag"):
+            self._begin_draw_lod()
             self.sketch_status.emit(f"Sketch: {msg}")
         elif msg and msg.startswith("Selected"):
+            self._end_draw_lod()
             self._rebuild_all_sketch_entities()
             self.sketch_status.emit("Sketch: Select")
         elif msg:
+            # First click of a draw starts LOD
+            if self._sketch_ctrl.is_drawing():
+                self._begin_draw_lod()
             self.sketch_status.emit(f"Sketch: {msg}")
         self._request_render()
 
@@ -1635,9 +1756,7 @@ class Viewport(QWidget):
                     self._doc.record_entity_move(
                         self._sketch_feature_id, self._drag_before, after
                     )
-            self._update_handles_visual()
-            self._update_junction_dots()
-            self._update_dim_labels()
+            self._end_draw_lod()
             self.sketch_status.emit(f"{self._sketch_ctrl.sketch.name} — edited")
         self._drag_before = None
         self._request_render()
