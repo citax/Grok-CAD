@@ -82,3 +82,5 @@ def test_set_parallel_projection_helper_exists():
     assert hasattr(Viewport, "_ensure_sketch_overlay_layer")
     assert hasattr(Viewport, "enter_sketch")
     assert hasattr(Viewport, "exit_sketch")
+    assert hasattr(Viewport, "_set_sketch_2d_chrome")
+    assert hasattr(Viewport, "_sync_rubber_geometry")
