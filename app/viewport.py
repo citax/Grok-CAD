@@ -8,8 +8,8 @@ from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import QEvent, QObject, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QCursor
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from pyvistaqt import QtInteractor
 
@@ -66,6 +66,83 @@ def _hex_to_rgb01(hex_color: str) -> tuple:
         int(h[2:4], 16) / 255.0,
         int(h[4:6], 16) / 255.0,
     )
+
+
+class _SketchRubberBand(QWidget):
+    """Qt overlay for in-progress sketch preview — no VTK re-render required.
+
+    Parent is the VTK interactor widget. Transparent to mouse events; paints the
+    rubber-band polyline (and optional snap cue) in widget coordinates.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._segments: list[tuple[float, float, float, float]] = []
+        self._snap: Optional[tuple[float, float]] = None
+        self._pen_color = QColor(SKETCH_PREVIEW)
+        self._snap_color = QColor(ACCENT)
+        self.hide()
+
+    def set_geometry_from_parent(self) -> None:
+        p = self.parentWidget()
+        if p is not None:
+            self.setGeometry(0, 0, p.width(), p.height())
+
+    def set_line(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        *,
+        snap: Optional[tuple[float, float]] = None,
+    ) -> None:
+        self._segments = [(x0, y0, x1, y1)]
+        self._snap = snap
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.update()
+
+    def set_segments(
+        self,
+        segs: list[tuple[float, float, float, float]],
+        *,
+        snap: Optional[tuple[float, float]] = None,
+    ) -> None:
+        self._segments = list(segs)
+        self._snap = snap
+        if segs:
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+
+    def clear(self) -> None:
+        self._segments = []
+        self._snap = None
+        self.hide()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if not self._segments:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(self._pen_color, 2.5)
+        p.setPen(pen)
+        for x0, y0, x1, y1 in self._segments:
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+        if self._snap is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._snap_color)
+            p.drawEllipse(QPointF(self._snap[0], self._snap[1]), 5.0, 5.0)
+        p.end()
 
 
 # Performance ablation / final tuning (software-GL).
@@ -310,6 +387,14 @@ class Viewport(QWidget):
         self._perf_method = _PERF_METHOD
         self._draw_lod_active: bool = False
         self._draw_saved_size: Optional[Tuple[int, int]] = None
+        self._rubber: Optional[_SketchRubberBand] = None
+        # Preview mode: "qt" = rubber-band only (default); "vtk" = full re-render path
+        self._draw_preview_mode: str = (
+            _os.environ.get("GROK_DRAW_PREVIEW") or "qt"
+        ).strip().lower()
+        # Instrumentation: full VTK renders during strokes
+        self._render_count: int = 0
+        self._render_ms_sum: float = 0.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -317,6 +402,9 @@ class Viewport(QWidget):
         try:
             self.plotter = QtInteractor(self, multi_samples=0)
             layout.addWidget(self.plotter.interactor)
+            # Qt rubber-band over the interactor (no VTK re-render on move)
+            self._rubber = _SketchRubberBand(self.plotter.interactor)
+            self._rubber.set_geometry_from_parent()
             self._ok = True
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] FAILED: {exc}", file=sys.stderr)
@@ -548,31 +636,31 @@ class Viewport(QWidget):
         """LOD while actively drawing/dragging in sketch mode (not only camera).
 
         Safe for Qt-embedded VTK: hide labels/junctions/grid and committed sketch
-        actors; coalesce renders. Do NOT call render_window.SetSize — Qt owns the
-        widget size and SetSize collapses the scene into a corner of the viewport.
-        Offscreen FBO blit would be required for safe resolution scaling; without
-        that, large-window fill-rate under llvmpipe remains the floor.
+        actors; freeze the base scene with ONE full render; subsequent mouse-moves
+        only update a QPainter rubber-band (no VTK re-render). Do NOT call
+        render_window.SetSize — that collapses the scene into a corner.
         """
         if self._draw_lod_active:
             return
         self._draw_lod_active = True
-        # Suppress heavy sketch chrome; keep rubber-band preview only
+        # Suppress labels/junctions/grid; keep committed strokes visible (frozen)
         self._set_interaction_lod_visible(False)
-        # Hide committed entity strokes (restore on end)
-        for name, act in list(self._overlay_actors.items()):
-            if name.startswith("sk_e_"):
-                try:
-                    act.SetVisibility(0)
-                except Exception:
-                    pass
-        # Never SetSize on the embedded window (causes corner-collapse).
+        # Drop any VTK preview actors — Qt rubber-band owns the live preview
+        self._remove_actor("__sk_preview")
+        self._remove_actor("__sk_infer")
         self._draw_saved_size = None
         try:
             if self.plotter is not None:
                 self.plotter.render_window.SetDesiredUpdateRate(12.0)
         except Exception:
             pass
-        # Coalesce move renders more aggressively while drawing
+        # ONE freeze of the base scene; subsequent moves only paint Qt rubber-band
+        if self._render_timer.isActive():
+            self._render_timer.stop()
+        self._do_render()
+        if self._rubber is not None:
+            self._rubber.set_geometry_from_parent()
+            self._rubber.raise_()
         if self._render_timer:
             self._render_timer.setInterval(48)
 
@@ -581,14 +669,9 @@ class Viewport(QWidget):
             return
         self._draw_lod_active = False
         self._set_interaction_lod_visible(True)
-        # Restore committed entity strokes
-        for name, act in list(self._overlay_actors.items()):
-            if name.startswith("sk_e_"):
-                try:
-                    act.SetVisibility(1)
-                except Exception:
-                    pass
         self._draw_saved_size = None
+        if self._rubber is not None:
+            self._rubber.clear()
         try:
             if self.plotter is not None:
                 self.plotter.render_window.SetDesiredUpdateRate(0.0001)
@@ -596,11 +679,13 @@ class Viewport(QWidget):
             pass
         if self._render_timer:
             self._render_timer.setInterval(16)
-        # Restore full overlays from live state
+        # Restore full overlays from live state + one full render
         self._update_junction_dots()
         self._update_dim_labels()
         self._update_handles_visual()
-        self._request_render()
+        if self._render_timer.isActive():
+            self._render_timer.stop()
+        self._do_render()
 
     # ----- document / rebuild -----
     def set_document(self, doc: Document) -> None:
@@ -743,7 +828,18 @@ class Viewport(QWidget):
 
     def _do_render(self) -> None:
         if self.plotter:
+            t0 = time.perf_counter()
             self.plotter.render()
+            self._render_count += 1
+            self._render_ms_sum += (time.perf_counter() - t0) * 1000.0
+
+    def reset_render_stats(self) -> None:
+        self._render_count = 0
+        self._render_ms_sum = 0.0
+
+    def render_stats(self) -> Tuple[int, float]:
+        """Return (full VTK render count, total ms) since last reset."""
+        return self._render_count, self._render_ms_sum
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         # Coalesce paints while the window is being dragged/maximized.
@@ -753,6 +849,8 @@ class Viewport(QWidget):
         settle = 120 if _perf_enabled("e") else 80
         self._resize_timer.setInterval(settle)
         self._resize_timer.start()  # restarts → settle
+        if self._rubber is not None:
+            self._rubber.set_geometry_from_parent()
         self._request_render()
         super().resizeEvent(event)
 
@@ -1527,9 +1625,82 @@ class Viewport(QWidget):
     def _clear_preview(self) -> None:
         self._remove_actor("__sk_preview")
         self._remove_actor("__sk_infer")
+        if self._rubber is not None:
+            self._rubber.clear()
 
     def _clear_handles(self) -> None:
         self._remove_actor("__sk_handles")
+
+    def _world_to_widget(self, world_pt) -> Optional[Tuple[float, float]]:
+        """Project world XYZ → widget coords (Qt y-down) on the interactor."""
+        if not self.plotter:
+            return None
+        try:
+            ren = self.plotter.renderer
+            ren.SetWorldPoint(
+                float(world_pt[0]), float(world_pt[1]), float(world_pt[2]), 1.0
+            )
+            ren.WorldToDisplay()
+            dx, dy, _ = ren.GetDisplayPoint()
+            h = float(self.plotter.interactor.height())
+            return float(dx), float(h - 1.0 - dy)
+        except Exception:
+            return None
+
+    def _update_preview_qt(self) -> None:
+        """Update QPainter rubber-band only — no VTK mesh, no full re-render."""
+        if self._rubber is None or self._sketch_ctrl is None or not self.plotter:
+            return
+        ctrl = self._sketch_ctrl
+        if (
+            ctrl.tool == SketchTool.SELECT
+            or ctrl.preview_uv is None
+            or ctrl.draw is None
+            or not ctrl.draw.points
+        ):
+            self._rubber.clear()
+            return
+        fr = ctrl.sketch.frame
+        p0 = ctrl.draw.points[0]
+        p1 = ctrl.preview_uv
+        segs: list[tuple[float, float, float, float]] = []
+        if ctrl.tool is SketchTool.LINE:
+            w0 = fr.to_world(p0)
+            w1 = fr.to_world(p1)
+            a = self._world_to_widget(w0)
+            b = self._world_to_widget(w1)
+            if a and b:
+                segs.append((a[0], a[1], b[0], b[1]))
+        elif ctrl.tool is SketchTool.RECTANGLE:
+            u0, v0 = float(p0[0]), float(p0[1])
+            u1, v1 = float(p1[0]), float(p1[1])
+            corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1), (u0, v0)]
+            pts_w = [self._world_to_widget(fr.to_world(c)) for c in corners]
+            for i in range(4):
+                a, b = pts_w[i], pts_w[i + 1]
+                if a and b:
+                    segs.append((a[0], a[1], b[0], b[1]))
+        else:  # circle — polyline approx
+            import math
+
+            rad = max(1e-6, float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])))
+            n = 32
+            pts = []
+            for i in range(n + 1):
+                a = 2 * math.pi * i / n
+                uv = (p0[0] + rad * math.cos(a), p0[1] + rad * math.sin(a))
+                pts.append(self._world_to_widget(fr.to_world(uv)))
+            for i in range(n):
+                a, b = pts[i], pts[i + 1]
+                if a and b:
+                    segs.append((a[0], a[1], b[0], b[1]))
+        snap_pt = None
+        if ctrl.last_snap.kind in ("h", "v", "origin", "point", "chain_start"):
+            snap_pt = self._world_to_widget(fr.to_world(ctrl.preview_uv))
+        if segs:
+            self._rubber.set_segments(segs, snap=snap_pt)
+        else:
+            self._rubber.clear()
 
     def _update_handles_visual(self) -> None:
         if not self.plotter or self._sketch_ctrl is None:
@@ -1558,8 +1729,28 @@ class Viewport(QWidget):
         )
 
     def _update_preview_visual(self) -> None:
+        """Preview for in-progress draw.
+
+        Default (qt): paint rubber-band via QPainter — no VTK mesh, no full re-render.
+        Legacy (vtk, GROK_DRAW_PREVIEW=vtk): previous full overlay-mesh path for profiling.
+        """
         if not self.plotter or self._sketch_ctrl is None:
             return
+        # Prefer Qt rubber-band during active draw LOD (and always in qt mode)
+        use_qt = self._draw_preview_mode != "vtk"
+        if use_qt and (
+            self._draw_lod_active
+            or (
+                self._sketch_ctrl.is_drawing()
+                and self._sketch_ctrl.tool != SketchTool.SELECT
+            )
+        ):
+            # Drop VTK preview actors if any leftover
+            self._remove_actor("__sk_preview")
+            self._remove_actor("__sk_infer")
+            self._update_preview_qt()
+            return
+
         self._clear_preview()
         ctrl = self._sketch_ctrl
         if ctrl.tool == SketchTool.SELECT or ctrl.preview_uv is None:
@@ -1571,7 +1762,6 @@ class Viewport(QWidget):
         p0 = ctrl.draw.points[0]
         p1 = ctrl.preview_uv
         if ctrl.tool is SketchTool.LINE:
-            # Exactly on-plane; overlay layer composites above grid/axes
             pdata = pv.Line(fr.to_world(p0), fr.to_world(p1))
         elif ctrl.tool is SketchTool.RECTANGLE:
             from cadcore.sketch import EntityKind
@@ -1591,8 +1781,7 @@ class Viewport(QWidget):
             render=False,
         )
         self._apply_sketch_actor_priority("__sk_preview")
-        # Inference cue — flat 2D dot on-plane, not a sphere
-        if ctrl.last_snap.kind in ("h", "v", "origin", "point"):
+        if ctrl.last_snap.kind in ("h", "v", "origin", "point", "chain_start"):
             w = fr.to_world(ctrl.preview_uv)
             self._add_overlay_mesh(
                 _flat_point_cloud(np.array([w], float)),
@@ -1669,24 +1858,29 @@ class Viewport(QWidget):
             self._sketch_ctrl.is_drawing()
             or self._sketch_ctrl.drag is not None
         )
-        # While drawing/dragging: LOD (suppress labels/junctions/grid) + coalesce
+        # While drawing/dragging: LOD + rubber-band (no full VTK re-render on move)
         if drawing:
             self._begin_draw_lod()
         self._sketch_ctrl.on_move(uv)
-        # Incremental: only update dragged entity or rubber-band preview
         if self._sketch_ctrl.drag is not None:
+            # Handle drag still needs occasional VTK (geometry changes) — but rare
             ent = self._sketch_ctrl.sketch.find_entity(self._sketch_ctrl.drag.entity_id)
             if ent:
                 self._upsert_entity_actor(ent)
-            # Skip dim labels / full handles during drag LOD
             if not self._draw_lod_active:
                 self._update_handles_visual()
                 self._update_dim_labels()
-        else:
-            self._update_preview_visual()
-            if not self._draw_lod_active and self._sketch_ctrl.hover_handle != prev_hover:
-                self._update_handles_visual()
-                self._update_cursor()
+            self._request_render()
+            return
+        if drawing and self._draw_preview_mode != "vtk":
+            # Qt rubber-band only — frozen base scene, zero full-scene re-renders
+            self._update_preview_qt()
+            return
+        # Idle hover or forced VTK preview path
+        self._update_preview_visual()
+        if not self._draw_lod_active and self._sketch_ctrl.hover_handle != prev_hover:
+            self._update_handles_visual()
+            self._update_cursor()
         self._request_render()
 
     def _sketch_mouse_press(self, x: float, y: float) -> None:
@@ -1713,9 +1907,21 @@ class Viewport(QWidget):
                 if self._doc is not None and self._sketch_feature_id >= 0:
                     self._doc.record_entity_add(self._sketch_feature_id, ent)
                 self._upsert_entity_actor(ent)
+            if self._rubber is not None:
+                self._rubber.clear()
             if msg == "Line" and self._sketch_ctrl.is_drawing():
-                # Polyline continues — keep draw LOD for next segment
-                self._begin_draw_lod()
+                # Polyline continues: ONE full render for new actor, then freeze again
+                if self._render_timer.isActive():
+                    self._render_timer.stop()
+                self._do_render()  # commit frame with new segment
+                # Stay in draw LOD — next moves are rubber-band only
+                if not self._draw_lod_active:
+                    self._begin_draw_lod()
+                else:
+                    # Re-freeze after actor upsert (already rendered once above)
+                    if self._rubber is not None:
+                        self._rubber.set_geometry_from_parent()
+                        self._rubber.raise_()
                 self.sketch_status.emit("Sketch: Line (chain…)")
             else:
                 self._end_draw_lod()
@@ -1726,6 +1932,7 @@ class Viewport(QWidget):
                 self.sketch_status.emit(
                     "Sketch: closed polyline" if msg == "LineClosed" else f"Sketch: {msg}"
                 )
+            return
         elif msg and msg.startswith("Drag"):
             self._begin_draw_lod()
             self.sketch_status.emit(f"Sketch: {msg}")
@@ -1734,7 +1941,7 @@ class Viewport(QWidget):
             self._rebuild_all_sketch_entities()
             self.sketch_status.emit("Sketch: Select")
         elif msg:
-            # First click of a draw starts LOD
+            # First click of a draw: freeze base scene once
             if self._sketch_ctrl.is_drawing():
                 self._begin_draw_lod()
             self.sketch_status.emit(f"Sketch: {msg}")
