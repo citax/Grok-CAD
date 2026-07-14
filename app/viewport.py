@@ -70,7 +70,7 @@ def _hex_to_rgb01(hex_color: str) -> tuple:
 
 # Performance ablation / final tuning (software-GL).
 # GROK_PERF_METHOD: none | a | b | c | d | e | final
-#   a = reduced interactive resolution during drag/resize
+#   a = (removed) SetSize half-res — incompatible with Qt-embedded window
 #   b = LOD: hide labels/junctions/overlay heavy props while interacting
 #   c = batch static sketch lines into fewer actors (closed sketches)
 #   d = disable MSAA/transparency while interacting
@@ -83,9 +83,11 @@ _PERF_METHOD = (_os.environ.get("GROK_PERF_METHOD") or "final").strip().lower()
 
 def _perf_enabled(*methods: str) -> bool:
     if _PERF_METHOD == "final":
-        # Ablation winners (llvmpipe @ 300 ents): c (batch) ≫ b (LOD) ≥ e (coalesce).
-        # a (scaled res) and d (MSAA off) did not help or regressed maximize/drag.
+        # Ablation winners: c (batch) ≫ b (LOD) ≥ e (coalesce).
+        # a (SetSize half-res) removed — collapses Qt-embedded viewport into a corner.
         return any(m in ("b", "c", "e") for m in methods)
+    if _PERF_METHOD == "a":
+        return False  # no SetSize path remains
     return _PERF_METHOD in methods
 
 
@@ -462,6 +464,12 @@ class Viewport(QWidget):
                 pass
 
     def _begin_interaction_lod(self) -> None:
+        """Camera-drag LOD — never SetSize on the Qt-embedded render window.
+
+        render_window.SetSize on a QtInteractor only paints into a corner of the
+        widget (size is owned by Qt). Safe LOD: hide heavy overlays + lower
+        DesiredUpdateRate. Fill-rate still limited by software GL / real GPU.
+        """
         if self._interacting:
             return
         self._interacting = True
@@ -471,16 +479,8 @@ class Viewport(QWidget):
             self.plotter.render_window.SetDesiredUpdateRate(12.0)
         except Exception:
             pass
-        # (a) lower interactive resolution
-        if _perf_enabled("a"):
-            try:
-                w, h = self.plotter.window_size
-                self._saved_size = (int(w), int(h))
-                # 50% linear scale → ~25% pixels (soft-GL fill-rate win)
-                sw, sh = max(64, int(w * 0.5)), max(64, int(h * 0.5))
-                self.plotter.render_window.SetSize(sw, sh)
-            except Exception:
-                self._saved_size = None
+        # Method "a" (SetSize half-res) is intentionally NOT applied here —
+        # incompatible with Qt-embedded windows (collapses scene into a corner).
         # (b) hide heavy overlays
         if _perf_enabled("b"):
             self._set_interaction_lod_visible(False)
@@ -494,7 +494,7 @@ class Viewport(QWidget):
                 pass
 
     def _end_interaction_lod(self) -> None:
-        if not self._interacting and not self._lod_hidden and self._saved_size is None:
+        if not self._interacting and not self._lod_hidden:
             return
         self._interacting = False
         if not self.plotter:
@@ -503,12 +503,8 @@ class Viewport(QWidget):
             self.plotter.render_window.SetDesiredUpdateRate(0.0001)
         except Exception:
             pass
-        if _perf_enabled("a") and self._saved_size is not None:
-            try:
-                self.plotter.render_window.SetSize(*self._saved_size)
-            except Exception:
-                pass
-            self._saved_size = None
+        # Clear any legacy saved size from older builds; never SetSize restore
+        self._saved_size = None
         if _perf_enabled("b"):
             self._set_interaction_lod_visible(True)
         # Still render only — no feature rebuild on pure camera move
@@ -551,11 +547,11 @@ class Viewport(QWidget):
     def _begin_draw_lod(self) -> None:
         """LOD while actively drawing/dragging in sketch mode (not only camera).
 
-        Two attacks on soft-GL jank:
-        1) Hide labels/junctions/grid and committed sketch actors (less geometry).
-        2) Drop render resolution once to ~50% linear (~25% pixels) for the whole
-           stroke — fill-rate is the real bottleneck at large windows; set size
-           once at start, restore once at end (no per-move SetSize thrash).
+        Safe for Qt-embedded VTK: hide labels/junctions/grid and committed sketch
+        actors; coalesce renders. Do NOT call render_window.SetSize — Qt owns the
+        widget size and SetSize collapses the scene into a corner of the viewport.
+        Offscreen FBO blit would be required for safe resolution scaling; without
+        that, large-window fill-rate under llvmpipe remains the floor.
         """
         if self._draw_lod_active:
             return
@@ -569,15 +565,8 @@ class Viewport(QWidget):
                     act.SetVisibility(0)
                 except Exception:
                     pass
-        # Fill-rate: lower render resolution once for the entire draw interaction
-        if self.plotter is not None and self._draw_saved_size is None:
-            try:
-                w, h = self.plotter.window_size
-                self._draw_saved_size = (int(w), int(h))
-                sw, sh = max(64, int(w * 0.5)), max(64, int(h * 0.5))
-                self.plotter.render_window.SetSize(sw, sh)
-            except Exception:
-                self._draw_saved_size = None
+        # Never SetSize on the embedded window (causes corner-collapse).
+        self._draw_saved_size = None
         try:
             if self.plotter is not None:
                 self.plotter.render_window.SetDesiredUpdateRate(12.0)
@@ -599,13 +588,7 @@ class Viewport(QWidget):
                     act.SetVisibility(1)
                 except Exception:
                     pass
-        # Restore full resolution once (paired with SetSize in _begin_draw_lod)
-        if self.plotter is not None and self._draw_saved_size is not None:
-            try:
-                self.plotter.render_window.SetSize(*self._draw_saved_size)
-            except Exception:
-                pass
-            self._draw_saved_size = None
+        self._draw_saved_size = None
         try:
             if self.plotter is not None:
                 self.plotter.render_window.SetDesiredUpdateRate(0.0001)
@@ -765,11 +748,8 @@ class Viewport(QWidget):
     def resizeEvent(self, event) -> None:  # noqa: N802
         # Coalesce paints while the window is being dragged/maximized.
         # Pure camera/window resize must NOT rebuild sketch/solid actors.
+        # Never SetSize the embedded render window (Qt owns geometry).
         self._resizing = True
-        if _perf_enabled("a"):
-            # Also scale down during live resize (same as interaction)
-            if not self._interacting:
-                self._begin_interaction_lod()
         settle = 120 if _perf_enabled("e") else 80
         self._resize_timer.setInterval(settle)
         self._resize_timer.start()  # restarts → settle
@@ -778,10 +758,7 @@ class Viewport(QWidget):
 
     def _end_resize_coalesce(self) -> None:
         self._resizing = False
-        if _perf_enabled("a") and self._interacting:
-            self._end_interaction_lod()
-        else:
-            self._request_render()
+        self._request_render()
 
     def _remove_actor(self, name: str) -> None:
         if not self.plotter:
