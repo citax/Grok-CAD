@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from dataclasses import fields, replace
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
@@ -19,6 +20,7 @@ from cadcore.document import (
     sketch_fingerprint,
 )
 from cadcore.mesh import Mesh
+from cadcore.sketch import Sketch
 
 
 def feature_fingerprint(f: Feature) -> str:
@@ -40,10 +42,15 @@ def feature_fingerprint(f: Feature) -> str:
         f"{f.axis_direction[0]:.6g},{f.axis_direction[1]:.6g}",
         f"{f.hole_center_u:.6g},{f.hole_center_v:.6g}",
         f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
-        str(int(getattr(f, "reversed", False))),
+        str(int(bool(f.reversed))),
         str(int(f.visible)),
         str(int(f.suppressed)),
     ]
+    # Fillet parametric source outline
+    if f.source_profile_uv:
+        parts.append(
+            ";".join(f"{p[0]:.6g},{p[1]:.6g}" for p in f.source_profile_uv)
+        )
     if f.type in (
         FeatureType.EXTRUDE,
         FeatureType.REVOLVE,
@@ -55,37 +62,38 @@ def feature_fingerprint(f: Feature) -> str:
     return "|".join(parts)
 
 
+def _clone_feature_value(name: str, val: Any) -> Any:
+    """Clone one Feature field for a worker-safe snapshot."""
+    if name == "sketch":
+        return copy_sketch(val)
+    if name == "source_profile_uv":
+        return [(float(p[0]), float(p[1])) for p in (val or [])]
+    if isinstance(val, tuple):
+        return tuple(val)
+    if isinstance(val, list):
+        return list(val)
+    if isinstance(val, np.ndarray):
+        return val.copy()
+    return val
+
+
+def snapshot_feature(f: Feature) -> Feature:
+    """Structural copy of one Feature from dataclasses.fields — no field can be forgotten."""
+    kwargs = {
+        fld.name: _clone_feature_value(fld.name, getattr(f, fld.name))
+        for fld in fields(Feature)
+    }
+    return Feature(**kwargs)
+
+
 def snapshot_features(doc: Document) -> List[Feature]:
-    """Deep-ish copy of features safe to read on a worker thread."""
-    out: List[Feature] = []
-    for f in doc.features:
-        out.append(
-            Feature(
-                id=f.id,
-                name=f.name,
-                type=f.type,
-                width=f.width,
-                height=f.height,
-                depth=f.depth,
-                radius=f.radius,
-                segments=f.segments,
-                rings=f.rings,
-                operand_a=f.operand_a,
-                operand_b=f.operand_b,
-                translation=tuple(f.translation),  # type: ignore[arg-type]
-                plane_id=f.plane_id,
-                sketch=copy_sketch(f.sketch),
-                profile_entity_id=f.profile_entity_id,
-                revolve_angle=f.revolve_angle,
-                axis_origin=tuple(f.axis_origin),  # type: ignore[arg-type]
-                axis_direction=tuple(f.axis_direction),  # type: ignore[arg-type]
-                hole_center_u=f.hole_center_u,
-                hole_center_v=f.hole_center_v,
-                visible=f.visible,
-                suppressed=f.suppressed,
-            )
-        )
-    return out
+    """Deep-ish copy of features safe to read on a worker thread.
+
+    Derived from ``dataclasses.fields(Feature)`` so new Feature fields are
+    always included (the previous hand-written list silently dropped
+    ``reversed`` and ``source_profile_uv``).
+    """
+    return [snapshot_feature(f) for f in doc.features]
 
 
 def evaluate_solids_snapshot(
@@ -252,7 +260,7 @@ def evaluate_solids_snapshot(
         m = eval_one(f.id)
         if m is None or m.empty:
             continue
-        # For sketch-based solids, include source sketch geometry in the fingerprint
+        # Attach source sketch for fingerprint when the solid feature has none
         fp_feature = f
         if f.type in (
             FeatureType.EXTRUDE,
@@ -261,32 +269,8 @@ def evaluate_solids_snapshot(
             FeatureType.POCKET,
         ):
             skf = by_id.get(f.operand_a)
-            if skf is not None and skf.sketch is not None:
-                # temporary view with sketch attached for fingerprint only
-                fp_feature = Feature(
-                    id=f.id,
-                    name=f.name,
-                    type=f.type,
-                    width=f.width,
-                    height=f.height,
-                    depth=f.depth,
-                    radius=f.radius,
-                    segments=f.segments,
-                    rings=f.rings,
-                    operand_a=f.operand_a,
-                    operand_b=f.operand_b,
-                    translation=f.translation,
-                    plane_id=f.plane_id,
-                    sketch=skf.sketch,
-                    profile_entity_id=f.profile_entity_id,
-                    revolve_angle=f.revolve_angle,
-                    axis_origin=f.axis_origin,
-                    axis_direction=f.axis_direction,
-                    hole_center_u=f.hole_center_u,
-                    hole_center_v=f.hole_center_v,
-                    visible=f.visible,
-                    suppressed=f.suppressed,
-                )
+            if skf is not None and skf.sketch is not None and f.sketch is None:
+                fp_feature = replace(f, sketch=skf.sketch)
         results[f.id] = (
             np.ascontiguousarray(m.vertices, dtype=np.float64),
             np.ascontiguousarray(m.faces, dtype=np.int32),

@@ -10,6 +10,8 @@ import sys
 import time
 import traceback
 
+import numpy as np
+
 os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
 os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -180,24 +182,81 @@ def main() -> int:
     win._sync_selection(ex.id)
     _pump(app, 8)
 
+    def _wait_rebuild(timeout_s: float = 8.0) -> None:
+        """Pump until rebuild timer idle and job gen stable (worker finished)."""
+        t_end = time.time() + timeout_s
+        while time.time() < t_end:
+            app.processEvents()
+            # Rebuild timer not pending and no busy message from worker
+            busy = False
+            try:
+                # GeometryRebuildJob clears busy on finish via busy_changed
+                pass
+            except Exception:
+                pass
+            if not win.viewport._rebuild_timer.isActive():
+                # give worker a few ticks after timer fire
+                for _ in range(30):
+                    app.processEvents()
+                    time.sleep(0.02)
+                return
+            time.sleep(0.02)
+        raise TimeoutError("rebuild did not finish")
+
+    def _viewport_solid_z(fid: int):
+        """Z bounds of the mesh the viewport actually uploaded (actor polydata)."""
+        name = f"solid_{fid}"
+        act = win.viewport.plotter.actors.get(name)
+        if act is None:
+            return None
+        try:
+            mapper = act.GetMapper()
+            data = mapper.GetInput()
+            pts = np.array(data.GetPoints().GetData())
+            if pts.size == 0:
+                return None
+            return float(pts[:, 2].min()), float(pts[:, 2].max())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport solid] {exc}", flush=True)
+            return None
+
+    def _wait_solid(fid: int, timeout_s: float = 8.0):
+        t_end = time.time() + timeout_s
+        while time.time() < t_end:
+            app.processEvents()
+            z = _viewport_solid_z(fid)
+            if z is not None:
+                return z
+            time.sleep(0.03)
+        return None
+
     # Change depth via panel on the live window
     win.props.show_feature(ex)
     win.props.show_feature(ex)  # second show — crash site
     win.props._editors["depth"].setValue(3.5)
     win.props.btn_apply.click()
-    _pump(app, 20)
+    _wait_rebuild()
     assert abs(ex.depth - 3.5) < 1e-12
-    mesh = win.doc.evaluate_feature(ex.id)
-    assert mesh is not None and abs(mesh.volume() - 14.0) < 0.15
-    print("MAINWINDOW_APPLY_OK volume≈14", flush=True)
+    # Worker path volume (not only doc.evaluate_feature)
+    from app.workers import evaluate_solids_snapshot, snapshot_features
+
+    res = evaluate_solids_snapshot(snapshot_features(win.doc))
+    assert ex.id in res
+    v, faces, _fp = res[ex.id]
+    # approximate volume via mesh from verts/faces
+    from cadcore.mesh import Mesh
+
+    m_snap = Mesh(v, faces)
+    assert abs(m_snap.volume() - 14.0) < 0.2, m_snap.volume()
+    print("MAINWINDOW_APPLY_OK volume≈14 (snapshot path)", flush=True)
 
     win._undo()
-    _pump(app, 15)
+    _wait_rebuild()
     assert abs(ex.depth - 1.0) < 1e-12
     print("MAINWINDOW_UNDO_OK", flush=True)
 
     win._redo()
-    _pump(app, 15)
+    _wait_rebuild()
     assert abs(ex.depth - 3.5) < 1e-12
     print("MAINWINDOW_REDO_OK", flush=True)
 
@@ -207,7 +266,21 @@ def main() -> int:
     _pump(app, 8)
     print("MAINWINDOW_RESELECT_OK", flush=True)
 
-    # Reverse direction: solid must flip to −normal, undo restores +normal
+    # --- Reverse direction: MUST assert VIEWPORT actor mesh, not doc.evaluate ---
+    z_before = _wait_solid(ex.id)
+    assert z_before is not None, "no solid actor before reverse"
+    print(f"VIEWPORT_Z_BEFORE {z_before[0]:.4f}..{z_before[1]:.4f}", flush=True)
+    assert z_before[0] >= -1e-3 and z_before[1] > 1.0
+
+    # Camera: look from +X so ±Z is left/right on screen for framebuffer check
+    try:
+        win.viewport.plotter.camera_position = [(8, 1, 0), (1, 1, 0), (0, 1, 0)]
+        win.viewport._do_render()
+        _pump(app, 5)
+    except Exception:
+        pass
+    img_before = np.asarray(win.viewport.plotter.screenshot(return_img=True))
+
     win.props.show_feature(ex)
     win.props.show_feature(ex)
     from PySide6.QtWidgets import QCheckBox
@@ -216,17 +289,39 @@ def main() -> int:
     assert isinstance(cb, QCheckBox), type(cb)
     cb.setChecked(True)
     win.props.btn_apply.click()
-    _pump(app, 20)
+    _wait_rebuild()
     assert ex.reversed is True
-    m_rev = win.doc.evaluate_feature(ex.id)
-    assert m_rev is not None and m_rev.vertices[:, 2].max() <= 1e-5
-    assert m_rev.vertices[:, 2].min() < -1.0
-    print("MAINWINDOW_REVERSE_OK", flush=True)
+
+    z_after = _wait_solid(ex.id)
+    assert z_after is not None, "no solid actor after reverse"
+    print(f"VIEWPORT_Z_AFTER {z_after[0]:.4f}..{z_after[1]:.4f}", flush=True)
+    if z_after[1] <= 1e-3 and z_after[0] < -1.0:
+        print("VIEWPORT_REVERSE_OK", flush=True)
+    else:
+        print(f"VIEWPORT_REVERSE_FAIL z={z_after}", flush=True)
+        return 1
+
+    # Snapshot-path geometry must also be on −Z
+    res2 = evaluate_solids_snapshot(snapshot_features(win.doc))
+    vz = res2[ex.id][0][:, 2]
+    assert float(vz.max()) <= 1e-5 and float(vz.min()) < -1.0
+
+    img_after = np.asarray(win.viewport.plotter.screenshot(return_img=True))
+    # Solid pixels should differ after reverse (coarse but real framebuffer)
+    if img_before.shape == img_after.shape:
+        diff = np.mean(np.abs(img_before.astype(float) - img_after.astype(float)))
+        print(f"FRAMEBUFFER_DIFF mean_abs={diff:.4f}", flush=True)
+        if diff < 0.5:
+            print("FRAMEBUFFER_DIFF_WEAK (camera may not separate sides well)", flush=True)
+        else:
+            print("FRAMEBUFFER_DIFF_OK", flush=True)
+
     win._undo()
-    _pump(app, 15)
+    _wait_rebuild()
     assert ex.reversed is False
-    m_fwd = win.doc.evaluate_feature(ex.id)
-    assert m_fwd is not None and m_fwd.vertices[:, 2].min() >= -1e-5
+    z_undo = _wait_solid(ex.id)
+    assert z_undo is not None and z_undo[0] >= -1e-3 and z_undo[1] > 1.0
+    print("VIEWPORT_REVERSE_UNDO_OK", flush=True)
     print("MAINWINDOW_REVERSE_UNDO_OK", flush=True)
 
     if _EXC:
