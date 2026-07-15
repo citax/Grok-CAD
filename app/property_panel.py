@@ -1,8 +1,14 @@
-"""SolidWorks-style PropertyManager panel for feature / sketch parameters."""
+"""SolidWorks-style PropertyManager panel for feature / sketch parameters.
+
+Editors are built fresh on every show_feature/show_sketch_line. Dynamic rows use
+QFormLayout.removeRow(), which deletes widgets — so spin boxes must NOT be
+long-lived attributes reused across shows (that caused dangling Shiboken
+pointers on the second show).
+"""
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Dict, Optional, Union
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -18,7 +24,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.theme import TEXT_SECONDARY
 from cadcore.document import Document, Feature, FeatureType, is_reference_plane
 from cadcore.sketch import LineEntity, line_length, set_line_length, snapshot_entity
 from cadcore.units import Unit, from_mm, to_mm
@@ -37,6 +42,8 @@ class PropertyPanel(QWidget):
         self._feature_id: int = -1
         self._sketch_line: Optional[tuple] = None  # (sketch_fid, entity_id)
         self._building = False
+        # Fresh editors for the *current* form only (never survive removeRow)
+        self._editors: Dict[str, Union[QDoubleSpinBox, QSpinBox]] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -59,7 +66,7 @@ class PropertyPanel(QWidget):
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
 
-        # Header (always)
+        # Header only — long-lived, never placed in the dynamic layout
         self.prop_name = QLineEdit()
         self.prop_name.setPlaceholderText("Name")
         self.prop_type = QLabel("—")
@@ -67,7 +74,6 @@ class PropertyPanel(QWidget):
         self._form.addRow(self._lbl("Name"), self.prop_name)
         self._form.addRow(self._lbl("Type"), self.prop_type)
 
-        # Dynamic rows container
         self._dyn_host = QWidget()
         self._dyn_layout = QFormLayout(self._dyn_host)
         self._dyn_layout.setContentsMargins(0, 0, 0, 0)
@@ -91,25 +97,6 @@ class PropertyPanel(QWidget):
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply)
         root.addLayout(btn_row)
-
-        # Editors (created once, shown/hidden)
-        self._spin_depth = self._dspin(0.001, 1e6, 4)
-        self._spin_radius = self._dspin(0.001, 1e6, 4)
-        self._spin_angle = self._dspin(0.001, 360.0, 2)
-        self._spin_segs = QSpinBox()
-        self._spin_segs.setRange(3, 512)
-        self._spin_hole_u = self._dspin(-1e6, 1e6, 4)
-        self._spin_hole_v = self._dspin(-1e6, 1e6, 4)
-        self._spin_line_len = self._dspin(0.001, 1e9, 4)
-        self._editors = {
-            "depth": self._spin_depth,
-            "radius": self._spin_radius,
-            "angle": self._spin_angle,
-            "segments": self._spin_segs,
-            "hole_u": self._spin_hole_u,
-            "hole_v": self._spin_hole_v,
-            "line_len": self._spin_line_len,
-        }
 
     @staticmethod
     def _lbl(text: str) -> QLabel:
@@ -141,8 +128,33 @@ class PropertyPanel(QWidget):
         self._building = False
 
     def _clear_dyn(self) -> None:
+        """Destroy dynamic rows (labels + fields). Editors are not reused."""
         while self._dyn_layout.rowCount():
             self._dyn_layout.removeRow(0)
+        self._editors = {}
+
+    def _add_dspin(
+        self, key: str, label: str, value: float, lo: float, hi: float, dec: int
+    ) -> QDoubleSpinBox:
+        spin = self._dspin(lo, hi, dec)
+        spin.setValue(float(value))
+        self._dyn_layout.addRow(self._lbl(label), spin)
+        self._editors[key] = spin
+        return spin
+
+    def _add_ispin(self, key: str, label: str, value: int, lo: int, hi: int) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(lo, hi)
+        spin.setValue(int(value))
+        self._dyn_layout.addRow(self._lbl(label), spin)
+        self._editors[key] = spin
+        return spin
+
+    def _editor(self, key: str) -> Union[QDoubleSpinBox, QSpinBox]:
+        w = self._editors.get(key)
+        if w is None:
+            raise RuntimeError(f"editor {key!r} not present for current form")
+        return w
 
     def show_feature(self, f: Feature, *, unit: Unit = Unit.MM) -> None:
         self._building = True
@@ -154,45 +166,58 @@ class PropertyPanel(QWidget):
         self.btn_apply.setEnabled(not is_reference_plane(f.type))
 
         if f.type is FeatureType.EXTRUDE:
-            self._spin_depth.setValue(from_mm(f.depth, unit))
-            self._dyn_layout.addRow(
-                self._lbl(f"Depth ({unit.label})"), self._spin_depth
+            self._add_dspin(
+                "depth", f"Depth ({unit.label})", from_mm(f.depth, unit), 0.001, 1e6, 4
             )
             self._hint.setText("Extrude (Boss/Base) — pad distance along plane normal.")
         elif f.type is FeatureType.FILLET:
-            self._spin_radius.setValue(from_mm(f.radius, unit))
-            self._spin_depth.setValue(from_mm(f.depth, unit))
-            self._spin_segs.setValue(int(f.segments))
-            self._dyn_layout.addRow(
-                self._lbl(f"Radius ({unit.label})"), self._spin_radius
+            self._add_dspin(
+                "radius",
+                f"Radius ({unit.label})",
+                from_mm(f.radius, unit),
+                0.001,
+                1e6,
+                4,
             )
-            self._dyn_layout.addRow(
-                self._lbl(f"Depth ({unit.label})"), self._spin_depth
+            self._add_dspin(
+                "depth", f"Depth ({unit.label})", from_mm(f.depth, unit), 0.001, 1e6, 4
             )
-            self._dyn_layout.addRow(self._lbl("Arc segments"), self._spin_segs)
+            self._add_ispin("segments", "Arc segments", int(f.segments), 3, 512)
             self._hint.setText(
                 "Fillet — corner radius (sharp corners removed from sketch) + extrude depth."
             )
         elif f.type is FeatureType.REVOLVE:
-            self._spin_angle.setValue(float(f.revolve_angle))
-            self._dyn_layout.addRow(self._lbl("Angle (°)"), self._spin_angle)
+            self._add_dspin(
+                "angle", "Angle (°)", float(f.revolve_angle), 0.001, 360.0, 2
+            )
             self._hint.setText("Revolve — angle about the sketch V-axis.")
         elif f.type is FeatureType.POCKET:
-            self._spin_radius.setValue(from_mm(f.radius, unit))
-            self._spin_depth.setValue(from_mm(f.depth, unit))
-            self._spin_hole_u.setValue(from_mm(f.hole_center_u, unit))
-            self._spin_hole_v.setValue(from_mm(f.hole_center_v, unit))
-            self._dyn_layout.addRow(
-                self._lbl(f"Hole r ({unit.label})"), self._spin_radius
+            self._add_dspin(
+                "radius",
+                f"Hole r ({unit.label})",
+                from_mm(f.radius, unit),
+                0.001,
+                1e6,
+                4,
             )
-            self._dyn_layout.addRow(
-                self._lbl(f"Depth ({unit.label})"), self._spin_depth
+            self._add_dspin(
+                "depth", f"Depth ({unit.label})", from_mm(f.depth, unit), 0.001, 1e6, 4
             )
-            self._dyn_layout.addRow(
-                self._lbl(f"Center U ({unit.label})"), self._spin_hole_u
+            self._add_dspin(
+                "hole_u",
+                f"Center U ({unit.label})",
+                from_mm(f.hole_center_u, unit),
+                -1e6,
+                1e6,
+                4,
             )
-            self._dyn_layout.addRow(
-                self._lbl(f"Center V ({unit.label})"), self._spin_hole_v
+            self._add_dspin(
+                "hole_v",
+                f"Center V ({unit.label})",
+                from_mm(f.hole_center_v, unit),
+                -1e6,
+                1e6,
+                4,
             )
             self._hint.setText("Pocket — through-hole radius, center, and extrude depth.")
         elif f.type is FeatureType.SKETCH:
@@ -219,9 +244,13 @@ class PropertyPanel(QWidget):
         self.prop_name.setText(f"Line {ent.id}")
         self.prop_type.setText("Sketch Line")
         self._clear_dyn()
-        self._spin_line_len.setValue(from_mm(line_length(ent), unit))
-        self._dyn_layout.addRow(
-            self._lbl(f"Length ({unit.label})"), self._spin_line_len
+        self._add_dspin(
+            "line_len",
+            f"Length ({unit.label})",
+            from_mm(line_length(ent), unit),
+            0.001,
+            1e9,
+            4,
         )
         self._hint.setText("Sketch line — set length (moves free endpoint p1).")
         self.btn_apply.setEnabled(True)
@@ -240,12 +269,14 @@ class PropertyPanel(QWidget):
             ent = skf.sketch.find_entity(eid)
             if not isinstance(ent, LineEntity):
                 return
+            spin = self._editor("line_len")
+            assert isinstance(spin, QDoubleSpinBox)
             before = snapshot_entity(ent)
-            set_line_length(ent, to_mm(self._spin_line_len.value(), unit), free_end="p1")
+            set_line_length(ent, to_mm(spin.value(), unit), free_end="p1")
             after = snapshot_entity(ent)
             self._doc.record_entity_move(sid, before, after)
             self.status_message.emit(
-                f"Line length → {self._spin_line_len.value():g} {unit.label}"
+                f"Line length → {spin.value():g} {unit.label}"
             )
             self.params_applied.emit(sid)
             return
@@ -254,23 +285,27 @@ class PropertyPanel(QWidget):
         if f is None:
             return
         name = self.prop_name.text().strip()
-        params = {}
+        params: dict = {}
         if name and name != f.name:
             params["name"] = name
         try:
             if f.type is FeatureType.EXTRUDE:
-                params["depth"] = to_mm(self._spin_depth.value(), unit)
+                params["depth"] = to_mm(float(self._editor("depth").value()), unit)
             elif f.type is FeatureType.FILLET:
-                params["radius"] = to_mm(self._spin_radius.value(), unit)
-                params["depth"] = to_mm(self._spin_depth.value(), unit)
-                params["segments"] = int(self._spin_segs.value())
+                params["radius"] = to_mm(float(self._editor("radius").value()), unit)
+                params["depth"] = to_mm(float(self._editor("depth").value()), unit)
+                params["segments"] = int(self._editor("segments").value())
             elif f.type is FeatureType.REVOLVE:
-                params["revolve_angle"] = float(self._spin_angle.value())
+                params["revolve_angle"] = float(self._editor("angle").value())
             elif f.type is FeatureType.POCKET:
-                params["radius"] = to_mm(self._spin_radius.value(), unit)
-                params["depth"] = to_mm(self._spin_depth.value(), unit)
-                params["hole_center_u"] = to_mm(self._spin_hole_u.value(), unit)
-                params["hole_center_v"] = to_mm(self._spin_hole_v.value(), unit)
+                params["radius"] = to_mm(float(self._editor("radius").value()), unit)
+                params["depth"] = to_mm(float(self._editor("depth").value()), unit)
+                params["hole_center_u"] = to_mm(
+                    float(self._editor("hole_u").value()), unit
+                )
+                params["hole_center_v"] = to_mm(
+                    float(self._editor("hole_v").value()), unit
+                )
             elif f.type is FeatureType.SKETCH:
                 if name:
                     f.name = name
