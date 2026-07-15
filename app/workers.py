@@ -144,20 +144,30 @@ def evaluate_solids_snapshot(
                 cache[fid] = None
                 return None
             sketch = skf.sketch
-            if f.profile_entity_id >= 0:
-                ent = sketch.find_entity(f.profile_entity_id)
+            # Parametric sharp source (sketch already shows filleted polyline)
+            if getattr(f, "source_profile_uv", None) and len(f.source_profile_uv) >= 3:
+                mesh = extrude_filleted_profile(
+                    f.source_profile_uv,
+                    f.depth,
+                    sketch.frame,
+                    f.radius,
+                    segments=max(3, int(f.segments)),
+                )
             else:
-                ent = first_closed_profile(sketch)
-            if ent is None:
-                cache[fid] = None
-                return None
-            mesh = extrude_filleted_profile(
-                ent,
-                f.depth,
-                sketch.frame,
-                f.radius,
-                segments=max(3, int(f.segments)),
-            )
+                if f.profile_entity_id >= 0:
+                    ent = sketch.find_entity(f.profile_entity_id)
+                else:
+                    ent = first_closed_profile(sketch)
+                if ent is None:
+                    cache[fid] = None
+                    return None
+                mesh = extrude_filleted_profile(
+                    ent,
+                    f.depth,
+                    sketch.frame,
+                    f.radius,
+                    segments=max(3, int(f.segments)),
+                )
         elif f.type is FeatureType.POCKET:
             skf = by_id.get(f.operand_a)
             if skf is None or skf.sketch is None:

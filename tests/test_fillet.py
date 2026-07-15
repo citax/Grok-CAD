@@ -101,6 +101,36 @@ def test_document_create_fillet_volume():
     assert feat.id in doc.evaluate_display_solids()
 
 
+def test_fillet_deletes_sketch_corners():
+    """After fillet, sharp rectangle corners must not remain in the sketch."""
+    import numpy as np
+
+    from cadcore.sketch import RectEntity
+
+    doc = Document()
+    doc.seed_reference_planes()
+    plane = next(f for f in doc.features if f.type is FeatureType.PLANE_FRONT)
+    skf = doc.create_sketch_on_plane(plane.id)
+    assert skf and skf.sketch
+    L, r, h = 4.0, 0.5, 1.0
+    skf.sketch.add_rectangle((0, 0), (L, L))
+    assert any(isinstance(e, RectEntity) for e in skf.sketch.entities)
+    feat = doc.create_fillet(skf.id, h, r, segments=32)
+    # Rect gone — replaced by filleted polyline segments
+    assert not any(isinstance(e, RectEntity) for e in skf.sketch.entities)
+    assert len(skf.sketch.entities) > 4
+    # No sketch endpoint at the four sharp corners
+    pts = []
+    for e in skf.sketch.entities:
+        if hasattr(e, "p0"):
+            pts.extend([e.p0, e.p1])
+    arr = np.array(pts, float)
+    for c in [(0.0, 0.0), (L, 0.0), (L, L), (0.0, L)]:
+        d = np.hypot(arr[:, 0] - c[0], arr[:, 1] - c[1])
+        assert (d < 0.05).sum() == 0, f"sharp corner {c} still present in sketch"
+    assert feat.source_profile_uv and len(feat.source_profile_uv) == 4
+
+
 def test_document_fillet_rejects_bad_radius():
     doc = Document()
     doc.seed_reference_planes()

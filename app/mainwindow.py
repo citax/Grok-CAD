@@ -10,18 +10,17 @@ from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
-    QFormLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QSizePolicy,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
     QWidget,
 )
 
+from app.property_panel import PropertyPanel
 from app.sketch_mode import SketchTool
 from app.theme import (
     ACCENT,
@@ -147,48 +146,29 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
 
     def _build_props_dock(self) -> None:
-        dock = QDockWidget("Properties", self)
+        dock = QDockWidget("PropertyManager", self)
         dock.setObjectName("PropertiesDock")
         dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
         )
-        w = QWidget()
-        w.setObjectName("PropertiesPanel")
-        form = QFormLayout(w)
-        form.setContentsMargins(12, 12, 12, 12)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(10)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        self.prop_name = QLabel("—")
-        self.prop_name.setObjectName("fieldValue")
-        self.prop_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.prop_type = QLabel("—")
-        self.prop_type.setObjectName("fieldValue")
-        self.prop_type.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.prop_detail = QLabel("—")
-        self.prop_detail.setObjectName("fieldValue")
-        self.prop_detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        lbl_name = QLabel("Name")
-        lbl_name.setObjectName("fieldLabel")
-        lbl_type = QLabel("Type")
-        lbl_type.setObjectName("fieldLabel")
-        lbl_detail = QLabel("Detail")
-        lbl_detail.setObjectName("fieldLabel")
-        form.addRow(lbl_name, self.prop_name)
-        form.addRow(lbl_type, self.prop_type)
-        form.addRow(lbl_detail, self.prop_detail)
-
-        hint = QLabel("Select a plane → Sketch → Extrude closed profile.")
-        hint.setObjectName("secondaryLabel")
-        hint.setWordWrap(True)
-        form.addRow(hint)
-
-        dock.setWidget(w)
+        self.props = PropertyPanel(self)
+        self.props.set_document(self.doc)
+        self.props.params_applied.connect(self._on_props_applied)
+        self.props.status_message.connect(self._on_status)
+        dock.setWidget(self.props)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _on_props_applied(self, fid: int) -> None:
+        """Rebuild after PropertyManager Apply (feature params or sketch length)."""
+        if self.viewport.in_sketch_mode:
+            self.viewport.sync_sketch_visuals()
+        else:
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+        self._refresh_tree()
+        if fid >= 0 and self.doc.find(fid) is not None:
+            self._sync_selection(fid)
 
     def _build_menus(self) -> None:
         file_m = self.menuBar().addMenu("&File")
@@ -493,33 +473,11 @@ class MainWindow(QMainWindow):
         self.viewport.set_selected_id(fid)
         f = self.doc.find(fid)
         if f is None:
-            self.prop_name.setText("—")
-            self.prop_type.setText("—")
-            self.prop_detail.setText("—")
+            self.props.clear()
             self.statusBar().showMessage(f"Selected: (none) · {self._status_env}")
             return
-        self.prop_name.setText(f.name)
-        self.prop_type.setText(feature_type_name(f.type))
-        if f.type is FeatureType.EXTRUDE:
-            self.prop_detail.setText(f"Distance = {f.depth:g}")
-        elif f.type is FeatureType.REVOLVE:
-            self.prop_detail.setText(f"Angle = {f.revolve_angle:g}°")
-        elif f.type is FeatureType.FILLET:
-            self.prop_detail.setText(
-                f"r={f.radius:g}, segs={f.segments}, dist={f.depth:g}"
-            )
-        elif f.type is FeatureType.POCKET:
-            self.prop_detail.setText(
-                f"hole r={f.radius:g}, center=({f.hole_center_u:g},{f.hole_center_v:g}), "
-                f"dist={f.depth:g}"
-            )
-        elif f.type is FeatureType.SKETCH and f.sketch is not None:
-            n = len(f.sketch.entities)
-            self.prop_detail.setText(f"{n} entit{'y' if n == 1 else 'ies'}")
-        elif is_reference_plane(f.type):
-            self.prop_detail.setText("Reference")
-        else:
-            self.prop_detail.setText("—")
+        self.props.set_document(self.doc)
+        self.props.show_feature(f, unit=self.doc.display_unit)
         self.statusBar().showMessage(f"Selected: {f.name} · {self._status_env}")
         self.tree.blockSignals(True)
         self.tree.clearSelection()
@@ -907,8 +865,9 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         self._sync_selection(feat.id)
         self.statusBar().showMessage(
-            f"Created {feat.name} (r={radius:g}, segs={segs}, dist={dist:g})",
-            3000,
+            f"Created {feat.name} (r={radius:g}, segs={segs}, dist={dist:g}) "
+            f"— sketch corners rounded",
+            4000,
         )
 
     def _pocket(self) -> None:

@@ -308,6 +308,9 @@ class Feature:
     # Pocket: radius = hole radius; hole_center_u/v = hole center in sketch UV
     hole_center_u: float = 0.0
     hole_center_v: float = 0.0
+    # Fillet: sharp source polygon in sketch UV (parametric radius edits)
+    # List of (u, v); not closed (first != last). Empty = resolve from sketch.
+    source_profile_uv: List[Tuple[float, float]] = field(default_factory=list)
     visible: bool = True
     suppressed: bool = False
 
@@ -442,6 +445,52 @@ class FeatureAddCommand(HistoryCommand):
         return f"Add feature {self.feature.name}"
 
 
+class FeatureParamCommand(HistoryCommand):
+    """Undoable edit of solid feature parameters (depth, radius, angle, …)."""
+
+    def __init__(self, feature_id: int, before: dict, after: dict) -> None:
+        self.feature_id = int(feature_id)
+        self.before = dict(before)
+        self.after = dict(after)
+
+    def _apply(self, doc: "Document", data: dict) -> None:
+        f = doc.find(self.feature_id)
+        if f is None:
+            return
+        for k, v in data.items():
+            if hasattr(f, k):
+                setattr(f, k, v if k != "source_profile_uv" else list(v))
+        # Keep sketch fillet polyline in sync with radius when undoing/redoing
+        if (
+            f.type is FeatureType.FILLET
+            and f.source_profile_uv
+            and len(f.source_profile_uv) >= 3
+        ):
+            from cadcore.fillet2d import fillet_closed_polygon
+
+            skf = doc.find(f.operand_a)
+            if skf is not None and skf.sketch is not None:
+                try:
+                    poly = fillet_closed_polygon(
+                        f.source_profile_uv,
+                        float(f.radius),
+                        arc_segments=max(6, int(f.segments) // 4),
+                    )
+                    _clear_sketch_entities(skf.sketch)
+                    _add_polyline_lines(skf.sketch, poly)
+                except ValueError:
+                    pass
+
+    def undo(self, doc: "Document") -> None:
+        self._apply(doc, self.before)
+
+    def redo(self, doc: "Document") -> None:
+        self._apply(doc, self.after)
+
+    def description(self) -> str:
+        return "Edit feature parameters"
+
+
 class FeatureDeleteCommand(HistoryCommand):
     def __init__(self, feature: "Feature", index: int) -> None:
         self.feature = feature
@@ -491,6 +540,47 @@ def _entity_anchor_uv(data: dict) -> Tuple[float, float]:
         p = data["center"]
         return (float(p[0]), float(p[1]))
     return (0.0, 0.0)
+
+
+def _clear_sketch_entities(sketch: Sketch) -> None:
+    sketch.entities.clear()
+
+
+def _add_polyline_lines(sketch: Sketch, poly: List[Tuple[float, float]]) -> None:
+    """Add consecutive line segments around a closed UV ring (no repeated last)."""
+    n = len(poly)
+    if n < 2:
+        return
+    for i in range(n):
+        a = poly[i]
+        b = poly[(i + 1) % n]
+        sketch.add_line(
+            (float(a[0]), float(a[1])),
+            (float(b[0]), float(b[1])),
+        )
+
+
+def _replace_sketch_profile_with_polyline(
+    sketch: Sketch, profile: object, poly: List[Tuple[float, float]]
+) -> None:
+    """Remove sharp profile geometry and insert filleted polyline as lines.
+
+    Sharp corner vertices disappear from the sketch (SolidWorks sketch-fillet look).
+    """
+    from cadcore.profiles import ClosedLineLoop
+    from cadcore.sketch import RectEntity
+
+    if isinstance(profile, RectEntity):
+        sketch.remove_entity(profile.id)
+    elif isinstance(profile, ClosedLineLoop):
+        for lid in getattr(profile, "line_ids", ()) or ():
+            sketch.remove_entity(int(lid))
+    else:
+        # Fallback: clear everything if we can't identify members
+        eid = getattr(profile, "id", None)
+        if eid is not None and int(eid) >= 0:
+            sketch.remove_entity(int(eid))
+    _add_polyline_lines(sketch, poly)
 
 
 @dataclass
@@ -842,9 +932,12 @@ class Document:
     ) -> Feature:
         """Fillet a closed sketch profile by ``radius``, then extrude by ``distance``.
 
-        Raises ValueError for open profiles, non-positive radius, radius too large
-        for the profile (self-intersection), or bad distance.
+        SolidWorks-style: sharp corner vertices are **removed from the sketch**
+        (replaced by arc polylines). The solid uses the filleted outline.
         """
+        from cadcore.fillet2d import fillet_closed_polygon, profile_to_polygon_uv
+        from cadcore.profiles import ClosedLineLoop
+
         skf = self.find(sketch_id)
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
             raise ValueError("fillet requires a valid sketch feature")
@@ -854,20 +947,33 @@ class Document:
         profile_entity_id = _profile_id(ent)
         if not is_closed_profile(ent):
             raise ValueError("open profile: not a closed rectangle/circle/line-loop")
+        # Circles are already smooth — corner fillet is a no-op on the sketch
+        if getattr(ent, "kind", None) is not None:
+            from cadcore.sketch import EntityKind
+
+            if getattr(ent, "kind", None) is EntityKind.CIRCLE:
+                raise ValueError("circle profile has no corners to fillet")
         dist = float(distance)
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
         rad = float(radius)
         if not np.isfinite(rad) or rad <= 1e-12:
             raise ValueError("fillet radius must be positive (radius <= 0 is invalid)")
-        # Validate by building once (catches r too large / open)
+
+        sharp = profile_to_polygon_uv(ent)
+        # Validate solid build from sharp profile (dual-offset)
         _ = extrude_filleted_profile(
-            ent,
+            sharp,
             dist,
             sketch.frame,
             rad,
             segments=int(segments),
         )
+        # Sketch: delete sharp corners — replace profile with filleted polyline
+        filleted_uv = fillet_closed_polygon(
+            sharp, rad, arc_segments=max(6, int(segments) // 4)
+        )
+        _replace_sketch_profile_with_polyline(sketch, ent, filleted_uv)
         self._fillet_count += 1
         f = Feature(
             type=FeatureType.FILLET,
@@ -876,11 +982,67 @@ class Document:
             radius=rad,
             segments=int(segments),
             operand_a=sketch_id,
-            profile_entity_id=int(profile_entity_id),
+            profile_entity_id=-1,  # profile is now the filleted line-loop
+            source_profile_uv=[(float(p[0]), float(p[1])) for p in sharp],
         )
         self.add_feature(f)
         self.record_feature_add(f)
         return f
+
+    def update_feature_params(self, fid: int, **params) -> bool:
+        """Apply editable parameters on a solid feature (undoable) and re-sync sketch.
+
+        Supported keys: depth, radius, segments, revolve_angle, hole_center_u,
+        hole_center_v. Returns False if feature missing / no change.
+        """
+        f = self.find(fid)
+        if f is None or is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
+            return False
+        keys = (
+            "depth",
+            "radius",
+            "segments",
+            "revolve_angle",
+            "hole_center_u",
+            "hole_center_v",
+            "name",
+        )
+        before = {k: getattr(f, k) for k in keys if hasattr(f, k)}
+        before["source_profile_uv"] = list(f.source_profile_uv)
+        changed = False
+        for k, v in params.items():
+            if k not in keys or not hasattr(f, k):
+                continue
+            if getattr(f, k) != v:
+                setattr(f, k, v)
+                changed = True
+        if not changed:
+            return False
+        # Fillet radius change: rebuild sketch polyline from stored sharp profile
+        if f.type is FeatureType.FILLET and "radius" in params and f.source_profile_uv:
+            from cadcore.fillet2d import fillet_closed_polygon
+
+            skf = self.find(f.operand_a)
+            if skf is not None and skf.sketch is not None:
+                try:
+                    poly = fillet_closed_polygon(
+                        f.source_profile_uv,
+                        float(f.radius),
+                        arc_segments=max(6, int(f.segments) // 4),
+                    )
+                    _clear_sketch_entities(skf.sketch)
+                    _add_polyline_lines(skf.sketch, poly)
+                except ValueError:
+                    # Revert
+                    for k, v in before.items():
+                        if k != "source_profile_uv":
+                            setattr(f, k, v)
+                    f.source_profile_uv = list(before["source_profile_uv"])
+                    raise
+        after = {k: getattr(f, k) for k in keys if hasattr(f, k)}
+        after["source_profile_uv"] = list(f.source_profile_uv)
+        self.push_command(FeatureParamCommand(fid, before, after))
+        return True
 
     def create_pocket(
         self,
@@ -966,19 +1128,29 @@ class Document:
             if skf is None or skf.sketch is None:
                 return None
             sketch = skf.sketch
-            try:
-                resolved = resolve_profiles(
-                    sketch, preferred_outer_id=f.profile_entity_id
+            # Prefer parametric sharp source (sketch already shows filleted edges)
+            if f.source_profile_uv and len(f.source_profile_uv) >= 3:
+                mesh = extrude_filleted_profile(
+                    f.source_profile_uv,
+                    f.depth,
+                    sketch.frame,
+                    f.radius,
+                    segments=max(3, int(f.segments)),
                 )
-            except ValueError:
-                return None
-            mesh = extrude_filleted_profile(
-                resolved.outer,
-                f.depth,
-                sketch.frame,
-                f.radius,
-                segments=max(3, int(f.segments)),
-            )
+            else:
+                try:
+                    resolved = resolve_profiles(
+                        sketch, preferred_outer_id=f.profile_entity_id
+                    )
+                except ValueError:
+                    return None
+                mesh = extrude_filleted_profile(
+                    resolved.outer,
+                    f.depth,
+                    sketch.frame,
+                    f.radius,
+                    segments=max(3, int(f.segments)),
+                )
         elif f.type is FeatureType.POCKET:
             skf = self.find(f.operand_a)
             if skf is None or skf.sketch is None:
