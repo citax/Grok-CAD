@@ -21,6 +21,7 @@ def test_vtk_preview_path_exists():
     assert hasattr(Viewport, "_begin_draw_lod")
     assert hasattr(Viewport, "_end_draw_lod")
     assert hasattr(Viewport, "_set_draw_solids_visible")
+    assert hasattr(Viewport, "_set_draw_planes_visible")
 
 
 def test_entity_line_is_polyline_not_volume():

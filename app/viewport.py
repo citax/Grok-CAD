@@ -644,7 +644,7 @@ class Viewport(QWidget):
                 pass
 
     def _set_draw_solids_visible(self, visible: bool) -> None:
-        """Hide heavy solid meshes during stroke so per-move VTK renders stay light."""
+        """Hide solid meshes during stroke (cheap no-op when none present)."""
         if not self.plotter:
             return
         for n in list(self.plotter.actors.keys()):
@@ -658,20 +658,44 @@ class Viewport(QWidget):
             except Exception:
                 pass
 
-    def _begin_draw_lod(self) -> None:
-        """LOD while actively drawing/dragging in sketch mode.
+    def _set_draw_planes_visible(self, visible: bool) -> None:
+        """Show/hide reference-plane fills AND border edges during a stroke.
 
-        Hide labels/junctions/grid + solid meshes so each per-move VTK render is
-        light. Committed sketch entity actors stay visible. Live preview is a
-        real VTK actor (__sk_preview) on the layer-1 overlay — not a Qt widget.
-        Do NOT call render_window.SetSize (collapses Qt-embedded viewport).
+        Profiled @2560×1440 (llvmpipe, non-additive overdraw):
+          - hide plane_* fills alone: ~35 → ~19 ms (ratio ~0.53)
+          - with fills already gone, hide edge_* borders: ~30 → ~18 ms (~12 ms)
+          - old chrome/grid/label hide: ~1.00× (worthless — not used here)
+        Sketch grid + entity strokes + preview stay visible.
+        """
+        if not self.plotter:
+            return
+        for n in list(self.plotter.actors.keys()):
+            if not (n.startswith("plane_") or n.startswith("edge_")):
+                continue
+            act = self.plotter.actors.get(n)
+            if act is None:
+                continue
+            try:
+                act.SetVisibility(1 if visible else 0)
+            except Exception:
+                pass
+
+    def _begin_draw_lod(self) -> None:
+        """Stroke LOD: hide plane fills + plane edges (+ solids if any).
+
+        Measured @2560×1440: labels/grid/junction hide was ~1.00× and is NOT
+        applied. Hiding translucent plane quads + their border edges is the
+        real app-side win above the ~17–18 ms empty-viewport llvmpipe floor.
+
+        UX: during a stroke the colored plane fill and its border ring vanish;
+        sketch grid, H/V axes, and committed entities remain. Do NOT SetSize.
         """
         if self._draw_lod_active:
             return
         self._draw_lod_active = True
         self._stroke_move_ms = []
-        # Suppress labels/junctions/grid; keep committed sketch strokes visible
-        self._set_interaction_lod_visible(False)
+        # Retargeted: plane fills + borders + solids — NOT chrome (was 1.00x)
+        self._set_draw_planes_visible(False)
         self._set_draw_solids_visible(False)
         self._draw_saved_size = None
         try:
@@ -687,7 +711,7 @@ class Viewport(QWidget):
         if not self._draw_lod_active:
             return
         self._draw_lod_active = False
-        self._set_interaction_lod_visible(True)
+        self._set_draw_planes_visible(True)
         self._set_draw_solids_visible(True)
         self._draw_saved_size = None
         self._clear_preview()
