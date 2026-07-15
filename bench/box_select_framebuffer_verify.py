@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Framebuffer proof for SolidWorks-style box multi-select (real MainWindow).
+"""Framebuffer + per-move timing for SolidWorks-style box multi-select.
 
 Uses plotter.screenshot() — NOT widget.grab() / isVisible() / source-string checks.
+Drives >= 25 interpolated moves per drag direction and prints honest timings.
 """
 from __future__ import annotations
 
 import os
+import statistics
 import sys
 import time
 
@@ -45,6 +47,40 @@ def _shot(win) -> np.ndarray:
     return np.asarray(win.viewport.plotter.screenshot(return_img=True))
 
 
+def _drag_moves(
+    win,
+    press_xy,
+    release_xy,
+    *,
+    n_moves: int = 25,
+    shift: bool = False,
+) -> list[float]:
+    """Press, then n_moves interpolated moves to release_xy; return ms per move."""
+    x0, y0 = float(press_xy[0]), float(press_xy[1])
+    x1, y1 = float(release_xy[0]), float(release_xy[1])
+    win.viewport._sketch_mouse_press(x0, y0, shift=shift)
+    times: list[float] = []
+    for i in range(1, n_moves + 1):
+        t = i / float(n_moves)
+        x = x0 + (x1 - x0) * t
+        y = y0 + (y1 - y0) * t
+        t0 = time.perf_counter()
+        win.viewport._sketch_mouse_move(x, y, shift=shift)
+        times.append((time.perf_counter() - t0) * 1000.0)
+    return times
+
+
+def _perf_summary(times: list[float]) -> dict:
+    return {
+        "n": len(times),
+        "median": statistics.median(times) if times else 0.0,
+        "max": max(times) if times else 0.0,
+        "first": times[0] if times else 0.0,
+        "last": times[-1] if times else 0.0,
+        "mean": statistics.mean(times) if times else 0.0,
+    }
+
+
 def main() -> int:
     from PySide6.QtWidgets import QApplication
 
@@ -61,7 +97,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     apply_theme(app)
     win = MainWindow()
-    win.resize(1000, 800)
+    win.resize(1400, 800)
     win.show()
     _pump(app, 25)
     if not win.viewport._ok:
@@ -71,11 +107,13 @@ def main() -> int:
     front = next(f for f in win.doc.features if f.type is FeatureType.PLANE_FRONT)
     skf = win.doc.create_sketch_on_plane(front.id)
     sk = skf.sketch
-    # Known scene in UV:
-    # inside line fully in [0,0]–[2,2]; partial crosser; circle outside
+    # Dense-ish scene (60 entities) + known window/crossing test entities
     line_in = sk.add_line((0.4, 0.4), (1.6, 0.4))
     line_partial = sk.add_line((1.5, 1.2), (3.0, 1.2))
     circ_out = sk.add_circle((4.0, 3.0), 0.35)
+    for i in range(57):
+        r, c = divmod(i, 10)
+        sk.add_line((c * 0.35 - 2.0, r * 0.35 - 2.0), (c * 0.35 - 1.85, r * 0.35 - 2.0))
 
     win.viewport.enter_sketch(skf.id)
     _pump(app, 15)
@@ -92,16 +130,14 @@ def main() -> int:
     base_cross = _count_near(base, cross_rgb)
     base_sel = _count_near(base, sel_rgb)
     print(
-        f"BASELINE win={base_win} cross={base_cross} selected={base_sel}",
+        f"BASELINE win={base_win} cross={base_cross} selected={base_sel} "
+        f"entities={len(sk.entities)}",
         flush=True,
     )
 
     ok_all = True
     iw = win.viewport.plotter.interactor
 
-    # Map UV corners of box [0,0]–[2,2] to display via mouse-to-uv inverse:
-    # pick display points by searching for UV near targets (coarse: use center+offset)
-    # Use orthographic parallel: walk a grid once.
     def find_display_for_uv(target_uv, tol=0.15):
         best = None
         best_d = 1e9
@@ -116,26 +152,26 @@ def main() -> int:
                     best_d = d
                     best = (xx, yy, uv)
         if best is None or best_d > tol * 4:
-            # fallback: use sketch frame + camera approximate
             return None
         return best[0], best[1]
 
     p0 = find_display_for_uv((0.0, 0.0))
     p1 = find_display_for_uv((2.0, 2.0))
     if p0 is None or p1 is None:
-        # Manual fallback: corners of interactor that still hit plane
-        p0 = (iw.width() // 2 - 120, iw.height() // 2 + 80)
-        p1 = (iw.width() // 2 + 100, iw.height() // 2 - 100)
+        p0 = (iw.width() // 2 - 180, iw.height() // 2 + 120)
+        p1 = (iw.width() // 2 + 160, iw.height() // 2 - 140)
         print(f"UV_MAP_FALLBACK p0={p0} p1={p1}", flush=True)
     else:
         print(f"UV_MAP p0={p0} p1={p1}", flush=True)
 
-    # ----- mid-drag L→R window (display x grows) -----
-    # Ensure press x < release x
+    # Ensure press x < release x for window (L→R)
     if p0[0] > p1[0]:
         p0, p1 = p1, p0
-    win.viewport._sketch_mouse_press(p0[0], p0[1], shift=False)
-    win.viewport._sketch_mouse_move(p1[0], p1[1], shift=False)
+
+    n_moves = 25
+
+    # ----- L→R window: realistic multi-move drag + pixel check on last frame -----
+    win_times = _drag_moves(win, p0, p1, n_moves=n_moves, shift=False)
     mid_win = _shot(win)
     n_win = _count_near(mid_win, win_rgb)
     if n_win > max(20, base_win + 10):
@@ -144,11 +180,17 @@ def main() -> int:
         print(f"SELBOX_PIXELS_FAIL window {n_win} base={base_win}", flush=True)
         ok_all = False
 
-    # Finish window release — capture selection set via UV box directly for id assert
-    # Re-do controlled UV box via controller for exact id check
+    win_s = _perf_summary(win_times)
+    print(
+        f"BOX_PERF window n={win_s['n']} median={win_s['median']:.2f}ms "
+        f"max={win_s['max']:.2f}ms first={win_s['first']:.2f}ms "
+        f"last={win_s['last']:.2f}ms mean={win_s['mean']:.2f}ms",
+        flush=True,
+    )
+
+    # Exact id sets via UV math
     ctrl.box_select = None
     win.viewport._clear_selbox()
-    # Build selection by known UV box (same as scene intent)
     win_ids = ctrl.entities_in_box(0.0, 0.0, 2.0, 2.0, window=True)
     cross_ids = ctrl.entities_in_box(0.0, 0.0, 2.0, 2.0, window=False)
     print(f"WINDOW_IDS {sorted(win_ids)}", flush=True)
@@ -163,7 +205,6 @@ def main() -> int:
         print("ID_SETS_FAIL window/crossing not distinct or wrong members", flush=True)
         ok_all = False
 
-    # Release mid-drag path to clear box actor
     win.viewport._sketch_mouse_release(p1[0], p1[1], shift=False)
     _pump(app, 4)
     if "__sk_selbox" in win.viewport._overlay_actors:
@@ -172,7 +213,6 @@ def main() -> int:
     else:
         print("SELBOX_GONE_OK", flush=True)
 
-    # Apply multi-select highlight for window set and check SKETCH_SELECTED pixels
     ctrl.set_selection(win_ids)
     win.viewport._rebuild_all_sketch_entities()
     if win.viewport._render_timer.isActive():
@@ -187,12 +227,13 @@ def main() -> int:
         print(f"SELECTED_PIXELS_FAIL {n_sel} base={base_sel}", flush=True)
         ok_all = False
 
-    # ----- mid-drag R→L crossing -----
+    # ----- R→L crossing: realistic multi-move drag -----
     ctrl.clear_selection()
     win.viewport._rebuild_all_sketch_entities()
-    # press right, move left
-    win.viewport._sketch_mouse_press(p1[0], p0[1], shift=False)
-    win.viewport._sketch_mouse_move(p0[0], p1[1], shift=False)
+    # press right, release left
+    press_r = (p1[0], p0[1])
+    release_l = (p0[0], p1[1])
+    cross_times = _drag_moves(win, press_r, release_l, n_moves=n_moves, shift=False)
     mid_cross = _shot(win)
     n_cross = _count_near(mid_cross, cross_rgb)
     if n_cross > max(20, base_cross + 10):
@@ -200,7 +241,47 @@ def main() -> int:
     else:
         print(f"SELBOX_PIXELS_FAIL crossing {n_cross} base={base_cross}", flush=True)
         ok_all = False
-    win.viewport._sketch_mouse_release(p0[0], p1[1], shift=False)
+
+    cross_s = _perf_summary(cross_times)
+    print(
+        f"BOX_PERF crossing n={cross_s['n']} median={cross_s['median']:.2f}ms "
+        f"max={cross_s['max']:.2f}ms first={cross_s['first']:.2f}ms "
+        f"last={cross_s['last']:.2f}ms mean={cross_s['mean']:.2f}ms",
+        flush=True,
+    )
+
+    # Performance gates: crossing near window floor; no growth during drag
+    ratio = (
+        cross_s["median"] / win_s["median"] if win_s["median"] > 1e-6 else 999.0
+    )
+    growth = (
+        cross_s["last"] / cross_s["first"] if cross_s["first"] > 1e-6 else 999.0
+    )
+    win_growth = (
+        win_s["last"] / win_s["first"] if win_s["first"] > 1e-6 else 999.0
+    )
+    print(
+        f"BOX_PERF ratio_crossing/window={ratio:.2f} "
+        f"crossing_last/first={growth:.2f} window_last/first={win_growth:.2f}",
+        flush=True,
+    )
+    if ratio <= 1.5 and growth <= 2.0:
+        print(
+            f"BOX_PERF_OK crossing_med={cross_s['median']:.2f}ms "
+            f"window_med={win_s['median']:.2f}ms",
+            flush=True,
+        )
+    else:
+        print(
+            f"BOX_PERF_FAIL ratio={ratio:.2f} (need<=1.5) "
+            f"growth={growth:.2f} (need<=2.0) "
+            f"cross_med={cross_s['median']:.2f} win_med={win_s['median']:.2f} "
+            f"cross_first={cross_s['first']:.2f} cross_last={cross_s['last']:.2f}",
+            flush=True,
+        )
+        ok_all = False
+
+    win.viewport._sketch_mouse_release(release_l[0], release_l[1], shift=False)
     _pump(app, 4)
 
     # ----- Shift-add -----
@@ -216,7 +297,6 @@ def main() -> int:
 
     # ----- click empty clears -----
     ctrl.set_selection({line_in.id})
-    # find empty display
     empty_xy = find_display_for_uv((5.0, 5.0))
     if empty_xy is None:
         empty_xy = (iw.width() - 40, 40)
@@ -229,21 +309,16 @@ def main() -> int:
         ok_all = False
 
     # ----- single select entity -----
-    # press near line_in midpoint in UV
     mid_xy = find_display_for_uv((1.0, 0.4))
     if mid_xy is None:
         mid_xy = (iw.width() // 2 - 40, iw.height() // 2)
     win.viewport._sketch_mouse_press(mid_xy[0], mid_xy[1], shift=False)
     win.viewport._sketch_mouse_release(mid_xy[0], mid_xy[1], shift=False)
-    if ctrl.selected_ids == {line_in.id} or line_in.id in ctrl.selected_ids:
+    if line_in.id in ctrl.selected_ids or len(ctrl.selected_ids) == 1:
         print(f"SINGLE_SELECT_OK ids={sorted(ctrl.selected_ids)}", flush=True)
     else:
-        # pick may snap to nearby; accept any non-empty single
-        if len(ctrl.selected_ids) == 1:
-            print(f"SINGLE_SELECT_OK ids={sorted(ctrl.selected_ids)}", flush=True)
-        else:
-            print(f"SINGLE_SELECT_FAIL ids={sorted(ctrl.selected_ids)}", flush=True)
-            ok_all = False
+        print(f"SINGLE_SELECT_FAIL ids={sorted(ctrl.selected_ids)}", flush=True)
+        ok_all = False
 
     # ----- multi delete + one undo -----
     ctrl.set_selection({line_in.id, line_partial.id})

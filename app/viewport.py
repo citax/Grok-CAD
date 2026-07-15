@@ -164,40 +164,79 @@ def _dashed_polyline_polydata(
     *,
     dash: float = 0.08,
     gap: float = 0.05,
+    max_dashes: int = 48,
 ) -> pv.PolyData:
-    """Build a dashed polyline from consecutive world points (explicit segments).
+    """Build a dashed polyline in ONE shot (no per-dash merge loop).
 
-    vtkProperty line stipple is unreliable on OpenGL2 — bake dashes into the mesh.
+    vtkProperty line stipple is unreliable on OpenGL2 — bake dashes into the mesh
+    as a single PolyData with an explicit ``lines`` connectivity array.
+
+    Dash count is hard-capped at ``max_dashes`` by enlarging dash+gap when the
+    perimeter would otherwise produce too many segments (keeps per-move cost flat
+    as the box grows or zoom changes).
     """
-    pts = [np.asarray(p, dtype=np.float64).reshape(3) for p in points_world]
-    if len(pts) < 2:
+    pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] < 2:
         return pv.PolyData()
-    segs: list = []
-    for i in range(len(pts) - 1):
+
+    edges: list[tuple[np.ndarray, np.ndarray, float]] = []
+    peri = 0.0
+    for i in range(pts.shape[0] - 1):
         a = pts[i]
         b = pts[i + 1]
-        ab = b - a
-        length = float(np.linalg.norm(ab))
+        length = float(np.linalg.norm(b - a))
         if length < 1e-12:
             continue
-        direction = ab / length
-        t = 0.0
-        on = True
-        while t < length - 1e-12:
-            span = dash if on else gap
-            t1 = min(length, t + span)
-            if on and t1 > t + 1e-12:
-                p0 = a + direction * t
-                p1 = a + direction * t1
-                segs.append(pv.Line(p0, p1))
-            t = t1
-            on = not on
-    if not segs:
-        return pv.lines_from_points(np.array(pts, float), close=False)
-    merged = segs[0]
-    for s in segs[1:]:
-        merged = merged.merge(s)
-    return merged
+        edges.append((a, b, length))
+        peri += length
+    if not edges:
+        return pv.PolyData()
+
+    dash = max(1e-9, float(dash))
+    gap = max(1e-9, float(gap))
+    period = dash + gap
+    # Cap: if perimeter would yield too many dash onsets, scale period up
+    max_dashes = max(4, int(max_dashes))
+    expected = peri / period
+    if expected > max_dashes:
+        scale = expected / float(max_dashes)
+        dash *= scale
+        gap *= scale
+        period = dash + gap
+
+    p0_list: list[np.ndarray] = []
+    p1_list: list[np.ndarray] = []
+    for a, b, length in edges:
+        direction = (b - a) / length
+        # Dash start parameters along this edge (vectorized)
+        t0s = np.arange(0.0, length, period, dtype=np.float64)
+        if t0s.size == 0:
+            continue
+        t1s = np.minimum(t0s + dash, length)
+        keep = t1s > t0s + 1e-12
+        t0s = t0s[keep]
+        t1s = t1s[keep]
+        if t0s.size == 0:
+            continue
+        p0_list.append(a + np.outer(t0s, direction))
+        p1_list.append(a + np.outer(t1s, direction))
+
+    if not p0_list:
+        return pv.lines_from_points(pts, close=False)
+
+    starts = np.vstack(p0_list)
+    ends = np.vstack(p1_list)
+    n = int(starts.shape[0])
+    # Interleave start/end → [s0, e0, s1, e1, ...]
+    points = np.empty((n * 2, 3), dtype=np.float64)
+    points[0::2] = starts
+    points[1::2] = ends
+    # Connectivity: [2, i0, i1, 2, i2, i3, ...]
+    lines = np.empty(n * 3, dtype=np.int64)
+    lines[0::3] = 2
+    lines[1::3] = np.arange(0, 2 * n, 2, dtype=np.int64)
+    lines[2::3] = np.arange(1, 2 * n, 2, dtype=np.int64)
+    return pv.PolyData(points, lines=lines)
 
 
 # Origin glyph size (world units / mm)
@@ -1695,7 +1734,14 @@ class Viewport(QWidget):
             col = SEL_BOX_WINDOW
             lw = 2.0
         else:
-            pdata = _dashed_polyline_polydata(corners_w, dash=0.08, gap=0.05)
+            # Screen-space dash density (~8 px dash / ~5 px gap) + hard cap in
+            # _dashed_polyline_polydata so dash count stays O(1) as the box grows.
+            wpp = self._world_units_per_pixel()
+            dash = max(0.04, float(wpp) * 8.0)
+            gap = max(0.025, float(wpp) * 5.0)
+            pdata = _dashed_polyline_polydata(
+                corners_w, dash=dash, gap=gap, max_dashes=48
+            )
             col = SEL_BOX_CROSSING
             lw = 2.2
         self._add_overlay_mesh(

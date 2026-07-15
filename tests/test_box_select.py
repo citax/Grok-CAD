@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import time
+
+import numpy as np
+
 from app.sketch_mode import SketchController, SketchTool
+from app.viewport import _dashed_polyline_polydata
 from cadcore.document import Document, FeatureType
 from cadcore.sketch import PlaneFrame, Sketch
 
@@ -156,3 +161,30 @@ def test_multi_delete_one_undo():
     assert doc.redo()
     assert sk.find_entity(a.id) is None
     assert sk.find_entity(b.id) is None
+
+
+def test_dashed_polyline_one_shot_flat_cost():
+    """Dash build must be O(1)-ish: large boxes stay under a few ms (no merge loop)."""
+    # Closed rectangle corners (world)
+    def rect(s: float):
+        return [
+            (0.0, 0.0, 0.0),
+            (s, 0.0, 0.0),
+            (s, s, 0.0),
+            (0.0, s, 0.0),
+            (0.0, 0.0, 0.0),
+        ]
+
+    small = _dashed_polyline_polydata(rect(0.5), dash=0.08, gap=0.05, max_dashes=48)
+    large = _dashed_polyline_polydata(rect(8.0), dash=0.08, gap=0.05, max_dashes=48)
+    assert small.n_cells > 0
+    assert large.n_cells > 0
+    # Cap keeps large from exploding past ~max_dashes
+    assert large.n_cells <= 48 + 4  # small tolerance for edge split
+
+    t0 = time.perf_counter()
+    for _ in range(20):
+        _dashed_polyline_polydata(rect(8.0), dash=0.08, gap=0.05, max_dashes=48)
+    ms = (time.perf_counter() - t0) * 1000.0 / 20.0
+    # Pre-fix was 500+ ms for 8x8; post-fix target is sub-millisecond class
+    assert ms < 5.0, f"dashed polydata still too slow: {ms:.2f} ms/call"
