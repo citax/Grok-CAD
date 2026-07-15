@@ -297,11 +297,17 @@ def main() -> int:
 
     # ----- click empty clears -----
     ctrl.set_selection({line_in.id})
-    empty_xy = find_display_for_uv((5.0, 5.0))
+    # Prefer a UV known outside all entities (scene uses ≤4,3 for circle)
+    empty_xy = find_display_for_uv((-2.5, -2.5))
     if empty_xy is None:
-        empty_xy = (iw.width() - 40, 40)
-    win.viewport._sketch_mouse_press(empty_xy[0], empty_xy[1], shift=False)
-    win.viewport._sketch_mouse_release(empty_xy[0], empty_xy[1], shift=False)
+        empty_xy = find_display_for_uv((6.0, -2.0))
+    if empty_xy is None:
+        # last resort: controller path (no entity under cursor)
+        ctrl.on_press((-3.0, -3.0), display_xy=(10.0, 10.0), shift=False)
+        ctrl.on_release((-3.0, -3.0), display_xy=(10.0, 10.0), shift=False)
+    else:
+        win.viewport._sketch_mouse_press(empty_xy[0], empty_xy[1], shift=False)
+        win.viewport._sketch_mouse_release(empty_xy[0], empty_xy[1], shift=False)
     if not ctrl.selected_ids:
         print("CLICK_CLEAR_OK", flush=True)
     else:

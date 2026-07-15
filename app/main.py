@@ -14,9 +14,10 @@ def main() -> int:
         file=sys.stderr,
     )
     try:
+        # Theme resolves at app.theme import (GROK_THEME / QSettings / default light)
         from PySide6.QtWidgets import QApplication, QMessageBox
+        from app.theme import CURRENT_THEME, apply_theme
         from app.mainwindow import MainWindow
-        from app.theme import apply_theme
     except Exception as exc:  # noqa: BLE001
         print(f"[main] Import failed: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -26,6 +27,7 @@ def main() -> int:
     app.setApplicationName("Grok CAD")
     app.setOrganizationName("CadCore")
     apply_theme(app)
+    print(f"[main] theme={CURRENT_THEME} (startup-only; Settings→Theme applies on restart)", file=sys.stderr)
     try:
         win = MainWindow()
         win.show()

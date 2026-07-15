@@ -10,13 +10,18 @@ from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
+    QTabWidget,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -24,12 +29,14 @@ from app.property_panel import PropertyPanel
 from app.sketch_mode import SketchTool
 from app.theme import (
     ACCENT,
+    CURRENT_THEME,
     PLANE_FRONT,
     PLANE_RIGHT,
     PLANE_TOP,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     fa_icon,
+    save_theme_preference,
 )
 from app.viewport import Viewport
 from cadcore.document import (
@@ -72,8 +79,8 @@ class MainWindow(QMainWindow):
         self._build_tree_dock()
         self._build_props_dock()
         self._build_menus()
-        self._build_toolbar()
-        self._build_sketch_toolbar()
+        self._build_command_manager()  # SolidWorks-like ribbon (replaces flat main toolbar)
+        self._build_heads_up_view_bar()  # floating view tools over viewport
         self._build_status_bar()
 
         self.viewport.feature_picked.connect(self._on_pick)
@@ -241,6 +248,27 @@ class MainWindow(QMainWindow):
             self._unit_group.addAction(act)
             unit_m.addAction(act)
             self._unit_actions[u] = act
+        settings_m.addSeparator()
+        theme_m = settings_m.addMenu("&Theme")
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        for key, label in (("light", "Light (default)"), ("dark", "Dark")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(key)
+            if key == CURRENT_THEME:
+                act.setChecked(True)
+            act.triggered.connect(
+                lambda checked=False, k=key: self._request_theme(k)
+            )
+            self._theme_group.addAction(act)
+            theme_m.addAction(act)
+        tip = QAction(
+            "Theme applies on restart (startup palette — avoids stale colour bindings)",
+            self,
+        )
+        tip.setEnabled(False)
+        theme_m.addAction(tip)
 
         view_m = self.menuBar().addMenu("&View")
         for label, key, icon_name in (
@@ -283,14 +311,145 @@ class MainWindow(QMainWindow):
         act_pok.triggered.connect(self._pocket)
         insert_m.addAction(act_pok)
 
-    def _build_toolbar(self) -> None:
-        views = QToolBar("Views")
-        views.setObjectName("ViewsToolBar")
-        views.setMovable(False)
-        views.setIconSize(QSize(20, 20))
-        views.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.addToolBar(views)
+    def _ribbon_button(self, act: QAction) -> QToolButton:
+        btn = QToolButton()
+        btn.setDefaultAction(act)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        btn.setIconSize(QSize(28, 28))
+        btn.setAutoRaise(True)
+        return btn
 
+    def _build_command_manager(self) -> None:
+        """SolidWorks-inspired CommandManager: Features / Sketch / Evaluate tabs."""
+        bar = QToolBar("CommandManager")
+        bar.setObjectName("CommandManagerBar")
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+
+        self.cmd_tabs = QTabWidget()
+        self.cmd_tabs.setObjectName("CommandManager")
+        self.cmd_tabs.setDocumentMode(True)
+
+        # --- Features tab ---
+        self.act_sketch = QAction(
+            fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self
+        )
+        self.act_sketch.setToolTip("Create or edit a sketch on the selected plane (S)")
+        self.act_sketch.setShortcut(QKeySequence("S"))
+        self.act_sketch.triggered.connect(self._enter_sketch)
+
+        self.act_extrude = QAction(fa_icon("fa5s.cube", color=ACCENT), "Extrude", self)
+        self.act_extrude.setToolTip(
+            "Extrude (pad) a closed sketch profile into a solid (E)"
+        )
+        self.act_extrude.setShortcut(QKeySequence("E"))
+        self.act_extrude.triggered.connect(self._extrude)
+
+        self.act_revolve = QAction(fa_icon("fa5s.sync-alt", color=ACCENT), "Revolve", self)
+        self.act_revolve.setToolTip(
+            "Revolve a closed sketch profile about the V-axis into a solid (R)"
+        )
+        self.act_revolve.setShortcut(QKeySequence("R"))
+        self.act_revolve.triggered.connect(self._revolve)
+
+        self.act_fillet = QAction(
+            fa_icon("fa5s.circle-notch", color=ACCENT), "Fillet", self
+        )
+        self.act_fillet.setToolTip(
+            "Fillet closed profile corners, then extrude into a solid (F)"
+        )
+        self.act_fillet.setShortcut(QKeySequence("F"))
+        self.act_fillet.triggered.connect(self._fillet)
+
+        self.act_pocket = QAction(
+            fa_icon("fa5s.dot-circle", color=ACCENT), "Pocket", self
+        )
+        self.act_pocket.setToolTip(
+            "Cut a circular through-hole pocket and extrude into a solid (P)"
+        )
+        self.act_pocket.setShortcut(QKeySequence("P"))
+        self.act_pocket.triggered.connect(self._pocket)
+
+        feat_w = QWidget()
+        feat_row = QHBoxLayout(feat_w)
+        feat_row.setContentsMargins(4, 2, 4, 2)
+        feat_row.setSpacing(4)
+        for act in (
+            self.act_sketch,
+            self.act_extrude,
+            self.act_revolve,
+            self.act_fillet,
+            self.act_pocket,
+        ):
+            feat_row.addWidget(self._ribbon_button(act))
+        feat_row.addStretch(1)
+        self.cmd_tabs.addTab(feat_w, "Features")
+
+        # --- Sketch tab ---
+        sketch_w = QWidget()
+        sk_row = QHBoxLayout(sketch_w)
+        sk_row.setContentsMargins(4, 2, 4, 2)
+        sk_row.setSpacing(4)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        tool_defs = (
+            (SketchTool.SELECT, "Select", "fa5s.mouse-pointer", "Select and edit entities"),
+            (SketchTool.LINE, "Line", "fa5s.minus", "Draw a line"),
+            (SketchTool.RECTANGLE, "Rectangle", "fa5s.vector-square", "Draw a rectangle"),
+            (SketchTool.CIRCLE, "Circle", "fa5s.circle", "Draw a circle"),
+        )
+        for tool, label, icon_name, tip in tool_defs:
+            act = QAction(fa_icon(icon_name), label, self)
+            act.setToolTip(tip)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked=False, t=tool: self._on_sketch_tool(t))
+            group.addAction(act)
+            self._sketch_tool_actions[tool] = act
+            sk_row.addWidget(self._ribbon_button(act))
+        self.act_exit_sketch = QAction(
+            fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit Sketch", self
+        )
+        self.act_exit_sketch.setToolTip("Exit sketch mode (Esc when idle)")
+        self.act_exit_sketch.triggered.connect(self._exit_sketch)
+        sk_row.addWidget(self._ribbon_button(self.act_exit_sketch))
+        sk_row.addStretch(1)
+        self._sketch_tab_index = self.cmd_tabs.addTab(sketch_w, "Sketch")
+
+        # --- Evaluate tab ---
+        eval_w = QWidget()
+        ev_row = QHBoxLayout(eval_w)
+        ev_row.setContentsMargins(4, 2, 4, 2)
+        ev_row.addWidget(self._ribbon_button(self.act_export_stl))
+        ev_row.addStretch(1)
+        self.cmd_tabs.addTab(eval_w, "Evaluate")
+
+        # Stretch ribbon across full width
+        host = QWidget()
+        hl = QVBoxLayout(host)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(self.cmd_tabs)
+        host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        bar.addWidget(host)
+        # Keep a hidden sketch_tb flag for code that toggles sketch chrome visibility
+        self.sketch_tb = bar  # type: ignore[assignment]
+        self._set_sketch_ribbon_enabled(False)
+
+    def _set_sketch_ribbon_enabled(self, on: bool) -> None:
+        for act in self._sketch_tool_actions.values():
+            act.setEnabled(on)
+        if hasattr(self, "act_exit_sketch"):
+            self.act_exit_sketch.setEnabled(on)
+        if on and hasattr(self, "cmd_tabs"):
+            self.cmd_tabs.setCurrentIndex(self._sketch_tab_index)
+
+    def _build_heads_up_view_bar(self) -> None:
+        """Floating SolidWorks-style heads-up view tools over the viewport."""
+        self._hud = QWidget(self.viewport)
+        self._hud.setObjectName("HeadsUpViewBar")
+        row = QHBoxLayout(self._hud)
+        row.setContentsMargins(6, 4, 6, 4)
+        row.setSpacing(2)
         view_defs = (
             ("Front", "front", "fa5s.square", "Front view"),
             ("Top", "top", "fa5s.border-all", "Top view"),
@@ -304,92 +463,45 @@ class MainWindow(QMainWindow):
             if key == "fit":
                 act.triggered.connect(self.viewport.zoom_to_fit)
             else:
-                act.triggered.connect(lambda checked=False, k=key: self.viewport.set_view(k))
-            views.addAction(act)
+                act.triggered.connect(
+                    lambda checked=False, k=key: self.viewport.set_view(k)
+                )
+            btn = QToolButton(self._hud)
+            btn.setDefaultAction(act)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            btn.setIconSize(QSize(18, 18))
+            btn.setAutoRaise(True)
+            row.addWidget(btn)
+        self._hud.adjustSize()
+        self._position_heads_up()
+        self._hud.raise_()
+        self._hud.show()
+        self.viewport.installEventFilter(self)
 
-        views.addSeparator()
+    def _position_heads_up(self) -> None:
+        if not hasattr(self, "_hud") or self._hud is None:
+            return
+        vp = self.viewport
+        self._hud.adjustSize()
+        x = max(8, (vp.width() - self._hud.width()) // 2)
+        self._hud.move(x, 8)
 
-        main = QToolBar("Main")
-        main.setObjectName("MainToolBar")
-        main.setMovable(False)
-        main.setIconSize(QSize(20, 20))
-        main.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.addToolBar(main)
-        self.act_sketch = QAction(
-            fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self
+    def eventFilter(self, obj, event):  # noqa: N802
+        from PySide6.QtCore import QEvent
+
+        if obj is self.viewport and event.type() == QEvent.Type.Resize:
+            self._position_heads_up()
+        return super().eventFilter(obj, event)
+
+    def _request_theme(self, name: str) -> None:
+        save_theme_preference(name)
+        QMessageBox.information(
+            self,
+            "Theme",
+            f"Theme “{name}” will apply the next time you start Grok CAD.\n\n"
+            "Startup-only theming avoids half-updated colours from import-time "
+            "bindings (restart required).",
         )
-        self.act_sketch.setToolTip("Create or edit a sketch on the selected plane (S)")
-        self.act_sketch.triggered.connect(self._enter_sketch)
-        main.addAction(self.act_sketch)
-
-        self.act_extrude = QAction(fa_icon("fa5s.cube", color=ACCENT), "Extrude", self)
-        self.act_extrude.setToolTip(
-            "Extrude (pad) a closed sketch profile into a solid (E)"
-        )
-        self.act_extrude.setShortcut(QKeySequence("E"))
-        self.act_extrude.triggered.connect(self._extrude)
-        main.addAction(self.act_extrude)
-
-        self.act_revolve = QAction(fa_icon("fa5s.sync-alt", color=ACCENT), "Revolve", self)
-        self.act_revolve.setToolTip(
-            "Revolve a closed sketch profile about the V-axis into a solid (R)"
-        )
-        self.act_revolve.setShortcut(QKeySequence("R"))
-        self.act_revolve.triggered.connect(self._revolve)
-        main.addAction(self.act_revolve)
-
-        self.act_fillet = QAction(
-            fa_icon("fa5s.circle-notch", color=ACCENT), "Fillet", self
-        )
-        self.act_fillet.setToolTip(
-            "Fillet closed profile corners, then extrude into a solid (F)"
-        )
-        self.act_fillet.setShortcut(QKeySequence("F"))
-        self.act_fillet.triggered.connect(self._fillet)
-        main.addAction(self.act_fillet)
-
-        self.act_pocket = QAction(
-            fa_icon("fa5s.dot-circle", color=ACCENT), "Pocket", self
-        )
-        self.act_pocket.setToolTip(
-            "Cut a circular through-hole pocket and extrude into a solid (P)"
-        )
-        self.act_pocket.setShortcut(QKeySequence("P"))
-        self.act_pocket.triggered.connect(self._pocket)
-        main.addAction(self.act_pocket)
-
-    def _build_sketch_toolbar(self) -> None:
-        self.sketch_tb = QToolBar("Sketch")
-        self.sketch_tb.setObjectName("SketchToolBar")
-        self.sketch_tb.setMovable(False)
-        self.sketch_tb.setIconSize(QSize(20, 20))
-        self.sketch_tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.addToolBar(self.sketch_tb)
-
-        group = QActionGroup(self)
-        group.setExclusive(True)
-
-        tool_defs = (
-            (SketchTool.SELECT, "Select", "fa5s.mouse-pointer", "Select and edit entities"),
-            (SketchTool.LINE, "Line", "fa5s.minus", "Draw a line"),
-            (SketchTool.RECTANGLE, "Rectangle", "fa5s.vector-square", "Draw a rectangle"),
-            (SketchTool.CIRCLE, "Circle", "fa5s.circle", "Draw a circle"),
-        )
-        for tool, label, icon_name, tip in tool_defs:
-            act = QAction(fa_icon(icon_name), label, self)
-            act.setToolTip(tip)
-            act.setCheckable(True)
-            act.triggered.connect(lambda checked=False, t=tool: self._on_sketch_tool(t))
-            group.addAction(act)
-            self.sketch_tb.addAction(act)
-            self._sketch_tool_actions[tool] = act
-
-        self.sketch_tb.addSeparator()
-        act_exit = QAction(fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit Sketch", self)
-        act_exit.setToolTip("Exit sketch mode (Esc when idle)")
-        act_exit.triggered.connect(self._exit_sketch)
-        self.sketch_tb.addAction(act_exit)
-        self.sketch_tb.setVisible(False)
 
     def _on_sketch_tool(self, tool: SketchTool) -> None:
         self.viewport.set_sketch_tool(tool)
@@ -511,7 +623,7 @@ class MainWindow(QMainWindow):
         if f and f.type is FeatureType.SKETCH and f.sketch is not None:
             self._sync_selection(fid)
             self.viewport.enter_sketch(f.id)
-            self.sketch_tb.setVisible(True)
+            self._set_sketch_ribbon_enabled(True)
             self._sync_sketch_tool_ui(SketchTool.LINE)
             self.statusBar().showMessage(f"Editing {f.name}")
 
@@ -536,7 +648,7 @@ class MainWindow(QMainWindow):
         # If a sketch is selected, re-open it
         if f is not None and f.type is FeatureType.SKETCH and f.sketch is not None:
             self.viewport.enter_sketch(f.id)
-            self.sketch_tb.setVisible(True)
+            self._set_sketch_ribbon_enabled(True)
             self._sync_sketch_tool_ui(SketchTool.LINE)
             self.statusBar().showMessage(f"Editing {f.name}")
             return
@@ -554,19 +666,19 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         self._sync_selection(skf.id)
         self.viewport.enter_sketch(skf.id)
-        self.sketch_tb.setVisible(True)
+        self._set_sketch_ribbon_enabled(True)
         self._sync_sketch_tool_ui(SketchTool.LINE)
         self.statusBar().showMessage(f"Editing {skf.name} on {f.name}")
 
     def _exit_sketch(self) -> None:
         self.viewport.exit_sketch()
-        self.sketch_tb.setVisible(False)
+        self._set_sketch_ribbon_enabled(False)
         self._refresh_tree()
         self._sync_selection(self.doc.selected_id)
         self.statusBar().showMessage("Exited sketch", 2000)
 
     def _on_sketch_exited(self) -> None:
-        self.sketch_tb.setVisible(False)
+        self._set_sketch_ribbon_enabled(False)
         self._refresh_tree()
 
     def _resolve_closed_sketch_id(self) -> int:
@@ -678,7 +790,7 @@ class MainWindow(QMainWindow):
         # Leave sketch mode so the solid rebuild is visible
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
-            self.sketch_tb.setVisible(False)
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             profile_entity_id = self._pick_closed_profile(
@@ -750,7 +862,7 @@ class MainWindow(QMainWindow):
 
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
-            self.sketch_tb.setVisible(False)
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             profile_entity_id = self._pick_closed_profile(
@@ -837,7 +949,7 @@ class MainWindow(QMainWindow):
 
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
-            self.sketch_tb.setVisible(False)
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             profile_entity_id = self._pick_closed_profile(
@@ -932,7 +1044,7 @@ class MainWindow(QMainWindow):
 
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
-            self.sketch_tb.setVisible(False)
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             profile_entity_id = self._pick_closed_profile(
@@ -1217,7 +1329,7 @@ class MainWindow(QMainWindow):
                 )
                 self.viewport.sketch_escape()
                 if not self.viewport.in_sketch_mode:
-                    self.sketch_tb.setVisible(False)
+                    self._set_sketch_ribbon_enabled(False)
                     self._refresh_tree()
                     self._sync_selection(self.doc.selected_id)
                     self.statusBar().showMessage("Exited sketch", 2000)

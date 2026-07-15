@@ -17,6 +17,7 @@ from app.sketch_mode import SNAP_POINT_PX, SketchController, SketchTool
 from app.theme import (
     ACCENT,
     TEXT_PRIMARY,
+    AXIS_LABEL,
     AXIS_X,
     AXIS_Y,
     AXIS_Z,
@@ -510,18 +511,23 @@ class Viewport(QWidget):
                 pickable=False,
                 opacity=0.35,
             )
-        # Small corner orientation widget only (unobtrusive)
+        # Corner orientation triad — SolidWorks-like RGB axes + high-contrast labels
         try:
-            self.plotter.add_axes(
-                line_width=1,
+            axes_kw = dict(
+                line_width=2,
                 xlabel="X",
                 ylabel="Y",
                 zlabel="Z",
-                x_color=GRID_COLOR,
-                y_color=GRID_COLOR,
-                z_color=GRID_COLOR,
-                viewport=(0.0, 0.0, 0.12, 0.12),
+                x_color=AXIS_X,
+                y_color=AXIS_Y,
+                z_color=AXIS_Z,
+                viewport=(0.0, 0.0, 0.18, 0.18),
             )
+            # label_color supported on recent PyVista; fall back if missing
+            try:
+                self.plotter.add_axes(**axes_kw, label_color=AXIS_LABEL)
+            except TypeError:
+                self.plotter.add_axes(**axes_kw)
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
 
