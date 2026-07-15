@@ -370,6 +370,35 @@ class EntityDeleteCommand(HistoryCommand):
         return f"Delete {self.entity_data.get('kind', 'entity')}"
 
 
+class EntityMultiDeleteCommand(HistoryCommand):
+    """Delete several sketch entities as ONE undo step.
+
+    ``items`` is a list of (entity_data, index) captured before deletion, in
+    ascending original-index order. Redo removes by id; undo re-inserts at the
+    recorded indices (lowest index first so positions stay stable).
+    """
+
+    def __init__(
+        self, sketch_id: int, items: List[Tuple[dict, int]]
+    ) -> None:
+        self.sketch_id = int(sketch_id)
+        self.items = [(dict(d), int(idx)) for d, idx in items]
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        for data, _idx in self.items:
+            sk.remove_entity(int(data["id"]))
+
+    def undo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        for data, idx in sorted(self.items, key=lambda t: t[1]):
+            ent = restore_entity(data)
+            sk.insert_entity(ent, idx)
+
+    def description(self) -> str:
+        return f"Delete {len(self.items)} entities"
+
+
 class EntityMoveCommand(HistoryCommand):
     def __init__(self, sketch_id: int, before: dict, after: dict) -> None:
         self.sketch_id = int(sketch_id)
@@ -571,6 +600,25 @@ class Document:
         sk.remove_entity(eid)
         self.push_command(EntityDeleteCommand(sketch_id, data, idx))
         return True
+
+    def delete_entities(self, sketch_id: int, eids: List[int]) -> int:
+        """Delete multiple sketch entities as ONE undo step. Returns count deleted."""
+        if not eids:
+            return 0
+        if len(eids) == 1:
+            return 1 if self.delete_entity(sketch_id, int(eids[0])) else 0
+        sk = _sketch_of(self, sketch_id)
+        wanted = {int(e) for e in eids}
+        items: List[Tuple[dict, int]] = []
+        for i, e in enumerate(sk.entities):
+            if e.id in wanted:
+                items.append((snapshot_entity(e), i))
+        if not items:
+            return 0
+        for data, _idx in items:
+            sk.remove_entity(int(data["id"]))
+        self.push_command(EntityMultiDeleteCommand(sketch_id, items))
+        return len(items)
 
     def record_entity_move(self, sketch_id: int, before: dict, after: dict) -> None:
         """Record geometry change if before != after."""

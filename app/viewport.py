@@ -26,10 +26,13 @@ from app.theme import (
     PLANE_FRONT,
     PLANE_RIGHT,
     PLANE_TOP,
+    SEL_BOX_CROSSING,
+    SEL_BOX_WINDOW,
     SKETCH_COLOR,
     SKETCH_GRID,
     SKETCH_H,
     SKETCH_PREVIEW,
+    SKETCH_SELECTED,
     SKETCH_V,
     SOLID_COLOR,
     SOLID_SELECTED,
@@ -156,6 +159,47 @@ def _flat_point_cloud(points: np.ndarray) -> pv.PolyData:
     return pv.PolyData(np.asarray(points, dtype=np.float64).reshape(-1, 3))
 
 
+def _dashed_polyline_polydata(
+    points_world,
+    *,
+    dash: float = 0.08,
+    gap: float = 0.05,
+) -> pv.PolyData:
+    """Build a dashed polyline from consecutive world points (explicit segments).
+
+    vtkProperty line stipple is unreliable on OpenGL2 — bake dashes into the mesh.
+    """
+    pts = [np.asarray(p, dtype=np.float64).reshape(3) for p in points_world]
+    if len(pts) < 2:
+        return pv.PolyData()
+    segs: list = []
+    for i in range(len(pts) - 1):
+        a = pts[i]
+        b = pts[i + 1]
+        ab = b - a
+        length = float(np.linalg.norm(ab))
+        if length < 1e-12:
+            continue
+        direction = ab / length
+        t = 0.0
+        on = True
+        while t < length - 1e-12:
+            span = dash if on else gap
+            t1 = min(length, t + span)
+            if on and t1 > t + 1e-12:
+                p0 = a + direction * t
+                p1 = a + direction * t1
+                segs.append(pv.Line(p0, p1))
+            t = t1
+            on = not on
+    if not segs:
+        return pv.lines_from_points(np.array(pts, float), close=False)
+    merged = segs[0]
+    for s in segs[1:]:
+        merged = merged.merge(s)
+    return merged
+
+
 # Origin glyph size (world units / mm)
 ORIGIN_CROSS_HALF = 0.14
 ORIGIN_RING_R = 0.09
@@ -213,7 +257,11 @@ class _InteractorFilter(QObject):
             return False
         et = event.type()
         if et == QEvent.Type.MouseMove:
-            self.vp._sketch_mouse_move(event.position().x(), event.position().y())
+            self.vp._sketch_mouse_move(
+                event.position().x(),
+                event.position().y(),
+                shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            )
             return True  # consume — lock camera
         if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
             # Double-click ends a polyline chain
@@ -221,10 +269,18 @@ class _InteractorFilter(QObject):
                 self.vp._end_line_chain()
                 return True
         if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            self.vp._sketch_mouse_press(event.position().x(), event.position().y())
+            self.vp._sketch_mouse_press(
+                event.position().x(),
+                event.position().y(),
+                shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            )
             return True
         if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            self.vp._sketch_mouse_release(event.position().x(), event.position().y())
+            self.vp._sketch_mouse_release(
+                event.position().x(),
+                event.position().y(),
+                shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            )
             return True
         if et == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_Escape:
@@ -596,6 +652,7 @@ class Viewport(QWidget):
         self._set_draw_solids_visible(True)
         self._draw_saved_size = None
         self._clear_preview()
+        self._clear_selbox()
         try:
             if self.plotter is not None:
                 self.plotter.render_window.SetDesiredUpdateRate(0.0001)
@@ -1077,14 +1134,19 @@ class Viewport(QWidget):
         self._update_cursor()
 
     def sketch_escape(self) -> None:
-        """Esc: cancel in-progress draw → Select; if idle, exit sketch mode."""
+        """Esc: cancel in-progress draw/box → Select; if idle, exit sketch mode."""
         if self._sketch_ctrl is None:
             return
-        if self._sketch_ctrl.is_drawing() or self._sketch_ctrl.drag is not None:
+        if (
+            self._sketch_ctrl.is_drawing()
+            or self._sketch_ctrl.drag is not None
+            or self._sketch_ctrl.is_box_selecting()
+        ):
             self._sketch_ctrl.cancel_drawing()
             self._sketch_ctrl.set_tool(SketchTool.SELECT)
             self._end_draw_lod()
             self._clear_preview()
+            self._clear_selbox()
             self._update_handles_visual()
             self._update_cursor()
             self.sketch_status.emit("Sketch: Select")
@@ -1249,6 +1311,7 @@ class Viewport(QWidget):
             "__sk_h",
             "__sk_v",
             "__sk_preview",
+            "__sk_selbox",
             "__sk_handles",
             "__sk_infer",
             "__sk_junctions",
@@ -1488,9 +1551,7 @@ class Viewport(QWidget):
         unit = self._doc.display_unit
         fr = self._sketch_ctrl.sketch.frame
         ctrl = self._sketch_ctrl
-        show_ids = set()
-        if ctrl.selected_entity_id >= 0:
-            show_ids.add(ctrl.selected_entity_id)
+        show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
         points = []
@@ -1529,9 +1590,7 @@ class Viewport(QWidget):
             return []
         unit = self._doc.display_unit
         ctrl = self._sketch_ctrl
-        show_ids = set()
-        if ctrl.selected_entity_id >= 0:
-            show_ids.add(ctrl.selected_entity_id)
+        show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
         out = []
@@ -1546,10 +1605,10 @@ class Viewport(QWidget):
             return []
         ctrl = self._sketch_ctrl
         ids = []
-        if ctrl.selected_entity_id >= 0:
-            ent = ctrl.sketch.find_entity(ctrl.selected_entity_id)
+        for eid in ctrl.selected_ids:
+            ent = ctrl.sketch.find_entity(eid)
             if isinstance(ent, LineEntity):
-                ids.append(ent.id)
+                ids.append(eid)
         if ctrl.hover_handle is not None:
             hid = ctrl.hover_handle.entity_id
             if hid not in ids:
@@ -1562,7 +1621,7 @@ class Viewport(QWidget):
         if not self.plotter or self._sketch_ctrl is None:
             return
         name = f"sk_e_{ent.id}"
-        selected = ent.id == self._sketch_ctrl.selected_entity_id
+        selected = ent.id in self._sketch_ctrl.selected_ids
         fp = _entity_fingerprint(ent, selected=selected)
         if self._sketch_entity_fps.get(ent.id) == fp and (
             name in self.plotter.actors or name in self._overlay_actors
@@ -1570,7 +1629,7 @@ class Viewport(QWidget):
             return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
         pdata = _entity_polydata(ent, self._sketch_ctrl.sketch)
-        col = SKETCH_PREVIEW if selected else SKETCH_COLOR
+        col = SKETCH_SELECTED if selected else SKETCH_COLOR
         self._add_overlay_mesh(
             pdata, color=col, line_width=3.0, name=name, pickable=False, render=False
         )
@@ -1582,6 +1641,9 @@ class Viewport(QWidget):
         self._remove_actor("__sk_preview")
         self._remove_actor("__sk_infer")
 
+    def _clear_selbox(self) -> None:
+        self._remove_actor("__sk_selbox")
+
     def _clear_handles(self) -> None:
         self._remove_actor("__sk_handles")
 
@@ -1592,8 +1654,9 @@ class Viewport(QWidget):
         ctrl = self._sketch_ctrl
         fr = ctrl.sketch.frame
         pts = []
+        sel = ctrl.selected_ids
         for h in ctrl.sketch.all_handles():
-            if ctrl.selected_entity_id >= 0 and h.entity_id != ctrl.selected_entity_id:
+            if sel and h.entity_id not in sel:
                 if ctrl.hover_handle is None or ctrl.hover_handle.entity_id != h.entity_id:
                     continue
             pts.append(fr.to_world(h.uv))
@@ -1610,6 +1673,40 @@ class Viewport(QWidget):
             pickable=False,
             render=False,
         )
+
+    def _update_selbox_visual(self) -> None:
+        """Live selection rectangle as VTK overlay actor (__sk_selbox).
+
+        Window (L→R): solid border in SEL_BOX_WINDOW.
+        Crossing (R→L): dashed border (explicit short segments) in SEL_BOX_CROSSING.
+        """
+        if not self.plotter or self._sketch_ctrl is None:
+            return
+        bs = self._sketch_ctrl.box_select
+        if bs is None or bs.drag_px < 1.0:
+            self._clear_selbox()
+            return
+        fr = self._sketch_ctrl.sketch.frame
+        u0, v0, u1, v1 = bs.uv_rect()
+        corners_uv = [(u0, v0), (u1, v0), (u1, v1), (u0, v1), (u0, v0)]
+        corners_w = [fr.to_world(c) for c in corners_uv]
+        if bs.is_window:
+            pdata = pv.lines_from_points(np.array(corners_w, float), close=False)
+            col = SEL_BOX_WINDOW
+            lw = 2.0
+        else:
+            pdata = _dashed_polyline_polydata(corners_w, dash=0.08, gap=0.05)
+            col = SEL_BOX_CROSSING
+            lw = 2.2
+        self._add_overlay_mesh(
+            pdata,
+            color=col,
+            line_width=lw,
+            name="__sk_selbox",
+            pickable=False,
+            render=False,
+        )
+        self._apply_sketch_actor_priority("__sk_selbox")
 
     def _update_preview_visual(self) -> None:
         """Live in-progress preview as a real VTK actor on the layer-1 overlay.
@@ -1729,7 +1826,7 @@ class Viewport(QWidget):
             return None
         return self._sketch_ctrl.sketch.frame.to_local(hit)
 
-    def _sketch_mouse_move(self, x: float, y: float) -> None:
+    def _sketch_mouse_move(self, x: float, y: float, *, shift: bool = False) -> None:
         if self._sketch_ctrl is None:
             return
         t0 = time.perf_counter()
@@ -1742,11 +1839,19 @@ class Viewport(QWidget):
         drawing = (
             self._sketch_ctrl.is_drawing()
             or self._sketch_ctrl.drag is not None
+            or self._sketch_ctrl.is_box_selecting()
         )
-        # While drawing/dragging: light LOD (hide chrome + solids)
+        # While drawing/dragging/box-selecting: light LOD (hide chrome + solids)
         if drawing:
             self._begin_draw_lod()
-        self._sketch_ctrl.on_move(uv)
+        self._sketch_ctrl.on_move(uv, display_xy=(float(x), float(y)))
+        if self._sketch_ctrl.box_select is not None:
+            self._update_selbox_visual()
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self._do_render()
+            self._stroke_move_ms.append((time.perf_counter() - t0) * 1000.0)
+            return
         if self._sketch_ctrl.drag is not None:
             ent = self._sketch_ctrl.sketch.find_entity(self._sketch_ctrl.drag.entity_id)
             if ent:
@@ -1758,7 +1863,7 @@ class Viewport(QWidget):
                 self._render_timer.stop()
             self._do_render()
             return
-        # Live VTK preview on layer-1 overlay + one light re-render per move
+        # Live VTK draw preview on layer-1 overlay + one light re-render per move
         self._update_preview_visual()
         if drawing:
             if self._render_timer.isActive():
@@ -1771,7 +1876,7 @@ class Viewport(QWidget):
             self._update_cursor()
         self._request_render()
 
-    def _sketch_mouse_press(self, x: float, y: float) -> None:
+    def _sketch_mouse_press(self, x: float, y: float, *, shift: bool = False) -> None:
         if self._sketch_ctrl is None:
             return
         self._update_snap_tolerance()
@@ -1787,7 +1892,9 @@ class Viewport(QWidget):
                 if ent0 is not None:
                     self._drag_before = snapshot_entity(ent0)
         n_before = len(self._sketch_ctrl.sketch.entities)
-        msg = self._sketch_ctrl.on_press(uv)
+        msg = self._sketch_ctrl.on_press(
+            uv, display_xy=(float(x), float(y)), shift=shift
+        )
         sk = self._sketch_ctrl.sketch
         if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
             if len(sk.entities) > n_before:
@@ -1824,8 +1931,15 @@ class Viewport(QWidget):
             self.sketch_status.emit(f"Sketch: {msg}")
         elif msg and msg.startswith("Selected"):
             self._end_draw_lod()
+            self._clear_selbox()
             self._rebuild_all_sketch_entities()
-            self.sketch_status.emit("Sketch: Select")
+            n = len(self._sketch_ctrl.selected_ids)
+            self.sketch_status.emit(f"Sketch: Select ({n})" if n != 1 else "Sketch: Select")
+        elif msg == "BoxSelect":
+            self._begin_draw_lod()
+            self._clear_selbox()
+            self._rebuild_all_sketch_entities()  # clear highlight if selection wiped
+            self.sketch_status.emit("Sketch: box select…")
         elif msg:
             # First click of a draw: enter light LOD; preview appears on next move
             if self._sketch_ctrl.is_drawing():
@@ -1835,16 +1949,21 @@ class Viewport(QWidget):
             self.sketch_status.emit(f"Sketch: {msg}")
         self._request_render()
 
-    def _sketch_mouse_release(self, x: float, y: float) -> None:
+    def _sketch_mouse_release(self, x: float, y: float, *, shift: bool = False) -> None:
         if self._sketch_ctrl is None:
             return
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             self._sketch_ctrl.drag = None
+            self._sketch_ctrl.box_select = None
+            self._clear_selbox()
             self._drag_before = None
             return
         was = self._sketch_ctrl.drag
-        self._sketch_ctrl.on_release(uv)
+        was_box = self._sketch_ctrl.box_select is not None
+        msg = self._sketch_ctrl.on_release(
+            uv, display_xy=(float(x), float(y)), shift=shift
+        )
         if was is not None:
             ent = self._sketch_ctrl.sketch.find_entity(was.entity_id)
             if ent:
@@ -1860,6 +1979,24 @@ class Viewport(QWidget):
                     )
             self._end_draw_lod()
             self.sketch_status.emit(f"{self._sketch_ctrl.sketch.name} — edited")
+        elif was_box:
+            self._clear_selbox()
+            self._end_draw_lod()
+            self._rebuild_all_sketch_entities()
+            self._update_handles_visual()
+            self._update_dim_labels()
+            n = len(self._sketch_ctrl.selected_ids)
+            if msg and msg.startswith("BoxSelect:"):
+                parts = msg.split(":")
+                mode = parts[1] if len(parts) > 1 else "?"
+                self.sketch_status.emit(f"Sketch: {mode} select → {n}")
+            elif msg == "BoxSelectClear":
+                self.sketch_status.emit("Sketch: selection cleared")
+            else:
+                self.sketch_status.emit(f"Sketch: selected {n}")
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self._do_render()
         self._drag_before = None
         self._request_render()
 

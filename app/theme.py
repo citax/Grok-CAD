@@ -36,7 +36,10 @@ PLANE_TOP = "#34D399"
 PLANE_RIGHT = "#F87171"
 
 SKETCH_COLOR = "#E2E8F0"
-SKETCH_PREVIEW = "#FBBF24"
+SKETCH_PREVIEW = "#FBBF24"  # live draw preview (amber) — not selection
+SKETCH_SELECTED = "#22D3EE"  # selected sketch entities (cyan; distinct from preview)
+SEL_BOX_WINDOW = "#3B82F6"  # L→R window select (solid border)
+SEL_BOX_CROSSING = "#C084FC"  # R→L crossing select (dashed border)
 HANDLE_COLOR = "#FDE047"
 HANDLE_HOVER = "#FB923C"
 SKETCH_GRID = "#64748B"

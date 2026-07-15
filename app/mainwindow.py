@@ -1071,17 +1071,20 @@ class MainWindow(QMainWindow):
 
     def _delete_selected(self) -> None:
         if self.viewport.in_sketch_mode:
-            # In sketch mode Delete removes the selected entity (undoable)
+            # In sketch mode Delete removes ALL selected entities (one undo step)
             ctrl = self.viewport._sketch_ctrl
-            if ctrl is None or ctrl.selected_entity_id < 0:
+            if ctrl is None or not ctrl.selected_ids:
                 self.statusBar().showMessage("Select a sketch entity to delete", 2500)
                 return
             sid = self.viewport._sketch_feature_id
-            eid = ctrl.selected_entity_id
-            if self.doc.delete_entity(sid, eid):
-                ctrl.selected_entity_id = -1
+            eids = list(ctrl.selected_ids)
+            n = self.doc.delete_entities(sid, eids)
+            if n > 0:
+                ctrl.clear_selection()
                 self.viewport.sync_sketch_visuals()
-                self.statusBar().showMessage("Entity deleted", 2000)
+                self.statusBar().showMessage(
+                    f"Deleted {n} entit{'y' if n == 1 else 'ies'}", 2000
+                )
             return
         fid = self.doc.selected_id
         f = self.doc.find(fid)
@@ -1132,8 +1135,16 @@ class MainWindow(QMainWindow):
     def _copy(self) -> None:
         sid = self._active_sketch_id()
         ctrl = self.viewport._sketch_ctrl if self.viewport.in_sketch_mode else None
-        eid = ctrl.selected_entity_id if ctrl is not None else -1
-        if sid < 0 or eid < 0:
+        if sid < 0 or ctrl is None or not ctrl.selected_ids:
+            self.statusBar().showMessage("Select a sketch entity to copy", 2500)
+            return
+        if len(ctrl.selected_ids) > 1:
+            self.statusBar().showMessage(
+                "Copy supports a single selection — select one entity", 3000
+            )
+            return
+        eid = ctrl.selected_entity_id
+        if eid < 0:
             self.statusBar().showMessage("Select a sketch entity to copy", 2500)
             return
         if self.doc.copy_entity(sid, eid):
@@ -1142,13 +1153,23 @@ class MainWindow(QMainWindow):
     def _cut(self) -> None:
         sid = self._active_sketch_id()
         ctrl = self.viewport._sketch_ctrl if self.viewport.in_sketch_mode else None
-        eid = ctrl.selected_entity_id if ctrl is not None else -1
-        if sid < 0 or eid < 0:
+        if sid < 0 or ctrl is None or not ctrl.selected_ids:
+            self.statusBar().showMessage("Select a sketch entity to cut", 2500)
+            return
+        if len(ctrl.selected_ids) > 1:
+            self.statusBar().showMessage(
+                "Cut supports a single selection — select one entity "
+                "(or Delete to remove all selected)",
+                3500,
+            )
+            return
+        eid = ctrl.selected_entity_id
+        if eid < 0:
             self.statusBar().showMessage("Select a sketch entity to cut", 2500)
             return
         if self.doc.cut_entity(sid, eid):
             if ctrl is not None:
-                ctrl.selected_entity_id = -1
+                ctrl.clear_selection()
             if self.viewport.in_sketch_mode:
                 self.viewport.sync_sketch_visuals()
             self.statusBar().showMessage("Cut", 1500)
@@ -1171,7 +1192,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Clipboard empty", 1500)
             return
         # Always refresh the viewport after a successful paste
-        self.viewport._sketch_ctrl.selected_entity_id = ent.id
+        self.viewport._sketch_ctrl.set_selection({ent.id})
         self.viewport.sync_sketch_visuals()
         self.statusBar().showMessage(f"Pasted entity {ent.id}", 2000)
 
@@ -1192,6 +1213,11 @@ class MainWindow(QMainWindow):
             )
             return
         ctrl = self.viewport._sketch_ctrl
+        if len(ctrl.selected_ids) != 1:
+            QMessageBox.information(
+                self, "Set Length", "Select exactly one line entity first."
+            )
+            return
         ent = ctrl.sketch.find_entity(ctrl.selected_entity_id)
         if not isinstance(ent, LineEntity):
             QMessageBox.information(self, "Set Length", "Select a line entity first.")
