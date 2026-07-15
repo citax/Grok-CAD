@@ -207,6 +207,28 @@ def main() -> int:
     _pump(app, 8)
     print("MAINWINDOW_RESELECT_OK", flush=True)
 
+    # Reverse direction: solid must flip to −normal, undo restores +normal
+    win.props.show_feature(ex)
+    win.props.show_feature(ex)
+    from PySide6.QtWidgets import QCheckBox
+
+    cb = win.props._editors.get("reversed")
+    assert isinstance(cb, QCheckBox), type(cb)
+    cb.setChecked(True)
+    win.props.btn_apply.click()
+    _pump(app, 20)
+    assert ex.reversed is True
+    m_rev = win.doc.evaluate_feature(ex.id)
+    assert m_rev is not None and m_rev.vertices[:, 2].max() <= 1e-5
+    assert m_rev.vertices[:, 2].min() < -1.0
+    print("MAINWINDOW_REVERSE_OK", flush=True)
+    win._undo()
+    _pump(app, 15)
+    assert ex.reversed is False
+    m_fwd = win.doc.evaluate_feature(ex.id)
+    assert m_fwd is not None and m_fwd.vertices[:, 2].min() >= -1e-5
+    print("MAINWINDOW_REVERSE_UNDO_OK", flush=True)
+
     if _EXC:
         print(f"EXC_FAIL {len(_EXC)}", flush=True)
         for e in _EXC:

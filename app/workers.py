@@ -40,6 +40,7 @@ def feature_fingerprint(f: Feature) -> str:
         f"{f.axis_direction[0]:.6g},{f.axis_direction[1]:.6g}",
         f"{f.hole_center_u:.6g},{f.hole_center_v:.6g}",
         f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
+        str(int(getattr(f, "reversed", False))),
         str(int(f.visible)),
         str(int(f.suppressed)),
     ]
@@ -137,6 +138,7 @@ def evaluate_solids_snapshot(
                 sketch.frame,
                 segments=max(3, int(f.segments)),
                 holes=resolved.holes,
+                reversed=bool(getattr(f, "reversed", False)),
             )
         elif f.type is FeatureType.FILLET:
             skf = by_id.get(f.operand_a)

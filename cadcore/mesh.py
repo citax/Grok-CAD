@@ -654,14 +654,39 @@ def extrude_pocketed_filleted_profile(
     return mesh
 
 
+def _manifold_after_extrude(
+    man: "Manifold",
+    dist: float,
+    frame: "PlaneFrame",
+    *,
+    reversed: bool = False,
+) -> Mesh:
+    """Apply reverse (local -Z shift) then map UVH → world via frame transform.
+
+    Manifold.extrude builds height along +local Z in [0, dist]. Translating by
+    ``-dist`` along Z before the frame transform places the solid on the
+    opposite side of the sketch plane without changing |depth|.
+    """
+    if reversed:
+        man = man.translate([0.0, 0.0, -float(dist)])
+    man = man.transform(_frame_transform(frame))
+    mesh = Mesh.from_manifold(man)
+    if not mesh.is_watertight():
+        raise RuntimeError("extrude result is not watertight")
+    return mesh
+
+
 def extrude_polygon(
     polygon_uv: Sequence[Tuple[float, float]],
     distance: float,
     frame: "PlaneFrame",
+    *,
+    reversed: bool = False,
 ) -> Mesh:
     """Extrude a closed 2D UV polygon along ``frame.normal`` by ``distance``.
 
     Uses manifold3d ``CrossSection`` + ``Manifold.extrude`` (not hand-rolled geometry).
+    ``reversed=True`` pads along −normal (depth stays positive).
     """
     if Manifold is None or CrossSection is None:
         raise RuntimeError("manifold3d is not installed")
@@ -674,11 +699,7 @@ def extrude_polygon(
     man = Manifold.extrude(cs, dist)
     if not _status_ok(man.status()) or man.is_empty():
         raise RuntimeError(f"manifold extrude failed: {man.status()}")
-    man = man.transform(_frame_transform(frame))
-    mesh = Mesh.from_manifold(man)
-    if not mesh.is_watertight():
-        raise RuntimeError("extrude result is not watertight")
-    return mesh
+    return _manifold_after_extrude(man, dist, frame, reversed=reversed)
 
 
 def extrude_rectangle(
@@ -686,9 +707,13 @@ def extrude_rectangle(
     c1: Sequence[float],
     distance: float,
     frame: "PlaneFrame",
+    *,
+    reversed: bool = False,
 ) -> Mesh:
     """Extrude an axis-aligned UV rectangle along the plane normal."""
-    return extrude_polygon(_rect_polygon_uv(c0, c1), distance, frame)
+    return extrude_polygon(
+        _rect_polygon_uv(c0, c1), distance, frame, reversed=reversed
+    )
 
 
 def extrude_circle(
@@ -698,6 +723,7 @@ def extrude_circle(
     frame: "PlaneFrame",
     *,
     segments: int = 64,
+    reversed: bool = False,
 ) -> Mesh:
     """Extrude a UV circle along the plane normal (polygonal approx)."""
     if Manifold is None or CrossSection is None:
@@ -718,11 +744,7 @@ def extrude_circle(
     man = Manifold.extrude(cs, dist)
     if not _status_ok(man.status()) or man.is_empty():
         raise RuntimeError(f"manifold extrude failed: {man.status()}")
-    man = man.transform(_frame_transform(frame))
-    mesh = Mesh.from_manifold(man)
-    if not mesh.is_watertight():
-        raise RuntimeError("extrude result is not watertight")
-    return mesh
+    return _manifold_after_extrude(man, dist, frame, reversed=reversed)
 
 
 def extrude_profile(
@@ -732,11 +754,13 @@ def extrude_profile(
     *,
     segments: int = 64,
     holes: Optional[Sequence[Union["RectEntity", "CircleEntity", "SketchEntity"]]] = None,
+    reversed: bool = False,
 ) -> Mesh:
     """Extrude a closed sketch profile (Rectangle or Circle) into a watertight solid.
 
     Optional ``holes`` are closed profiles nested inside the outer boundary; they
     are subtracted via CrossSection difference before extrude (through-holes).
+    ``reversed=True`` pads along −plane normal; ``distance`` must stay positive.
 
     Open entities (e.g. lines) and degenerate geometry are rejected with ValueError.
     """
@@ -749,13 +773,22 @@ def extrude_profile(
     hole_list = list(holes) if holes else []
     if not hole_list:
         if isinstance(profile, RectEntity):
-            return extrude_rectangle(profile.c0, profile.c1, distance, frame)
+            return extrude_rectangle(
+                profile.c0, profile.c1, distance, frame, reversed=reversed
+            )
         if isinstance(profile, CircleEntity):
             return extrude_circle(
-                profile.center, profile.radius, distance, frame, segments=segments
+                profile.center,
+                profile.radius,
+                distance,
+                frame,
+                segments=segments,
+                reversed=reversed,
             )
         if isinstance(profile, ClosedLineLoop):
-            return extrude_polygon(profile.vertices, distance, frame)
+            return extrude_polygon(
+                profile.vertices, distance, frame, reversed=reversed
+            )
         raise ValueError(
             f"unsupported profile type for extrude: {type(profile).__name__}"
         )
@@ -786,11 +819,7 @@ def extrude_profile(
     man = Manifold.extrude(cs, dist)
     if not _status_ok(man.status()) or man.is_empty():
         raise RuntimeError(f"manifold extrude failed: {man.status()}")
-    man = man.transform(_frame_transform(frame))
-    mesh = Mesh.from_manifold(man)
-    if not mesh.is_watertight():
-        raise RuntimeError("extrude result is not watertight")
-    return mesh
+    return _manifold_after_extrude(man, dist, frame, reversed=reversed)
 
 
 def _normalize_axis_2d(

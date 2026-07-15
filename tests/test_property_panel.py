@@ -96,6 +96,34 @@ def test_apply_button_changes_extrude_depth_and_volume():
     assert abs(mesh1.volume() - 14.0) < 0.1
 
 
+def test_apply_reverse_direction_moves_solid():
+    from PySide6.QtWidgets import QCheckBox
+
+    _app()
+    doc = Document()
+    doc.seed_reference_planes()
+    plane = next(f for f in doc.features if f.type is FeatureType.PLANE_FRONT)
+    skf = doc.create_sketch_on_plane(plane.id)
+    skf.sketch.add_rectangle((0, 0), (2, 2))
+    ex = doc.create_extrude(skf.id, 2.0)
+    m0 = doc.evaluate_feature(ex.id)
+    assert m0 is not None and m0.vertices[:, 2].min() >= -1e-6
+
+    p = PropertyPanel()
+    p.set_document(doc)
+    p.show_feature(ex)
+    cb = p._editors["reversed"]
+    assert isinstance(cb, QCheckBox)
+    cb.setChecked(True)
+    p.btn_apply.click()
+    assert ex.reversed is True
+    m1 = doc.evaluate_feature(ex.id)
+    assert m1 is not None
+    assert m1.vertices[:, 2].max() <= 1e-6
+    assert m1.vertices[:, 2].min() < -1.0
+    assert abs(m0.volume() - m1.volume()) < 1e-6
+
+
 def test_apply_fillet_radius_via_button():
     _app()
     doc = Document()

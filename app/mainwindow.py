@@ -704,8 +704,11 @@ class MainWindow(QMainWindow):
         self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(feat.id)
+        # Direction defaults forward; flip Reverse in PropertyManager after create
+        # (QInputDialog cannot host a checkbox).
         self.statusBar().showMessage(
-            f"Created {feat.name} (distance={dist:g})", 3000
+            f"Created {feat.name} (distance={dist:g}) — use Reverse direction in PropertyManager to flip",
+            4000,
         )
 
     def _revolve(self) -> None:

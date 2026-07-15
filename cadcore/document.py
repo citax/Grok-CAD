@@ -297,9 +297,11 @@ class Feature:
     # Sketch linkage
     plane_id: int = -1
     sketch: Optional[Sketch] = None
-    # Extrude (pad): operand_a = source sketch id, depth = distance,
-    # profile_entity_id = closed entity (or -1 → first closed profile)
+    # Extrude (pad): operand_a = source sketch id, depth = distance (always ≥ 0),
+    # profile_entity_id = closed entity (or -1 → first closed profile),
+    # reversed = pad along −plane normal (SolidWorks "Reverse Direction")
     profile_entity_id: int = -1
+    reversed: bool = False
     # Revolve: operand_a = sketch id, revolve_angle in degrees (default 360),
     # axis in sketch UV (origin + direction); segments = angular resolution
     revolve_angle: float = 360.0
@@ -828,10 +830,12 @@ class Document:
         *,
         profile_entity_id: int = -1,
         segments: int = 64,
+        reversed: bool = False,
     ) -> Feature:
-        """Pad a closed sketch profile (rectangle or circle) by ``distance``.
+        """Pad a closed sketch profile by ``distance`` along ±plane normal.
 
-        Raises ValueError for missing sketch, open/degenerate profiles, or bad distance.
+        ``distance`` is always a positive magnitude. ``reversed=True`` pads along
+        the opposite of the sketch plane normal (SolidWorks Reverse Direction).
         """
         skf = self.find(sketch_id)
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
@@ -846,6 +850,7 @@ class Document:
         dist = float(distance)
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
+        rev = bool(reversed)
         # Validate by building once (also catches open types / holes)
         _ = extrude_profile(
             ent,
@@ -853,6 +858,7 @@ class Document:
             sketch.frame,
             segments=int(segments),
             holes=resolved.holes,
+            reversed=rev,
         )
         self._extrude_count += 1
         f = Feature(
@@ -862,6 +868,7 @@ class Document:
             segments=int(segments),
             operand_a=sketch_id,
             profile_entity_id=int(profile_entity_id),
+            reversed=rev,
         )
         self.add_feature(f)
         self.record_feature_add(f)
@@ -993,7 +1000,7 @@ class Document:
         """Apply editable parameters on a solid feature (undoable) and re-sync sketch.
 
         Supported keys: depth, radius, segments, revolve_angle, hole_center_u,
-        hole_center_v. Returns False if feature missing / no change.
+        hole_center_v, reversed, name. Returns False if feature missing / no change.
         """
         f = self.find(fid)
         if f is None or is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
@@ -1005,6 +1012,7 @@ class Document:
             "revolve_angle",
             "hole_center_u",
             "hole_center_v",
+            "reversed",
             "name",
         )
         before = {k: getattr(f, k) for k in keys if hasattr(f, k)}
@@ -1122,6 +1130,7 @@ class Document:
                 sketch.frame,
                 segments=max(3, int(f.segments)),
                 holes=resolved.holes,
+                reversed=bool(getattr(f, "reversed", False)),
             )
         elif f.type is FeatureType.FILLET:
             skf = self.find(f.operand_a)

@@ -12,6 +12,7 @@ from typing import Dict, Optional, Union
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -43,7 +44,7 @@ class PropertyPanel(QWidget):
         self._sketch_line: Optional[tuple] = None  # (sketch_fid, entity_id)
         self._building = False
         # Fresh editors for the *current* form only (never survive removeRow)
-        self._editors: Dict[str, Union[QDoubleSpinBox, QSpinBox]] = {}
+        self._editors: Dict[str, Union[QDoubleSpinBox, QSpinBox, QCheckBox]] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -150,11 +151,18 @@ class PropertyPanel(QWidget):
         self._editors[key] = spin
         return spin
 
-    def _editor(self, key: str) -> Union[QDoubleSpinBox, QSpinBox]:
+    def _editor(self, key: str) -> Union[QDoubleSpinBox, QSpinBox, QCheckBox]:
         w = self._editors.get(key)
         if w is None:
             raise RuntimeError(f"editor {key!r} not present for current form")
         return w
+
+    def _add_checkbox(self, key: str, label: str, checked: bool) -> QCheckBox:
+        cb = QCheckBox(label)
+        cb.setChecked(bool(checked))
+        self._dyn_layout.addRow(self._lbl(""), cb)
+        self._editors[key] = cb
+        return cb
 
     def show_feature(self, f: Feature, *, unit: Unit = Unit.MM) -> None:
         self._building = True
@@ -169,7 +177,15 @@ class PropertyPanel(QWidget):
             self._add_dspin(
                 "depth", f"Depth ({unit.label})", from_mm(f.depth, unit), 0.001, 1e6, 4
             )
-            self._hint.setText("Extrude (Boss/Base) — pad distance along plane normal.")
+            self._add_checkbox(
+                "reversed",
+                "Reverse direction",
+                bool(getattr(f, "reversed", False)),
+            )
+            self._hint.setText(
+                "Extrude (Boss/Base) — depth is always positive; "
+                "tick Reverse direction to pad along −plane normal."
+            )
         elif f.type is FeatureType.FILLET:
             self._add_dspin(
                 "radius",
@@ -291,6 +307,9 @@ class PropertyPanel(QWidget):
         try:
             if f.type is FeatureType.EXTRUDE:
                 params["depth"] = to_mm(float(self._editor("depth").value()), unit)
+                rev = self._editor("reversed")
+                assert isinstance(rev, QCheckBox)
+                params["reversed"] = bool(rev.isChecked())
             elif f.type is FeatureType.FILLET:
                 params["radius"] = to_mm(float(self._editor("radius").value()), unit)
                 params["depth"] = to_mm(float(self._editor("depth").value()), unit)
