@@ -9,7 +9,6 @@ from typing import Dict, Optional, Set, Tuple
 import numpy as np
 import pyvista as pv
 from PySide6.QtCore import QEvent, QObject, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from pyvistaqt import QtInteractor
 
@@ -1231,7 +1230,6 @@ class Viewport(QWidget):
         self._sketch_ctrl.set_tool(tool)
         self._clear_preview()
         self.sketch_status.emit(f"Sketch: {tool.name.title()}")
-        self._update_cursor()
 
     def sketch_escape(self) -> None:
         """Esc: cancel in-progress draw/box → Select; if idle, exit sketch mode."""
@@ -1248,7 +1246,6 @@ class Viewport(QWidget):
             self._clear_preview()
             self._clear_selbox()
             self._update_handles_visual()
-            self._update_cursor()
             self.sketch_status.emit("Sketch: Select")
             self._request_render()
             return
@@ -1352,7 +1349,6 @@ class Viewport(QWidget):
             self.plotter.iren.interactor.GetInteractorStyle().SetEnabled(1)
         except Exception:
             pass
-        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
     def _draw_sketch_overlay(self) -> None:
         """Sketch grid + local H/V axes on the plane."""
@@ -1881,17 +1877,6 @@ class Viewport(QWidget):
         else:
             self._remove_actor("__sk_infer")
 
-    def _update_cursor(self) -> None:
-        if self._sketch_ctrl is None:
-            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-            return
-        if self._sketch_ctrl.tool != SketchTool.SELECT:
-            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-        elif self._sketch_ctrl.hover_handle is not None:
-            self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
-        else:
-            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-
     # ----- mouse → sketch UV -----
     def _display_to_ray(self, x: float, y: float):
         """Return (origin, direction) world ray for widget coords."""
@@ -1980,7 +1965,6 @@ class Viewport(QWidget):
             return
         if not self._draw_lod_active and self._sketch_ctrl.hover_handle != prev_hover:
             self._update_handles_visual()
-            self._update_cursor()
         self._request_render()
 
     def _sketch_mouse_press(self, x: float, y: float, *, shift: bool = False) -> None:
