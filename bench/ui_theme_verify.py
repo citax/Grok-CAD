@@ -196,32 +196,49 @@ def main() -> int:
     except Exception:
         pass
 
-    # Isolate caption glyphs by proximity to AXIS_LABEL (what we actually paint)
+    # Isolate caption *cores* by proximity to AXIS_LABEL (what the code paints).
+    # Tol must be tight: cheb<=40 lets anti-aliased edges of pure-black glyphs
+    # land inside the #1A202C ball on light backgrounds and clear n_label by accident.
     from app.theme import AXIS_LABEL
 
     label_rgb = _hex_rgb(AXIS_LABEL)
     flat = crop.reshape(-1, 3).astype(float)
-    # Chebyshev distance in RGB — match bench style (tol ~40 for anti-alias)
     cheb = np.max(np.abs(flat - label_rgb.reshape(1, 3)), axis=1)
-    label_mask = cheb <= 40.0
+    # Glyph cores sit on AXIS_LABEL; fixed light measures ~110–126 px within 8.
+    LABEL_CORE_TOL = 8.0
+    label_mask = cheb <= LABEL_CORE_TOL
     n_label = int(np.count_nonzero(label_mask))
-    # Pure black (#000000) — the broken-default caption colour
+    # Pure black — VTK default caption colour when styling is missing.
+    # Far from AXIS_LABEL in both themes, and not background on light (on dark it
+    # is darker than the gradient). Theme-independent wrong-colour evidence.
     black_mask = np.max(flat, axis=1) <= 8.0
     n_black = int(np.count_nonzero(black_mask))
     print(
         f"AXIS_PIXELS theme={tag} label_match={n_label} pure_black={n_black} "
-        f"AXIS_LABEL={AXIS_LABEL}",
+        f"tol={LABEL_CORE_TOL:.0f} AXIS_LABEL={AXIS_LABEL}",
         flush=True,
     )
-    if n_label < 20:
+    # Floor: three bold glyphs → tens of core pixels (fixed ~100+); empty/wrong → 0.
+    if n_label < 40:
         print(
             f"AXIS_CONTRAST_FAIL theme={tag} reason=no_label_glyphs n_label={n_label}",
             flush=True,
         )
         return 1
 
+    # Intended colour must reach the FB: a large pure-black population with few
+    # AXIS_LABEL cores means captions rendered in the wrong colour. Applies in
+    # every theme (was dark-only; light black-on-light passed via AA scrap).
+    if n_black > n_label:
+        print(
+            f"AXIS_CONTRAST_FAIL theme={tag} reason=wrong_label_colour "
+            f"pure_black={n_black} > label_match={n_label}",
+            flush=True,
+        )
+        return 1
+
     fg = np.mean(flat[label_mask], axis=0)
-    # Local background: crop pixels that are neither labels nor saturated axis shafts
+    # Local background: crop pixels that are not label cores
     non_label = ~label_mask
     if int(np.count_nonzero(non_label)) < 50:
         print(f"AXIS_CONTRAST_FAIL theme={tag} reason=no_background_sample", flush=True)
@@ -237,13 +254,6 @@ def main() -> int:
         print(f"AXIS_CONTRAST_FAIL {ratio:.2f}", flush=True)
         return 1
     print(f"AXIS_CONTRAST_OK {ratio:.2f}", flush=True)
-    # Dark theme: captions must not be pure black (the pre-fix default)
-    if tag == "dark" and n_black > n_label:
-        print(
-            f"AXIS_CONTRAST_FAIL theme=dark pure_black={n_black} > label_match={n_label}",
-            flush=True,
-        )
-        return 1
     # Human look: describe measured facts only (no canned success prose)
     print(
         f"LOOK triad crop theme={tag}: label_pixels≈{n_label} mean_rgb={fg.astype(int).tolist()} "
