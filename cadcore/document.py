@@ -22,10 +22,12 @@ from cadcore.mesh import (
 )
 from cadcore.sketch import (
     CircleEntity,
+    DimKind,
     LineEntity,
     PlaneFrame,
     RectEntity,
     Sketch,
+    SketchDimension,
     SketchEntity,
     apply_entity_snapshot,
     offset_entity_data,
@@ -88,8 +90,28 @@ def is_boolean(t: FeatureType) -> bool:
     )
 
 
+def is_solid_feature(t: FeatureType) -> bool:
+    """True if the feature can produce a triangle mesh with faces to sketch on."""
+    return t in (
+        FeatureType.EXTRUDE,
+        FeatureType.REVOLVE,
+        FeatureType.FILLET,
+        FeatureType.POCKET,
+        FeatureType.BOX,
+        FeatureType.SPHERE,
+        FeatureType.CYLINDER,
+        FeatureType.BOOLEAN_UNION,
+        FeatureType.BOOLEAN_DIFFERENCE,
+        FeatureType.BOOLEAN_INTERSECTION,
+    )
+
+
 def plane_frame_for_feature(f: "Feature") -> PlaneFrame:
-    return PlaneFrame.from_plane_type(f.type.name)
+    if is_reference_plane(f.type):
+        return PlaneFrame.from_plane_type(f.type.name)
+    if f.sketch is not None:
+        return f.sketch.frame
+    return PlaneFrame.from_plane_type("PLANE_FRONT")
 
 
 from cadcore.profiles import (  # noqa: E402  — re-export after sketch imports
@@ -239,7 +261,9 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
             np.asarray(sk.frame.normal, dtype=np.float64).copy(),
         ),
         entities=[],
+        dimensions=[],
         _next_entity_id=sk._next_entity_id,
+        _next_dim_id=getattr(sk, "_next_dim_id", 1),
     )
     for e in sk.entities:
         if isinstance(e, LineEntity):
@@ -256,6 +280,16 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
                     id=e.id, kind=e.kind, center=tuple(e.center), radius=float(e.radius)  # type: ignore[arg-type]
                 )
             )
+    for d in getattr(sk, "dimensions", None) or []:
+        out.dimensions.append(
+            SketchDimension(
+                id=int(d.id),
+                kind=d.kind if isinstance(d.kind, DimKind) else DimKind.LINEAR,
+                entity_id=int(d.entity_id),
+                role=str(d.role),
+                value_mm=float(d.value_mm),
+            )
+        )
     return out
 
 
@@ -690,6 +724,7 @@ class Document:
             return False
         data = snapshot_entity(sk.entities[idx])
         sk.remove_entity(eid)
+        sk.remove_dimensions_for_entity(eid)
         self.push_command(EntityDeleteCommand(sketch_id, data, idx))
         return True
 
@@ -822,6 +857,79 @@ class Document:
         self.add_feature(f)
         self.record_feature_add(f)
         return f
+
+    def create_sketch_on_face(
+        self,
+        solid_id: int,
+        frame: PlaneFrame,
+    ) -> Optional[Feature]:
+        """Create a sketch whose UV plane sits on a solid face (``frame``).
+
+        ``plane_id`` / ``plane_feature_id`` record the parent solid so the tree
+        shows the relationship; geometry lives entirely in ``frame``.
+        """
+        solid = self.find(solid_id)
+        if solid is None or not is_solid_feature(solid.type):
+            return None
+        # Normalize frame axes
+        o = np.asarray(frame.origin, dtype=np.float64).reshape(3).copy()
+        u = np.asarray(frame.u_axis, dtype=np.float64).reshape(3).copy()
+        v = np.asarray(frame.v_axis, dtype=np.float64).reshape(3).copy()
+        n = np.asarray(frame.normal, dtype=np.float64).reshape(3).copy()
+        for vec, name in ((u, "u"), (v, "v"), (n, "n")):
+            ln = float(np.linalg.norm(vec))
+            if ln < 1e-12:
+                raise ValueError(f"degenerate face frame ({name}-axis)")
+            vec /= ln
+        # Re-orthogonalize
+        n = n / float(np.linalg.norm(n))
+        u = u - n * float(np.dot(u, n))
+        lu = float(np.linalg.norm(u))
+        if lu < 1e-12:
+            raise ValueError("degenerate face frame (u in normal)")
+        u = u / lu
+        v = np.cross(n, u)
+        v = v / float(np.linalg.norm(v))
+        fr = PlaneFrame(o, u, v, n)
+        self._sketch_count += 1
+        sketch = Sketch(
+            name=f"Sketch{self._sketch_count}",
+            plane_feature_id=solid_id,
+            frame=fr,
+        )
+        f = Feature(
+            type=FeatureType.SKETCH,
+            name=sketch.name,
+            plane_id=solid_id,
+            sketch=sketch,
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def apply_sketch_dimension(
+        self,
+        sketch_id: int,
+        entity_id: int,
+        role: str,
+        value_mm: float,
+    ) -> Optional[SketchDimension]:
+        """Create/update a driving dimension and apply it to geometry (undoable)."""
+        from cadcore.sketch import apply_dimension_value, measure_dimension_value
+
+        sk = _sketch_of(self, sketch_id)
+        ent = _entity_of(self, sketch_id, entity_id)
+        before = snapshot_entity(ent)
+        apply_dimension_value(ent, role, value_mm)
+        after = snapshot_entity(ent)
+        # Store dimension at applied value (geometry is source of truth after apply)
+        try:
+            measured = measure_dimension_value(ent, role)
+        except ValueError:
+            measured = float(value_mm)
+        dim = sk.add_or_update_dimension(entity_id, role, measured)
+        self.push_command(EntityMoveCommand(sketch_id, before, after))
+        return dim
 
     def create_extrude(
         self,

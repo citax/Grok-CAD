@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -41,15 +41,29 @@ from app.theme import (
     VP_BG_TOP,
 )
 from app.workers import GeometryRebuildJob, snapshot_features
-from cadcore.document import Document, FeatureType, is_reference_plane
+from cadcore.document import Document, FeatureType, is_reference_plane, is_solid_feature
+from cadcore.faces import plane_frame_from_face
+from cadcore.scale import (
+    axis_length_mm,
+    characteristic_length_from_bounds,
+    characteristic_length_from_points,
+    origin_glyph_sizes,
+    plane_half_mm,
+    sketch_entity_uv_extent,
+    sketch_grid_params,
+    sketch_parallel_scale,
+)
 from cadcore.sketch import (
     CircleEntity,
     LineEntity,
+    PlaneFrame,
     RectEntity,
     Sketch,
     SketchEntity,
     Vec2,
+    dimension_anchor_uv,
     line_length,
+    measure_dimension_value,
     snapshot_entity,
 )
 from cadcore.units import format_length
@@ -59,7 +73,8 @@ PLANE_COLORS = {
     FeatureType.PLANE_TOP: PLANE_TOP,
     FeatureType.PLANE_RIGHT: PLANE_RIGHT,
 }
-PLANE_HALF = 2.5
+# Default reference-plane half-extent (mm); scaled up for large parts.
+PLANE_HALF = 25.0
 
 
 def _hex_to_rgb01(hex_color: str) -> tuple:
@@ -240,9 +255,9 @@ def _dashed_polyline_polydata(
     return pv.PolyData(points, lines=lines)
 
 
-# Origin glyph size (world units / mm)
-ORIGIN_CROSS_HALF = 0.14
-ORIGIN_RING_R = 0.09
+# Origin glyph size defaults (world units / mm) — scaled with scene
+ORIGIN_CROSS_HALF = 1.4
+ORIGIN_RING_R = 0.9
 ORIGIN_RING_N = 36
 
 
@@ -362,6 +377,8 @@ class Viewport(QWidget):
     sketch_exited = Signal()
     sketch_status = Signal(str)
     renderer_info = Signal(str)
+    # Smart Dimension: entity_id, role ("length"|"width"|"height"|"diameter")
+    dimension_requested = Signal(int, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -371,6 +388,8 @@ class Viewport(QWidget):
         self.gl_renderer = ""
         self._planes_built = False
         self._solid_fps: Dict[int, str] = {}
+        # Cache triangle meshes for face picking (fid → (verts, faces))
+        self._solid_mesh_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         self._job_gen = 0
         self._pool = QThreadPool.globalInstance()
         self._pool.setMaxThreadCount(max(1, min(2, self._pool.maxThreadCount())))
@@ -384,6 +403,16 @@ class Viewport(QWidget):
         self._sk_overlay = None  # optional 2nd-layer VTK renderer for sketch strokes
         self._overlay_actors: Dict[str, object] = {}  # name → vtkActor on overlay layer
         self._filter: Optional[_InteractorFilter] = None
+        # Scene scale (mm) — drives world axes / origin / reference planes
+        self._char_mm: float = 50.0
+        self._plane_half: float = PLANE_HALF
+        self._axis_len: float = axis_length_mm(self._char_mm)
+        self._grid_half: float = 50.0
+        self._grid_step: float = 5.0
+        # Last planar face pick for sketch-on-face (solid_id + PlaneFrame)
+        self._face_pick_solid_id: int = -1
+        self._face_pick_frame: Optional[PlaneFrame] = None
+        self._face_pick_point: Optional[np.ndarray] = None
 
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
@@ -517,29 +546,7 @@ class Viewport(QWidget):
     def _setup_helpers(self) -> None:
         assert self.plotter is not None
         # No environment bounds box — keeps the scene uncluttered.
-        # Flat crosshair + ring origin glyph (not a single GL point, not a sphere)
-        self.plotter.add_mesh(
-            _origin_glyph_polydata(),
-            color=TEXT_PRIMARY,
-            line_width=2.0,
-            name="__origin",
-            pickable=False,
-        )
-        # Neutral, faint world axes (not loud RGB) — low-opacity grey lines
-        axis_color = GRID_COLOR
-        for end, name in (
-            ((2.4, 0, 0), "__ax"),
-            ((0, 2.4, 0), "__ay"),
-            ((0, 0, 2.4), "__az"),
-        ):
-            self.plotter.add_mesh(
-                pv.Line((0, 0, 0), end),
-                color=axis_color,
-                line_width=1.5,
-                name=name,
-                pickable=False,
-                opacity=0.35,
-            )
+        self._refresh_world_helpers(force=True)
         # Corner orientation triad — RGB axes + high-contrast caption labels.
         # PyVista 0.48 add_axes() has no label_color kwarg — set caption colours
         # on the vtkAxesActor after creation (do not swallow API errors).
@@ -558,6 +565,116 @@ class Viewport(QWidget):
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
             raise
+
+    def _compute_char_mm(self) -> float:
+        """Characteristic scene length (mm) from solids + sketches + default."""
+        pts: list = []
+        for verts, _faces in self._solid_mesh_cache.values():
+            if verts is not None and len(verts):
+                pts.extend(np.asarray(verts, float).reshape(-1, 3))
+        if self._doc is not None:
+            for f in self._doc.features:
+                if f.type is FeatureType.SKETCH and f.sketch is not None:
+                    fr = f.sketch.frame
+                    for e in f.sketch.entities:
+                        if isinstance(e, LineEntity):
+                            pts.append(fr.to_world(e.p0))
+                            pts.append(fr.to_world(e.p1))
+                        elif isinstance(e, RectEntity):
+                            for c in e.corners():
+                                pts.append(fr.to_world(c))
+                        elif isinstance(e, CircleEntity):
+                            pts.append(fr.to_world(e.center))
+                            pts.append(
+                                fr.to_world(
+                                    (e.center[0] + e.radius, e.center[1])
+                                )
+                            )
+        if pts:
+            return characteristic_length_from_points(pts, default=50.0)
+        return 50.0
+
+    def _refresh_world_helpers(self, *, force: bool = False) -> None:
+        """Rebuild origin glyph + world XYZ axes sized for the current scene."""
+        if not self.plotter:
+            return
+        char = self._compute_char_mm()
+        new_half = plane_half_mm(char)
+        new_axis = axis_length_mm(char)
+        if (
+            not force
+            and abs(char - self._char_mm) / max(self._char_mm, 1.0) < 0.08
+            and abs(new_axis - self._axis_len) / max(self._axis_len, 1.0) < 0.08
+        ):
+            return
+        self._char_mm = char
+        self._axis_len = new_axis
+        prev_plane = self._plane_half
+        self._plane_half = new_half
+        oh, rr = origin_glyph_sizes(char)
+        self._remove_actor("__origin")
+        self.plotter.add_mesh(
+            _origin_glyph_polydata(half=oh, ring_r=rr),
+            color=TEXT_PRIMARY,
+            line_width=2.0,
+            name="__origin",
+            pickable=False,
+            render=False,
+        )
+        axis_color = GRID_COLOR
+        L = float(self._axis_len)
+        for end, name in (
+            ((L, 0, 0), "__ax"),
+            ((0, L, 0), "__ay"),
+            ((0, 0, L), "__az"),
+        ):
+            self._remove_actor(name)
+            self.plotter.add_mesh(
+                pv.Line((0, 0, 0), end),
+                color=axis_color,
+                line_width=1.5,
+                name=name,
+                pickable=False,
+                opacity=0.45,
+                render=False,
+            )
+        # Rebuild reference planes when half-extent changes materially
+        if force or abs(prev_plane - self._plane_half) / max(prev_plane, 1.0) > 0.08:
+            self._rebuild_reference_planes()
+        # Keep sketch-mode visibility rules
+        if self.in_sketch_mode:
+            self._set_sketch_2d_chrome(True)
+
+    def _rebuild_reference_planes(self) -> None:
+        if not self.plotter or self._doc is None:
+            return
+        half = float(self._plane_half)
+        for f in self._doc.features:
+            if not is_reference_plane(f.type):
+                continue
+            color = PLANE_COLORS[f.type]
+            for prefix in ("plane_", "edge_"):
+                self._remove_actor(f"{prefix}{f.id}")
+            self.plotter.add_mesh(
+                _plane_surface(f.type, half=half),
+                color=color,
+                opacity=0.32,
+                name=f"plane_{f.id}",
+                pickable=True,
+                smooth_shading=False,
+                show_edges=False,
+                render=False,
+            )
+            self.plotter.add_mesh(
+                _plane_border(f.type, half=half),
+                color=color,
+                line_width=2,
+                name=f"edge_{f.id}",
+                pickable=False,
+                render=False,
+            )
+        self._planes_built = True
+        self._restyle_selection_only()
 
     @staticmethod
     def _style_axes_captions(actor) -> None:
@@ -865,7 +982,13 @@ class Viewport(QWidget):
         for fid in set(self._solid_fps) - wanted:
             self._remove_actor(f"solid_{fid}")
             self._solid_fps.pop(fid, None)
+            self._solid_mesh_cache.pop(fid, None)
         for fid, (verts, faces, fp) in results.items():
+            # Always keep full-res mesh for face picking / scale (even if actor reused)
+            self._solid_mesh_cache[fid] = (
+                np.asarray(verts, dtype=np.float64),
+                np.asarray(faces, dtype=np.int32),
+            )
             if self._solid_fps.get(fid) == fp:
                 continue
             self._remove_actor(f"solid_{fid}")
@@ -880,6 +1003,7 @@ class Viewport(QWidget):
                 smooth_shading=False, show_edges=False, render=False,
             )
             self._solid_fps[fid] = fp
+        self._refresh_world_helpers()
         self._restyle_selection_only()
         self._request_render()
 
@@ -898,20 +1022,7 @@ class Viewport(QWidget):
                         except Exception:
                             pass
             return
-        for f in self._doc.features:
-            if not is_reference_plane(f.type):
-                continue
-            color = PLANE_COLORS[f.type]
-            self.plotter.add_mesh(
-                _plane_surface(f.type), color=color, opacity=0.32, name=f"plane_{f.id}",
-                pickable=True, smooth_shading=False, show_edges=False, render=False,
-            )
-            self.plotter.add_mesh(
-                _plane_border(f.type), color=color, line_width=2, name=f"edge_{f.id}",
-                pickable=False, render=False,
-            )
-        self._planes_built = True
-        self._restyle_selection_only()
+        self._rebuild_reference_planes()
         self._request_render()
 
     def _request_render(self) -> None:
@@ -1048,7 +1159,7 @@ class Viewport(QWidget):
                 prop.SetColor(*(sel_rgb if selected else (0.60, 0.64, 0.68)))
 
     # ----- sketch mode -----
-    def _set_parallel_projection(self, enabled: bool) -> None:
+    def _set_parallel_projection(self, enabled: bool, *, parallel_scale: Optional[float] = None) -> None:
         """Toggle orthographic (parallel) camera — true 2D sketch look."""
         if not self.plotter:
             return
@@ -1056,8 +1167,8 @@ class Viewport(QWidget):
             cam = self.plotter.camera
             cam.SetParallelProjection(1 if enabled else 0)
             if enabled:
-                # Scale so the sketch plane fills a comfortable orthographic window
-                cam.SetParallelScale(3.2)
+                scale = float(parallel_scale) if parallel_scale is not None else 40.0
+                cam.SetParallelScale(max(1.0, scale))
         except Exception:
             try:
                 self.plotter.enable_parallel_projection() if enabled else self.plotter.disable_parallel_projection()
@@ -1174,14 +1285,16 @@ class Viewport(QWidget):
 
         # Orient camera normal to plane + orthographic projection (true 2D sketch)
         fr = f.sketch.frame
-        dist = 10.0
+        ent_ext = sketch_entity_uv_extent(f.sketch.entities)
+        p_scale = sketch_parallel_scale(ent_ext, default=max(40.0, self._char_mm * 0.6))
+        dist = max(p_scale * 3.0, self._axis_len * 2.0, 50.0)
         pos = fr.origin + fr.normal * dist
         self.plotter.camera_position = [
             tuple(pos),
             tuple(fr.origin),
             tuple(fr.v_axis),
         ]
-        self._set_parallel_projection(True)
+        self._set_parallel_projection(True, parallel_scale=p_scale)
         self._set_sketch_2d_chrome(True)
         self._ensure_sketch_overlay_layer()
 
@@ -1202,7 +1315,7 @@ class Viewport(QWidget):
         self._restyle_selection_only()
         self._request_render()
         plane = self._doc.find(f.plane_id)
-        pname = plane.name if plane else "Plane"
+        pname = plane.name if plane else "face"
         self.sketch_status.emit(f"Editing {f.name} on {pname} (2D)")
 
     def exit_sketch(self) -> None:
@@ -1348,8 +1461,8 @@ class Viewport(QWidget):
             return
         wpp = self._world_units_per_pixel()
         point_tol = max(1e-9, SNAP_POINT_PX * wpp)
-        # Grid stays fixed in world (sketch units); only point snap is pixel-based
-        self._sketch_ctrl.set_snap_world_tol(point_tol)
+        # Grid step matches the drawn sketch grid (world mm)
+        self._sketch_ctrl.set_snap_world_tol(point_tol, grid=self._grid_step)
 
     def sketch_cancel(self) -> None:
         """Back-compat alias for Esc first stage only (cancel draw)."""
@@ -1381,22 +1494,27 @@ class Viewport(QWidget):
             pass
 
     def _draw_sketch_overlay(self) -> None:
-        """Sketch grid + local H/V axes on the plane."""
+        """Sketch grid + local H/V axes on the plane (scale with view + geometry)."""
         if not self.plotter or self._sketch_ctrl is None:
             return
         fr = self._sketch_ctrl.sketch.frame
-        # Grid lines in UV
-        half = 3.0
-        step = 0.5
+        # View half-height (orthographic parallel scale) drives grid density
+        try:
+            view_half = float(self.plotter.camera.GetParallelScale())
+        except Exception:
+            view_half = max(40.0, self._char_mm * 0.6)
+        ent_ext = sketch_entity_uv_extent(self._sketch_ctrl.sketch.entities)
+        half, step = sketch_grid_params(view_half, entity_extent_mm=ent_ext)
+        self._grid_half = half
+        self._grid_step = step
+        self._update_snap_tolerance()
         pts_u = []
         pts_v = []
         g = np.arange(-half, half + 1e-9, step)
         for t in g:
-            # lines of constant u
             a = fr.to_world((t, -half))
             b = fr.to_world((t, half))
             pts_u.extend([a, b])
-            # constant v
             c = fr.to_world((-half, t))
             d = fr.to_world((half, t))
             pts_v.extend([c, d])
@@ -1416,6 +1534,7 @@ class Viewport(QWidget):
             grid, color=SKETCH_GRID, line_width=1, name="__sk_grid", pickable=False, render=False
         )
         # H axis (u) and V axis (v) through origin — coplanar with user strokes
+        # Axis length matches grid half so orientation reads at the working scale.
         self._remove_actor("__sk_h")
         self._remove_actor("__sk_v")
         self.plotter.add_mesh(
@@ -1698,6 +1817,16 @@ class Viewport(QWidget):
             for name in list(self.plotter.actors.keys()):
                 if name.startswith("sk_e_"):
                     self._remove_actor(name)
+        # Grow orthographic window + grid when geometry outruns the current view
+        try:
+            ent_ext = sketch_entity_uv_extent(self._sketch_ctrl.sketch.entities)
+            need = sketch_parallel_scale(ent_ext, default=max(40.0, self._char_mm * 0.6))
+            cam = self.plotter.camera
+            if bool(cam.GetParallelProjection()) and float(cam.GetParallelScale()) < need * 0.95:
+                cam.SetParallelScale(need)
+        except Exception:
+            pass
+        self._draw_sketch_overlay()
         for ent in self._sketch_ctrl.sketch.entities:
             self._upsert_entity_actor(ent)
         self._update_handles_visual()
@@ -1732,7 +1861,7 @@ class Viewport(QWidget):
         )
 
     def _update_dim_labels(self) -> None:
-        """Length label only for the selected (or hovered) line — reduces clutter."""
+        """Show driving dimensions always; also ephemeral labels on selected lines."""
         if not self.plotter or self._sketch_ctrl is None or self._doc is None:
             return
         for name in list(getattr(self, "_dim_label_names", set()) or set()):
@@ -1742,15 +1871,37 @@ class Viewport(QWidget):
         unit = self._doc.display_unit
         fr = self._sketch_ctrl.sketch.frame
         ctrl = self._sketch_ctrl
+        sk = ctrl.sketch
+        points = []
+        labels = []
+        seen: Set[Tuple[int, str]] = set()
+        # 1) Driving dimensions (persist, drive geometry)
+        for dim in getattr(sk, "dimensions", None) or []:
+            ent = sk.find_entity(dim.entity_id)
+            if ent is None:
+                continue
+            key = (int(dim.entity_id), str(dim.role))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                val = measure_dimension_value(ent, dim.role)
+            except ValueError:
+                val = float(dim.value_mm)
+            # Keep stored value in sync if user dragged handles
+            dim.value_mm = float(val)
+            anchor = dimension_anchor_uv(ent, dim.role)
+            points.append(fr.to_world(anchor))
+            prefix = "⌀" if dim.role == "diameter" else ""
+            labels.append(prefix + format_length(val, unit))
+        # 2) Ephemeral selected/hovered line lengths (when no driving dim yet)
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
-        points = []
-        labels = []
-        for ent in ctrl.sketch.entities:
-            if not isinstance(ent, LineEntity):
+        for ent in sk.entities:
+            if not isinstance(ent, LineEntity) or ent.id not in show_ids:
                 continue
-            if ent.id not in show_ids:
+            if (ent.id, "length") in seen:
                 continue
             mid = ent.midpoint()
             points.append(fr.to_world(mid))
@@ -1776,17 +1927,33 @@ class Viewport(QWidget):
             print(f"[viewport] dim labels: {exc}", file=sys.stderr)
 
     def dim_label_texts(self) -> list:
-        """Label strings currently shown (selected/hovered lines only)."""
+        """Label strings currently shown (driving dims + selected lines)."""
         if self._sketch_ctrl is None or self._doc is None:
             return []
         unit = self._doc.display_unit
         ctrl = self._sketch_ctrl
+        sk = ctrl.sketch
+        out = []
+        seen: Set[Tuple[int, str]] = set()
+        for dim in getattr(sk, "dimensions", None) or []:
+            ent = sk.find_entity(dim.entity_id)
+            if ent is None:
+                continue
+            key = (int(dim.entity_id), str(dim.role))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                val = measure_dimension_value(ent, dim.role)
+            except ValueError:
+                val = float(dim.value_mm)
+            prefix = "⌀" if dim.role == "diameter" else ""
+            out.append(prefix + format_length(val, unit))
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
-        out = []
-        for ent in ctrl.sketch.entities:
-            if isinstance(ent, LineEntity) and ent.id in show_ids:
+        for ent in sk.entities:
+            if isinstance(ent, LineEntity) and ent.id in show_ids and (ent.id, "length") not in seen:
                 out.append(format_length(line_length(ent), unit))
         return out
 
@@ -1796,9 +1963,12 @@ class Viewport(QWidget):
             return []
         ctrl = self._sketch_ctrl
         ids = []
+        for dim in getattr(ctrl.sketch, "dimensions", None) or []:
+            if dim.entity_id not in ids and ctrl.sketch.find_entity(dim.entity_id):
+                ids.append(dim.entity_id)
         for eid in ctrl.selected_ids:
             ent = ctrl.sketch.find_entity(eid)
-            if isinstance(ent, LineEntity):
+            if isinstance(ent, LineEntity) and eid not in ids:
                 ids.append(eid)
         if ctrl.hover_handle is not None:
             hid = ctrl.hover_handle.entity_id
@@ -1807,6 +1977,18 @@ class Viewport(QWidget):
                 if isinstance(ent, LineEntity):
                     ids.append(hid)
         return ids
+
+    def face_pick_frame(self) -> Optional[PlaneFrame]:
+        """Last solid-face PlaneFrame from a viewport pick, if any."""
+        return self._face_pick_frame
+
+    def face_pick_solid_id(self) -> int:
+        return int(self._face_pick_solid_id)
+
+    def clear_face_pick(self) -> None:
+        self._face_pick_solid_id = -1
+        self._face_pick_frame = None
+        self._face_pick_point = None
 
     def _upsert_entity_actor(self, ent: SketchEntity) -> None:
         if not self.plotter or self._sketch_ctrl is None:
@@ -2086,6 +2268,22 @@ class Viewport(QWidget):
             uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
         )
         sk = self._sketch_ctrl.sketch
+        if msg and msg.startswith("DimPick:"):
+            # DimPick:<entity_id>:<role>
+            parts = msg.split(":")
+            if len(parts) >= 3:
+                try:
+                    eid = int(parts[1])
+                    role = parts[2]
+                    self.dimension_requested.emit(eid, role)
+                    self.sketch_status.emit(f"Dimension on entity {eid} ({role})")
+                except ValueError:
+                    pass
+            self._request_render()
+            return
+        if msg == "DimPickMiss":
+            self.sketch_status.emit("Smart Dimension: click a line, rectangle, or circle")
+            return
         if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
             if len(sk.entities) > n_before:
                 ent = sk.entities[-1]
@@ -2236,7 +2434,7 @@ class Viewport(QWidget):
                 continue
         if fid < 0:
             c = np.asarray(mesh.center)
-            h = PLANE_HALF + 0.25
+            h = float(self._plane_half) + 0.25
             for f in self._doc.features:
                 if not is_reference_plane(f.type) or not f.visible:
                     continue
@@ -2249,18 +2447,96 @@ class Viewport(QWidget):
                 if f.type is FeatureType.PLANE_RIGHT and abs(c[0]) < 0.25 and abs(c[1]) <= h and abs(c[2]) <= h:
                     fid = f.id
                     break
-        if fid >= 0:
-            self._selected_id = fid
-            self._restyle_selection_only()
-            self._request_render()
-            self.feature_picked.emit(fid)
+        if fid < 0:
+            return
+        self._selected_id = fid
+        # Capture planar face under the pick for sketch-on-face
+        self._capture_face_pick(fid, mesh)
+        self._restyle_selection_only()
+        self._request_render()
+        self.feature_picked.emit(fid)
+
+    def _capture_face_pick(self, fid: int, mesh) -> None:  # noqa: ANN001
+        """If ``fid`` is a solid, resolve the planar face under the pick point."""
+        self._face_pick_solid_id = -1
+        self._face_pick_frame = None
+        self._face_pick_point = None
+        if self._doc is None:
+            return
+        f = self._doc.find(fid)
+        if f is None or not is_solid_feature(f.type):
+            return
+        cache = self._solid_mesh_cache.get(fid)
+        if cache is None:
+            return
+        verts, faces = cache
+        # Prefer PyVista's last picked world point; fall back to mesh center
+        pick_pt = None
+        try:
+            pp = getattr(self.plotter, "picked_point", None)
+            if pp is not None:
+                pick_pt = np.asarray(pp, dtype=np.float64).reshape(3)
+        except Exception:
+            pick_pt = None
+        if pick_pt is None:
+            try:
+                pick_pt = np.asarray(mesh.center, dtype=np.float64).reshape(3)
+            except Exception:
+                pick_pt = verts.mean(axis=0)
+        cell_id = None
+        try:
+            cells = getattr(self.plotter, "picked_cells", None)
+            if cells is not None and getattr(cells, "n_cells", 0):
+                # First cell id if available
+                cell_id = 0
+        except Exception:
+            cell_id = None
+        try:
+            frame = plane_frame_from_face(verts, faces, pick_pt, cell_id=cell_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] face pick: {exc}", file=sys.stderr)
+            return
+        self._face_pick_solid_id = int(fid)
+        self._face_pick_frame = frame
+        self._face_pick_point = pick_pt.copy()
+        self.status_message.emit(
+            f"Face on {f.name} · n=({frame.normal[0]:.2f},{frame.normal[1]:.2f},{frame.normal[2]:.2f})"
+        )
+
+    def set_face_pick_from_mesh(
+        self,
+        solid_id: int,
+        pick_point: Sequence[float],
+        *,
+        cell_id: Optional[int] = None,
+    ) -> Optional[PlaneFrame]:
+        """Programmatic face pick (tests / verification) using the real face path."""
+        cache = self._solid_mesh_cache.get(int(solid_id))
+        if cache is None and self._doc is not None:
+            # Evaluate solid if not cached yet
+            mesh = self._doc.evaluate_feature(int(solid_id))
+            if mesh is not None and not mesh.empty:
+                self._solid_mesh_cache[int(solid_id)] = (
+                    mesh.vertices.copy(),
+                    mesh.faces.copy(),
+                )
+                cache = self._solid_mesh_cache[int(solid_id)]
+        if cache is None:
+            return None
+        verts, faces = cache
+        frame = plane_frame_from_face(verts, faces, pick_point, cell_id=cell_id)
+        self._face_pick_solid_id = int(solid_id)
+        self._face_pick_frame = frame
+        self._face_pick_point = np.asarray(pick_point, dtype=np.float64).reshape(3)
+        self._selected_id = int(solid_id)
+        return frame
 
     def set_view(self, name: str) -> None:
         if not self.plotter or self.in_sketch_mode:
             if self.in_sketch_mode:
                 self.status_message.emit("Exit sketch to change standard views")
             return
-        dist = 11.0
+        dist = max(11.0, self._axis_len * 4.0, self._char_mm * 1.2)
         focus = (0.0, 0.0, 0.0)
         up = (0.0, 1.0, 0.0)
         if name == "front":

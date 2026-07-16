@@ -39,6 +39,7 @@ class SketchTool(Enum):
     LINE = auto()
     RECTANGLE = auto()
     CIRCLE = auto()
+    DIMENSION = auto()  # Smart Dimension — click entity, value drives geometry
 
 
 @dataclass
@@ -178,7 +179,8 @@ class SketchController:
         self.drag = None
         self.box_select = None
         self.preview_uv = None
-        if tool != SketchTool.SELECT:
+        # Dimension keeps selection context; other draw tools clear it
+        if tool not in (SketchTool.SELECT, SketchTool.DIMENSION):
             self.selected_ids.clear()
             self.hover_handle = None
 
@@ -421,6 +423,21 @@ class SketchController:
         shift: bool = False,
         ctrl: bool = False,
     ) -> Optional[str]:
+        if self.tool == SketchTool.DIMENSION:
+            # Smart Dimension: pick entity (body or handle), role from click location
+            from cadcore.sketch import infer_dimension_role
+
+            h = self.pick_handle(raw_uv)
+            eid = h.entity_id if h is not None else self.pick_entity_body(raw_uv)
+            if eid is None:
+                return "DimPickMiss"
+            ent = self.sketch.find_entity(eid)
+            if ent is None:
+                return "DimPickMiss"
+            self.selected_entity_id = eid
+            role = infer_dimension_role(ent, uv_hint=raw_uv)
+            return f"DimPick:{eid}:{role}"
+
         if self.tool == SketchTool.SELECT:
             h = self.pick_handle(raw_uv)
             if h is not None:

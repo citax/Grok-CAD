@@ -46,6 +46,7 @@ from cadcore.document import (
     first_closed_profile,
     is_closed_profile,
     is_reference_plane,
+    is_solid_feature,
     resolve_profiles,
 )
 from cadcore.mesh import write_stl_binary
@@ -54,7 +55,12 @@ from cadcore.sketch import (
     CircleEntity,
     LineEntity,
     RectEntity,
+    apply_dimension_value,
     line_length,
+    make_line_horizontal,
+    make_line_vertical,
+    make_lines_equal_length,
+    measure_dimension_value,
     set_line_length,
     snapshot_entity,
 )
@@ -89,6 +95,7 @@ class MainWindow(QMainWindow):
         self.viewport.sketch_exited.connect(self._on_sketch_exited)
         self.viewport.sketch_status.connect(self._on_status)
         self.viewport.renderer_info.connect(self._on_renderer_info)
+        self.viewport.dimension_requested.connect(self._on_dimension_requested)
         if getattr(self.viewport, "gl_renderer", ""):
             self._on_renderer_info(self.viewport.gl_renderer)
 
@@ -335,7 +342,9 @@ class MainWindow(QMainWindow):
         self.act_sketch = QAction(
             fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self
         )
-        self.act_sketch.setToolTip("Create or edit a sketch on the selected plane (S)")
+        self.act_sketch.setToolTip(
+            "Sketch on the selected reference plane or solid face (S)"
+        )
         self.act_sketch.setShortcut(QKeySequence("S"))
         self.act_sketch.triggered.connect(self._enter_sketch)
 
@@ -398,15 +407,41 @@ class MainWindow(QMainWindow):
             (SketchTool.LINE, "Line", "fa5s.minus", "Draw a line"),
             (SketchTool.RECTANGLE, "Rectangle", "fa5s.vector-square", "Draw a rectangle"),
             (SketchTool.CIRCLE, "Circle", "fa5s.circle", "Draw a circle"),
+            (
+                SketchTool.DIMENSION,
+                "Smart Dim",
+                "fa5s.ruler-combined",
+                "Driving dimension — click entity, type size (D)",
+            ),
         )
         for tool, label, icon_name, tip in tool_defs:
             act = QAction(fa_icon(icon_name), label, self)
             act.setToolTip(tip)
             act.setCheckable(True)
+            if tool is SketchTool.DIMENSION:
+                act.setShortcut(QKeySequence("D"))
             act.triggered.connect(lambda checked=False, t=tool: self._on_sketch_tool(t))
             group.addAction(act)
             self._sketch_tool_actions[tool] = act
             sk_row.addWidget(self._ribbon_button(act))
+        # H / V / Equal — constraints that earn their place next to dimensions
+        self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horizontal", self)
+        self.act_horiz.setToolTip("Make selected line(s) horizontal")
+        self.act_horiz.setShortcut(QKeySequence("H"))
+        self.act_horiz.triggered.connect(self._make_horizontal)
+        sk_row.addWidget(self._ribbon_button(self.act_horiz))
+        self.act_vert = QAction(fa_icon("fa5s.arrows-alt-v"), "Vertical", self)
+        self.act_vert.setToolTip("Make selected line(s) vertical")
+        self.act_vert.setShortcut(QKeySequence("V"))
+        self.act_vert.triggered.connect(self._make_vertical)
+        sk_row.addWidget(self._ribbon_button(self.act_vert))
+        self.act_equal = QAction(fa_icon("fa5s.equals"), "Equal", self)
+        self.act_equal.setToolTip(
+            "Make selected lines equal length (first is source)"
+        )
+        self.act_equal.setShortcut(QKeySequence("="))
+        self.act_equal.triggered.connect(self._make_equal)
+        sk_row.addWidget(self._ribbon_button(self.act_equal))
         self.act_exit_sketch = QAction(
             fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit Sketch", self
         )
@@ -438,8 +473,9 @@ class MainWindow(QMainWindow):
     def _set_sketch_ribbon_enabled(self, on: bool) -> None:
         for act in self._sketch_tool_actions.values():
             act.setEnabled(on)
-        if hasattr(self, "act_exit_sketch"):
-            self.act_exit_sketch.setEnabled(on)
+        for name in ("act_exit_sketch", "act_horiz", "act_vert", "act_equal"):
+            if hasattr(self, name):
+                getattr(self, name).setEnabled(on)
         if on and hasattr(self, "cmd_tabs"):
             self.cmd_tabs.setCurrentIndex(self._sketch_tab_index)
 
@@ -518,6 +554,7 @@ class MainWindow(QMainWindow):
                 SketchTool.LINE: "fa5s.minus",
                 SketchTool.RECTANGLE: "fa5s.vector-square",
                 SketchTool.CIRCLE: "fa5s.circle",
+                SketchTool.DIMENSION: "fa5s.ruler-combined",
             }[t]
             col = "#ffffff" if a.isChecked() else TEXT_PRIMARY
             a.setIcon(fa_icon(name, color=col))
@@ -652,13 +689,41 @@ class MainWindow(QMainWindow):
             self._sync_sketch_tool_ui(SketchTool.LINE)
             self.statusBar().showMessage(f"Editing {f.name}")
             return
+        # Solid face: pick a face then Sketch
+        if f is not None and is_solid_feature(f.type):
+            frame = self.viewport.face_pick_frame()
+            sid = self.viewport.face_pick_solid_id()
+            if frame is None or sid != f.id:
+                QMessageBox.information(
+                    self,
+                    "Sketch on Face",
+                    "Click a face of the solid first (so the face highlights), "
+                    "then click Sketch.\n\n"
+                    "The sketch will sit on that face and extrude along its normal.",
+                )
+                self.statusBar().showMessage(
+                    "Click a solid face, then Sketch", 4000
+                )
+                return
+            skf = self.doc.create_sketch_on_face(f.id, frame)
+            if skf is None or skf.sketch is None:
+                return
+            self._refresh_tree()
+            self._sync_selection(skf.id)
+            self.viewport.enter_sketch(skf.id)
+            self._set_sketch_ribbon_enabled(True)
+            self._sync_sketch_tool_ui(SketchTool.LINE)
+            self.statusBar().showMessage(f"Editing {skf.name} on face of {f.name}")
+            return
         if f is None or not is_reference_plane(f.type):
             QMessageBox.information(
                 self,
                 "Sketch",
-                "Select a reference plane first, then click Sketch.",
+                "Select a reference plane or a solid face, then click Sketch.",
             )
-            self.statusBar().showMessage("Select a reference plane to start a sketch", 4000)
+            self.statusBar().showMessage(
+                "Select a plane or solid face to start a sketch", 4000
+            )
             return
         skf = self.doc.create_sketch_on_plane(f.id)
         if skf is None or skf.sketch is None:
@@ -1355,7 +1420,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Units: {unit.label}", 2000)
 
     def _set_line_length(self) -> None:
-        """Dialog: set selected line length in current display unit (undoable)."""
+        """Dialog: set selected line length as a driving dimension (undoable)."""
         if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
             QMessageBox.information(
                 self, "Set Length", "Enter sketch mode and select a line first."
@@ -1371,13 +1436,34 @@ class MainWindow(QMainWindow):
         if not isinstance(ent, LineEntity):
             QMessageBox.information(self, "Set Length", "Select a line entity first.")
             return
+        self._on_dimension_requested(ent.id, "length")
+
+    def _on_dimension_requested(self, entity_id: int, role: str) -> None:
+        """Smart Dimension / Set Length: typed value drives geometry + persists."""
+        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            return
+        sid = self.viewport._sketch_feature_id
+        sk = self.viewport._sketch_ctrl.sketch
+        ent = sk.find_entity(int(entity_id))
+        if ent is None:
+            return
         unit = self.doc.display_unit
-        cur_mm = line_length(ent)
+        try:
+            cur_mm = measure_dimension_value(ent, role)
+        except ValueError:
+            self.statusBar().showMessage(f"Cannot dimension {role} on that entity", 3000)
+            return
         cur_disp = from_mm(cur_mm, unit)
+        role_label = {
+            "length": "Length",
+            "width": "Width",
+            "height": "Height",
+            "diameter": "Diameter",
+        }.get(role, role.title())
         val, ok = QInputDialog.getDouble(
             self,
-            "Set Line Length",
-            f"Length ({unit.label}):",
+            "Smart Dimension",
+            f"{role_label} ({unit.label}):",
             cur_disp,
             1e-6,
             1e9,
@@ -1385,13 +1471,85 @@ class MainWindow(QMainWindow):
         )
         if not ok:
             return
-        before = snapshot_entity(ent)
-        set_line_length(ent, to_mm(val, unit), free_end="p1")
-        after = snapshot_entity(ent)
-        self.doc.record_entity_move(self.viewport._sketch_feature_id, before, after)
+        mm = to_mm(val, unit)
+        dim = self.doc.apply_sketch_dimension(sid, int(entity_id), role, mm)
+        self.viewport.sync_sketch_visuals()
+        shown = format_length(measure_dimension_value(ent, role), unit)
+        self.statusBar().showMessage(
+            f"{role_label} → {shown}" + (f"  (dim #{dim.id})" if dim else ""),
+            3000,
+        )
+
+    def _make_horizontal(self) -> None:
+        self._apply_line_constraint("horizontal")
+
+    def _make_vertical(self) -> None:
+        self._apply_line_constraint("vertical")
+
+    def _apply_line_constraint(self, kind: str) -> None:
+        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            return
+        ctrl = self.viewport._sketch_ctrl
+        sid = self.viewport._sketch_feature_id
+        n = 0
+        for eid in list(ctrl.selected_ids):
+            ent = ctrl.sketch.find_entity(eid)
+            if not isinstance(ent, LineEntity):
+                continue
+            before = snapshot_entity(ent)
+            if kind == "horizontal":
+                make_line_horizontal(ent)
+            else:
+                make_line_vertical(ent)
+            after = snapshot_entity(ent)
+            self.doc.record_entity_move(sid, before, after)
+            n += 1
+        if n == 0:
+            self.statusBar().showMessage("Select one or more lines first", 2500)
+            return
+        self.viewport.sync_sketch_visuals()
+        self.statusBar().showMessage(f"{kind.title()} → {n} line(s)", 2500)
+
+    def _make_equal(self) -> None:
+        """Equal length: first selected line is source; others match it."""
+        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            return
+        ctrl = self.viewport._sketch_ctrl
+        lines = [
+            ctrl.sketch.find_entity(eid)
+            for eid in ctrl.selected_ids
+            if isinstance(ctrl.sketch.find_entity(eid), LineEntity)
+        ]
+        lines = [e for e in lines if e is not None]
+        if len(lines) < 2:
+            self.statusBar().showMessage(
+                "Select at least two lines (first is the source length)", 3000
+            )
+            return
+        # Deterministic source: lowest entity id among selection order is unstable;
+        # use sorted ids so Equal is reproducible; status names the source.
+        ids = sorted(
+            eid
+            for eid in ctrl.selected_ids
+            if isinstance(ctrl.sketch.find_entity(eid), LineEntity)
+        )
+        source = ctrl.sketch.find_entity(ids[0])
+        assert isinstance(source, LineEntity)
+        sid = self.viewport._sketch_feature_id
+        n = 0
+        for eid in ids[1:]:
+            ent = ctrl.sketch.find_entity(eid)
+            if not isinstance(ent, LineEntity):
+                continue
+            before = snapshot_entity(ent)
+            make_lines_equal_length(source, ent)
+            after = snapshot_entity(ent)
+            self.doc.record_entity_move(sid, before, after)
+            n += 1
         self.viewport.sync_sketch_visuals()
         self.statusBar().showMessage(
-            f"Length → {format_length(line_length(ent), unit)}", 2500
+            f"Equal → {n} line(s) = {format_length(line_length(source), self.doc.display_unit)}",
+            3000,
         )
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
