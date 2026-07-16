@@ -14,6 +14,10 @@ def main() -> int:
         file=sys.stderr,
     )
     try:
+        # PyVista must initialize before PySide6 on Windows: shiboken's import hook
+        # breaks the matplotlib/dateutil/six chain that pyvista.plotting needs for
+        # global_theme if Qt is already loaded (ImportError on global_theme).
+        import pyvista  # noqa: F401
         # Theme resolves at app.theme import (GROK_THEME / QSettings / default light)
         from PySide6.QtWidgets import QApplication, QMessageBox
         from app.theme import CURRENT_THEME, apply_theme
