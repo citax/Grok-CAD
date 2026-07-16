@@ -10,8 +10,13 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
 
 import numpy as np
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
 os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
@@ -180,41 +185,69 @@ def main() -> int:
         flush=True,
     )
 
-    # Crop corner for axis triad (bottom-left / lower-left of image — VTK viewport 0,0 is bottom-left)
+    # Crop corner for axis triad (VTK image y-up: bottom-left is triad viewport)
     h, w = img.shape[:2]
-    # triad is in corner viewport (0,0,0.18,0.18) → bottom-left in VTK image coords
-    crop = img[int(h * 0.82) : h, 0 : int(w * 0.18)]
-    # Measure contrast: brightest non-bg vs local median bg
+    crop = img[int(h * 0.80) : h, 0 : int(w * 0.20)].copy()
+    # Save crop for human inspection
+    try:
+        from PIL import Image
+
+        Image.fromarray(crop).save(os.path.join(out_dir, f"triad_crop_{tag}.png"))
+    except Exception:
+        pass
+
+    # Isolate caption glyphs by proximity to AXIS_LABEL (what we actually paint)
+    from app.theme import AXIS_LABEL
+
+    label_rgb = _hex_rgb(AXIS_LABEL)
     flat = crop.reshape(-1, 3).astype(float)
-    # background ≈ median
-    bg = np.median(flat, axis=0)
-    # labels/axes tend to be saturated primary-ish — take pixels far from bg
-    dist = np.linalg.norm(flat - bg, axis=1)
-    thr = np.percentile(dist, 92)
-    fg_pix = flat[dist >= thr]
-    if len(fg_pix) < 10:
-        fg = np.mean(flat, axis=0)
-    else:
-        fg = np.mean(fg_pix, axis=0)
+    # Chebyshev distance in RGB — match bench style (tol ~40 for anti-alias)
+    cheb = np.max(np.abs(flat - label_rgb.reshape(1, 3)), axis=1)
+    label_mask = cheb <= 40.0
+    n_label = int(np.count_nonzero(label_mask))
+    # Pure black (#000000) — the broken-default caption colour
+    black_mask = np.max(flat, axis=1) <= 8.0
+    n_black = int(np.count_nonzero(black_mask))
+    print(
+        f"AXIS_PIXELS theme={tag} label_match={n_label} pure_black={n_black} "
+        f"AXIS_LABEL={AXIS_LABEL}",
+        flush=True,
+    )
+    if n_label < 20:
+        print(
+            f"AXIS_CONTRAST_FAIL theme={tag} reason=no_label_glyphs n_label={n_label}",
+            flush=True,
+        )
+        return 1
+
+    fg = np.mean(flat[label_mask], axis=0)
+    # Local background: crop pixels that are neither labels nor saturated axis shafts
+    non_label = ~label_mask
+    if int(np.count_nonzero(non_label)) < 50:
+        print(f"AXIS_CONTRAST_FAIL theme={tag} reason=no_background_sample", flush=True)
+        return 1
+    bg = np.median(flat[non_label], axis=0)
     ratio = _contrast_from_pixels(fg, bg)
     print(
-        f"AXIS_CONTRAST theme={tag} fg={fg.astype(int).tolist()} bg={bg.astype(int).tolist()} ratio={ratio:.2f}",
+        f"AXIS_CONTRAST theme={tag} fg={fg.astype(int).tolist()} "
+        f"bg={bg.astype(int).tolist()} ratio={ratio:.2f}",
         flush=True,
     )
     if ratio < 4.5:
-        # Also check design tokens AXIS_LABEL vs VP_BG
-        from app.theme import AXIS_LABEL, VP_BG_BOTTOM
-
-        design = contrast_ratio(AXIS_LABEL, VP_BG_BOTTOM)
-        print(f"AXIS_TOKEN_CONTRAST {design:.2f}", flush=True)
-        if design < 4.5:
-            print(f"AXIS_CONTRAST_FAIL {ratio:.2f}", flush=True)
-            return 1
-        print(f"AXIS_CONTRAST_OK {design:.2f} (token; crop={ratio:.2f})", flush=True)
-    else:
-        print(f"AXIS_CONTRAST_OK {ratio:.2f}", flush=True)
+        print(f"AXIS_CONTRAST_FAIL {ratio:.2f}", flush=True)
+        return 1
+    print(f"AXIS_CONTRAST_OK {ratio:.2f}", flush=True)
+    # Dark theme: captions must not be pure black (the pre-fix default)
+    if tag == "dark" and n_black > n_label:
+        print(
+            f"AXIS_CONTRAST_FAIL theme=dark pure_black={n_black} > label_match={n_label}",
+            flush=True,
+        )
+        return 1
+    # Human look: describe measured facts only (no canned success prose)
     print(
-        f"LOOK triad crop: RGB-separated axes + readable labels on {tag} bg",
+        f"LOOK triad crop theme={tag}: label_pixels≈{n_label} mean_rgb={fg.astype(int).tolist()} "
+        f"bg_median={bg.astype(int).tolist()} black_px={n_black} contrast={ratio:.2f}",
         flush=True,
     )
 

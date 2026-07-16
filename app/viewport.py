@@ -511,9 +511,11 @@ class Viewport(QWidget):
                 pickable=False,
                 opacity=0.35,
             )
-        # Corner orientation triad — SolidWorks-like RGB axes + high-contrast labels
+        # Corner orientation triad — RGB axes + high-contrast caption labels.
+        # PyVista 0.48 add_axes() has no label_color kwarg — set caption colours
+        # on the vtkAxesActor after creation (do not swallow API errors).
         try:
-            axes_kw = dict(
+            actor = self.plotter.add_axes(
                 line_width=2,
                 xlabel="X",
                 ylabel="Y",
@@ -523,13 +525,42 @@ class Viewport(QWidget):
                 z_color=AXIS_Z,
                 viewport=(0.0, 0.0, 0.18, 0.18),
             )
-            # label_color supported on recent PyVista; fall back if missing
-            try:
-                self.plotter.add_axes(**axes_kw, label_color=AXIS_LABEL)
-            except TypeError:
-                self.plotter.add_axes(**axes_kw)
+            self._style_axes_captions(actor)
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
+            raise
+
+    @staticmethod
+    def _style_axes_captions(actor) -> None:
+        """Set X/Y/Z caption colour to AXIS_LABEL (0–1 RGB) on vtkAxesActor.
+
+        PyVista's add_axes does not accept label_color in 0.48.x; captions default
+        to black and vanish on dark themes unless set here.
+        """
+        if actor is None:
+            raise RuntimeError("add_axes returned None — cannot style captions")
+        r, g, b = _hex_to_rgb01(AXIS_LABEL)
+        for getter in (
+            "GetXAxisCaptionActor2D",
+            "GetYAxisCaptionActor2D",
+            "GetZAxisCaptionActor2D",
+        ):
+            cap = getattr(actor, getter)()
+            if cap is None:
+                continue
+            prop = cap.GetCaptionTextProperty()
+            prop.SetColor(float(r), float(g), float(b))
+            prop.SetOpacity(1.0)
+            prop.BoldOn()
+            try:
+                prop.ShadowOff()
+            except Exception:
+                pass
+            try:
+                # Slightly larger for readability at 2560×1440
+                prop.SetFontSize(max(14, int(prop.GetFontSize() or 12)))
+            except Exception:
+                pass
 
     def _setup_picking(self) -> None:
         assert self.plotter is not None
