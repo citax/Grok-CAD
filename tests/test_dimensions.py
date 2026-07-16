@@ -54,14 +54,57 @@ def test_circle_diameter_drives():
 
 
 def test_infer_role_for_rect_edges():
+    """Clicked edge's length is the dimension — not the perpendicular span."""
     sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    # Rect: width=10 (horizontal edges), height=20 (vertical edges)
     r = sk.add_rectangle((0, 0), (10, 20))
-    # Near left vertical edge → width
-    assert infer_dimension_role(r, uv_hint=(-0.1, 10.0)) == "width"
-    # Near bottom horizontal edge → height
-    assert infer_dimension_role(r, uv_hint=(5.0, -0.1)) == "height"
+    # Bottom / top horizontal edges → width
+    assert infer_dimension_role(r, uv_hint=(5.0, 0.0)) == "width"
+    assert infer_dimension_role(r, uv_hint=(5.0, 20.0)) == "width"
+    assert infer_dimension_role(r, uv_hint=(5.0, -0.1)) == "width"
+    # Left / right vertical edges → height
+    assert infer_dimension_role(r, uv_hint=(0.0, 10.0)) == "height"
+    assert infer_dimension_role(r, uv_hint=(10.0, 10.0)) == "height"
+    assert infer_dimension_role(r, uv_hint=(-0.1, 10.0)) == "height"
     assert infer_dimension_role(sk.add_line((0, 0), (1, 0))) == "length"
     assert infer_dimension_role(sk.add_circle((0, 0), 1)) == "diameter"
+
+
+def test_old_backwards_edge_rule_rejected():
+    """The previous inverted rule (vertical→width, horizontal→height) must fail.
+
+    This test exists so that reintroducing the bug cannot hide behind a green suite.
+    """
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    r = sk.add_rectangle((0, 0), (10, 20))
+    # Old wrong rule said: near left vertical → "width". Correct is "height".
+    left = infer_dimension_role(r, uv_hint=(-0.1, 10.0))
+    bottom = infer_dimension_role(r, uv_hint=(5.0, -0.1))
+    assert left == "height"
+    assert bottom == "width"
+    # Explicitly reject the inverted mapping
+    assert not (left == "width" and bottom == "height"), (
+        "backwards edge rule returned (vertical→width, horizontal→height)"
+    )
+
+
+def test_dimension_tool_infers_role_from_click_not_caller():
+    """Smart Dimension tool: role is decided inside on_press from click UV."""
+    from app.sketch_mode import SketchController, SketchTool
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    r = sk.add_rectangle((0.0, 0.0), (30.0, 20.0))
+    ctrl = SketchController(sk)
+    ctrl.set_tool(SketchTool.DIMENSION)
+    # Bottom edge midpoint — must be width (long horizontal edge of a 30×20)
+    msg_b = ctrl.on_press((15.0, 0.0))
+    assert msg_b == f"DimPick:{r.id}:width", msg_b
+    # Left edge midpoint — must be height
+    msg_l = ctrl.on_press((0.0, 10.0))
+    assert msg_l == f"DimPick:{r.id}:height", msg_l
+    # Top and right
+    assert ctrl.on_press((15.0, 20.0)) == f"DimPick:{r.id}:width"
+    assert ctrl.on_press((30.0, 10.0)) == f"DimPick:{r.id}:height"
 
 
 def test_document_apply_sketch_dimension_undo():

@@ -1990,6 +1990,57 @@ class Viewport(QWidget):
         self._face_pick_frame = None
         self._face_pick_point = None
 
+    def solid_display_vertices(self, fid: int) -> Optional[np.ndarray]:
+        """Vertices of the solid **as drawn** (VTK actor mapper input).
+
+        This is the mesh that ``_apply_solid_results`` uploaded into
+        ``plotter.actors['solid_{fid}']`` — the same PolyData VTK composites
+        into the framebuffer. Prefer this over ``Document.evaluate_feature``
+        when verifying what the user sees.
+        """
+        if not self.plotter:
+            return None
+        actor = self.plotter.actors.get(f"solid_{int(fid)}")
+        if actor is None:
+            return None
+        try:
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+
+            mapper = actor.GetMapper()
+            if mapper is None:
+                return None
+            data = mapper.GetInput()
+            if data is None or data.GetPoints() is None:
+                return None
+            pts = vtk_to_numpy(data.GetPoints().GetData())
+            return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] solid_display_vertices: {exc}", file=sys.stderr)
+            return None
+
+    def sketch_entity_display_points(self, eid: int) -> Optional[np.ndarray]:
+        """World points of a sketch entity actor on the overlay / main plotter."""
+        name = f"sk_e_{int(eid)}"
+        actor = self._overlay_actors.get(name)
+        if actor is None and self.plotter is not None:
+            actor = self.plotter.actors.get(name)
+        if actor is None:
+            return None
+        try:
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+
+            mapper = actor.GetMapper()
+            if mapper is None:
+                return None
+            data = mapper.GetInput()
+            if data is None or data.GetPoints() is None:
+                return None
+            pts = vtk_to_numpy(data.GetPoints().GetData())
+            return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] sketch_entity_display_points: {exc}", file=sys.stderr)
+            return None
+
     def _upsert_entity_actor(self, ent: SketchEntity) -> None:
         if not self.plotter or self._sketch_ctrl is None:
             return

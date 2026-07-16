@@ -157,8 +157,14 @@ def sketch_parallel_scale(
     default: float = 40.0,
     margin: float = 1.35,
 ) -> float:
-    """Orthographic parallel scale (half-height) when entering sketch mode."""
+    """Orthographic parallel scale (half-height) when entering sketch mode.
+
+    * Empty sketch → ``default`` (comfortable real-size workspace, e.g. 40 mm).
+    * Existing geometry → fit tightly to its extent (no large floor that
+      shrinks small sketches to a few on-screen pixels — that broke box-select
+      framebuffer checks that depend on UV→pixel mapping).
+    """
     e = float(entity_extent_mm)
     if not math.isfinite(e) or e < 1e-6:
         return float(default)
-    return max(float(default) * 0.25, e * float(margin), 5.0)
+    return max(e * float(margin), 3.0)

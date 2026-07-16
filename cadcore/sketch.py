@@ -489,9 +489,14 @@ def apply_dimension_value(ent: SketchEntity, role: str, value_mm: float) -> None
 
 
 def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -> str:
-    """Pick a default dimension role for Smart Dimension on an entity.
+    """Pick dimension role for Smart Dimension from the entity + click location.
 
-    For rectangles, ``uv_hint`` near a vertical edge → width; near horizontal → height.
+    For a rectangle, the clicked **edge's length** is what the number sets:
+
+    * Bottom / top (horizontal edges) → their length is the **width** (|Δu|)
+    * Left / right (vertical edges) → their length is the **height** (|Δv|)
+
+    ``uv_hint`` is the click in sketch UV; nearest edge wins.
     """
     if isinstance(ent, LineEntity):
         return "length"
@@ -500,13 +505,17 @@ def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -
     if isinstance(ent, RectEntity):
         if uv_hint is None:
             return "width"
-        u0, u1 = sorted([ent.c0[0], ent.c1[0]])
-        v0, v1 = sorted([ent.c0[1], ent.c1[1]])
+        u0, u1 = sorted([float(ent.c0[0]), float(ent.c1[0])])
+        v0, v1 = sorted([float(ent.c0[1]), float(ent.c1[1])])
         u, v = float(uv_hint[0]), float(uv_hint[1])
-        du = min(abs(u - u0), abs(u - u1))
-        dv = min(abs(v - v0), abs(v - v1))
-        # Closer to a vertical side → dimension the width; else height
-        return "width" if du <= dv else "height"
+        # Distance to nearest vertical edge (left/right) vs horizontal (bottom/top)
+        dist_to_vertical = min(abs(u - u0), abs(u - u1))
+        dist_to_horizontal = min(abs(v - v0), abs(v - v1))
+        # Near a horizontal edge → dimension that edge's length = width
+        # Near a vertical edge → dimension that edge's length = height
+        if dist_to_horizontal <= dist_to_vertical:
+            return "width"
+        return "height"
     raise ValueError(f"unsupported entity for dimension: {type(ent).__name__}")
 
 
