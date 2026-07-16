@@ -2197,15 +2197,23 @@ class Viewport(QWidget):
             self._update_handles_visual()
             self._update_dim_labels()
             self._update_profile_fill_visual()
-            n = len(self._sketch_ctrl.selected_ids)
-            if msg and msg.startswith("BoxSelect:"):
-                parts = msg.split(":")
-                mode = parts[1] if len(parts) > 1 else "?"
-                self.sketch_status.emit(f"Sketch: {mode} select → {n}")
-            elif msg == "BoxSelectClear":
-                self.sketch_status.emit("Sketch: selection cleared")
+            if msg and msg.startswith("Selected profile"):
+                n = len(self._sketch_ctrl.selected_profile_ids)
+                self.sketch_status.emit(
+                    f"Sketch: {n} region(s) selected"
+                    if n != 1
+                    else "Sketch: 1 region selected"
+                )
             else:
-                self.sketch_status.emit(f"Sketch: selected {n}")
+                n = len(self._sketch_ctrl.selected_ids)
+                if msg and msg.startswith("BoxSelect:"):
+                    parts = msg.split(":")
+                    mode = parts[1] if len(parts) > 1 else "?"
+                    self.sketch_status.emit(f"Sketch: {mode} select → {n}")
+                elif msg == "BoxSelectClear":
+                    self.sketch_status.emit("Sketch: selection cleared")
+                else:
+                    self.sketch_status.emit(f"Sketch: selected {n}")
             if self._render_timer.isActive():
                 self._render_timer.stop()
             self._do_render()

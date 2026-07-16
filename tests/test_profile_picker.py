@@ -97,3 +97,55 @@ def test_ambiguous_resolve_needs_preferred_id():
     r = resolve_profiles(sk, preferred_outer_id=loops[0].id)
     assert isinstance(r.outer, ClosedLineLoop)
     assert r.outer.id == loops[0].id
+
+
+def test_click_interior_selects_region_not_on_press():
+    """Region pick is deferred to release (press alone starts box-select)."""
+    from app.sketch_mode import SketchController, SketchTool
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    r = sk.add_rectangle((0, 0), (2, 2))
+    ctrl = SketchController(sk)
+    ctrl.set_tool(SketchTool.SELECT)
+    msg = ctrl.on_press((1.0, 1.0), display_xy=(100.0, 100.0), shift=False)
+    assert msg == "BoxSelect"
+    assert ctrl.is_box_selecting()
+    assert not ctrl.selected_profile_ids  # not decided yet
+    msg = ctrl.on_release((1.0, 1.0), display_xy=(100.0, 100.0), shift=False)
+    assert msg and msg.startswith("Selected profile")
+    assert r.id in ctrl.selected_profile_ids
+    assert not ctrl.selected_ids
+
+
+def test_drag_from_interior_is_box_select():
+    from app.sketch_mode import SketchController, SketchTool
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    sk.add_rectangle((0, 0), (2, 2))
+    # Line fully inside the rect, well away from the press point (1,1)
+    line = sk.add_line((0.5, 1.2), (1.5, 1.2))
+    ctrl = SketchController(sk)
+    ctrl.set_tool(SketchTool.SELECT)
+    # Press in open interior (not near handles/edges), then drag a real UV box
+    msg = ctrl.on_press((0.3, 0.5), display_xy=(100.0, 200.0), shift=False)
+    assert msg == "BoxSelect"
+    ctrl.on_move((1.7, 1.5), display_xy=(300.0, 50.0))
+    msg = ctrl.on_release((1.7, 1.5), display_xy=(300.0, 50.0), shift=False)
+    assert msg and msg.startswith("BoxSelect:window:")
+    assert not ctrl.selected_profile_ids
+    assert line.id in ctrl.selected_ids
+
+
+def test_edge_click_selects_entity_not_region():
+    from app.sketch_mode import SketchController, SketchTool
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    r = sk.add_rectangle((0, 0), (2, 2))
+    ctrl = SketchController(sk)
+    ctrl.set_tool(SketchTool.SELECT)
+    # Midpoint of bottom edge
+    msg = ctrl.on_press((1.0, 0.0), display_xy=(50.0, 50.0), shift=False)
+    assert msg and msg.startswith("Selected entity")
+    assert ctrl.selected_ids == {r.id}
+    assert not ctrl.selected_profile_ids
+    assert ctrl.box_select is None

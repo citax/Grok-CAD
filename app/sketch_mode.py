@@ -433,20 +433,7 @@ class SketchController:
                     start_uv=h.uv,
                 )
                 return f"Drag {h.name}"
-            # Closed region fill takes priority over edge-body picks so clicking
-            # "inside the shape" selects the region for Extrude (Ctrl multi-adds).
-            from cadcore.profiles import pick_closed_profile_at
-
-            prof = pick_closed_profile_at(self.sketch, raw_uv)
-            if prof is not None:
-                self.box_select = None
-                pid = int(getattr(prof, "id", -1))
-                if ctrl or shift:
-                    self.toggle_profile_id(pid)
-                else:
-                    self.set_profile_selection([pid])
-                n = len(self.selected_profile_ids)
-                return f"Selected profile {pid} (n={n})"
+            # Edge/body first: clicking the line means the shape, not the region fill.
             eid = self.pick_entity_body(raw_uv)
             if eid is not None:
                 self.box_select = None
@@ -460,7 +447,8 @@ class SketchController:
                 else:
                     self.selected_entity_id = eid
                 return f"Selected entity {eid}"
-            # Empty space → start box select (clear unless Shift/Ctrl-add)
+            # Interior of a region OR empty canvas: do not decide yet.
+            # Press+drag → box select; press+release (no drag) → region pick if inside.
             multi = bool(shift or ctrl)
             baseline = set(self.selected_ids) if multi else set()
             if not multi:
@@ -513,7 +501,21 @@ class SketchController:
             add = bs.add_mode or bool(shift or ctrl)
             self.box_select = None
             if bs.drag_px < BOX_SELECT_MIN_PX:
-                # Click empty: keep cleared selection (or baseline if was multi-add click)
+                # Click without drag: pick closed region if press was inside one.
+                # (Press+drag already diverged into box select above this threshold.)
+                from cadcore.profiles import pick_closed_profile_at
+
+                prof = pick_closed_profile_at(self.sketch, bs.press_uv)
+                if prof is not None:
+                    pid = int(getattr(prof, "id", -1))
+                    if add:
+                        # Ctrl/Shift: toggle region (profiles kept if press was multi)
+                        self.toggle_profile_id(pid)
+                    else:
+                        self.set_profile_selection([pid])
+                    n = len(self.selected_profile_ids)
+                    return f"Selected profile {pid} (n={n})"
+                # Click empty: keep cleared selection (or baseline if multi-add click)
                 if not add:
                     self.selected_ids.clear()
                     self.selected_profile_ids.clear()

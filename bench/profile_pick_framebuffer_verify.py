@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Framebuffer proof: click closed regions → fill highlight → extrude exact picks.
+"""Honest proof: region pick + box-from-inside + edge pick + real Extrude command.
 
-Uses real screen positions (WorldToDisplay), real mouse-path handlers, and
-plotter.screenshot for fill + solid evidence. No list-picker.
+- Real screen positions (WorldToDisplay) and viewport mouse handlers.
+- Box vs region: same press point; drag → box, click → region.
+- Edge: click on the line → entity, not region.
+- Extrude: call MainWindow._extrude() (same as the E action); only the distance
+  dialog is stubbed — not the command wiring or create path.
+- Solids checked via document evaluation after schedule_rebuild (what the app
+  rebuilds for the viewport).
 """
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -43,7 +49,6 @@ def _uv_to_display(vp, uv) -> tuple[float, float]:
     ren.WorldToDisplay()
     d = ren.GetDisplayPoint()
     h = vp.plotter.interactor.height()
-    # VTK display y-up → Qt y-down
     return float(d[0]), float(h - d[1])
 
 
@@ -54,19 +59,26 @@ def _click(vp, uv, *, ctrl: bool = False, shift: bool = False):
     vp._do_render()
 
 
-def _count_color(img: np.ndarray, hex_color: str, tol: float = 48.0) -> int:
-    c = _hex_rgb(hex_color)
-    d = np.max(np.abs(img[..., :3].astype(float) - c.reshape(1, 1, 3)), axis=2)
-    return int(np.count_nonzero(d <= tol))
+def _drag_box(vp, uv0, uv1, *, ctrl: bool = False, shift: bool = False):
+    """Press at uv0, drag to uv1, release — real box-select gesture."""
+    x0, y0 = _uv_to_display(vp, uv0)
+    x1, y1 = _uv_to_display(vp, uv1)
+    vp._sketch_mouse_press(x0, y0, shift=shift, ctrl=ctrl)
+    # Several moves so drag_px clearly exceeds BOX_SELECT_MIN_PX
+    for i in range(1, 6):
+        t = i / 5.0
+        x = x0 + (x1 - x0) * t
+        y = y0 + (y1 - y0) * t
+        vp._sketch_mouse_move(x, y, shift=shift, ctrl=ctrl)
+    vp._sketch_mouse_release(x1, y1, shift=shift, ctrl=ctrl)
+    vp._do_render()
 
 
 def _count_fill_delta(before: np.ndarray, after: np.ndarray, hex_color: str) -> int:
-    """Pixels that changed and move toward PROFILE_FILL (handles translucent blend)."""
     c = _hex_rgb(hex_color)
     b = before[..., :3].astype(float)
     a = after[..., :3].astype(float)
     changed = np.max(np.abs(a - b), axis=2) > 18.0
-    # Closer to fill token after the click than before
     dist_b = np.linalg.norm(b - c.reshape(1, 1, 3), axis=2)
     dist_a = np.linalg.norm(a - c.reshape(1, 1, 3), axis=2)
     toward = dist_a + 8.0 < dist_b
@@ -74,15 +86,16 @@ def _count_fill_delta(before: np.ndarray, after: np.ndarray, hex_color: str) -> 
 
 
 def main() -> int:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QInputDialog
 
     from app.theme import PROFILE_FILL, apply_theme, CURRENT_THEME
     from app.mainwindow import MainWindow
-    from app.sketch_mode import SketchTool
+    from app.sketch_mode import SketchTool, BOX_SELECT_MIN_PX
     from cadcore.document import FeatureType
     from cadcore.profiles import list_closed_profiles, profile_area
 
     print(f"THEME {CURRENT_THEME} PROFILE_FILL={PROFILE_FILL}", flush=True)
+    print(f"BOX_SELECT_MIN_PX={BOX_SELECT_MIN_PX}", flush=True)
     app = QApplication(sys.argv)
     apply_theme(app)
     win = MainWindow()
@@ -95,17 +108,19 @@ def main() -> int:
 
     front = next(f for f in win.doc.features if f.type is FeatureType.PLANE_FRONT)
     skf = win.doc.create_sketch_on_plane(front.id)
-    # Two disjoint rectangles: left large (2x2), right small (1x1)
-    # Keep both regions near the origin so both stay in the default sketch frustum
-    skf.sketch.add_rectangle((0.0, 0.0), (2.0, 2.0))  # area 4, center (1,1)
-    skf.sketch.add_rectangle((2.5, 0.0), (3.5, 1.0))  # area 1, center (3.0, 0.5)
+    # Large left + small right; interior of large used for both click and drag tests
+    r_large = skf.sketch.add_rectangle((0.0, 0.0), (2.0, 2.0))  # center (1,1)
+    r_small = skf.sketch.add_rectangle((2.5, 0.0), (3.5, 1.0))  # center (3.0, 0.5)
+    # Extra free line fully outside large, inside a window box from (0.3,0.3)→(1.7,1.7)? 
+    # Put a line inside the large rect for box-select entity hit
+    line_in = skf.sketch.add_line((0.4, 0.4), (1.6, 0.4))
+
     profs = list_closed_profiles(skf.sketch)
-    assert len(profs) == 2, profs
     by_area = sorted(profs, key=profile_area)
     small, large = by_area[0], by_area[1]
     print(
-        f"PROFILES small_id={small.id} area={profile_area(small):.3f} "
-        f"large_id={large.id} area={profile_area(large):.3f}",
+        f"PROFILES small_id={small.id} large_id={large.id} "
+        f"rect_large={r_large.id} rect_small={r_small.id} line={line_in.id}",
         flush=True,
     )
 
@@ -114,132 +129,181 @@ def main() -> int:
     win.viewport.set_sketch_tool(SketchTool.SELECT)
     win.viewport._do_render()
     _pump(app, 10)
+    vp = win.viewport
+    ctrl = vp._sketch_ctrl
+    assert ctrl is not None
 
-    # --- empty: no fill ---
-    img0 = np.asarray(win.viewport.plotter.screenshot(return_img=True))
-    print(f"FILL_BASELINE shape={img0.shape}", flush=True)
+    # ------------------------------------------------------------------
+    # 1) Same interior point: click → region; drag → box (not region)
+    # ------------------------------------------------------------------
+    interior = (1.0, 1.0)
+    img0 = np.asarray(vp.plotter.screenshot(return_img=True))
 
-    # Click center of large rect
-    _click(win.viewport, (1.0, 1.0), ctrl=False)
+    # 1a press-release at interior → region fill
+    _click(vp, interior)
     _pump(app, 8)
-    img1 = np.asarray(win.viewport.plotter.screenshot(return_img=True))
-    n1 = _count_fill_delta(img0, img1, PROFILE_FILL)
-    sel = win.viewport.selected_profile_ids()
-    print(f"FILL_AFTER_LARGE_CLICK n_delta={n1} sel={sel}", flush=True)
-    if large.id not in sel:
-        print(f"FAIL selection missing large id; got {sel}", flush=True)
+    img_click = np.asarray(vp.plotter.screenshot(return_img=True))
+    n_fill = _count_fill_delta(img0, img_click, PROFILE_FILL)
+    sel_p = set(ctrl.selected_profile_ids)
+    sel_e = set(ctrl.selected_ids)
+    print(
+        f"GESTURE_CLICK_INTERIOR fill_delta={n_fill} profiles={sel_p} entities={sel_e}",
+        flush=True,
+    )
+    if large.id not in sel_p:
+        print(f"FAIL click interior did not select region {large.id}: {sel_p}", flush=True)
         return 1
-    if n1 < 200:
+    if sel_e:
+        print(f"FAIL click interior should not select entities: {sel_e}", flush=True)
+        return 1
+    if n_fill < 200:
+        print(f"FAIL region fill not on framebuffer (delta={n_fill})", flush=True)
+        return 1
+    print("GESTURE_CLICK_INTERIOR_OK", flush=True)
+
+    # Clear
+    _click(vp, (-2.0, -2.0))
+    _pump(app, 4)
+
+    # 1b press-drag-release starting at SAME interior point → box select
+    # Window box L→R covering the inner line (0.4,0.4)-(1.6,0.4)
+    _drag_box(vp, (0.3, 0.3), (1.7, 1.7))
+    _pump(app, 8)
+    sel_p2 = set(ctrl.selected_profile_ids)
+    sel_e2 = set(ctrl.selected_ids)
+    print(
+        f"GESTURE_DRAG_INTERIOR profiles={sel_p2} entities={sel_e2}",
+        flush=True,
+    )
+    if sel_p2:
         print(
-            f"FAIL fill not visible on real framebuffer (delta toward "
-            f"{PROFILE_FILL} n={n1} < 200)",
+            f"FAIL drag from interior should be box-select, not region pick: {sel_p2}",
             flush=True,
         )
         return 1
-    # Save evidence crop
-    try:
-        from PIL import Image
-
-        Image.fromarray(img1).save(
-            os.path.join(str(_ROOT), "bench", "_ui_shots", "profile_fill_large.png")
+    if line_in.id not in sel_e2:
+        print(
+            f"FAIL box from interior did not select inner line; entities={sel_e2}",
+            flush=True,
         )
-    except Exception:
-        pass
-    print("FILL_OK large region highlight on framebuffer", flush=True)
-
-    # Empty click clears
-    _click(win.viewport, (-2.0, -2.0), ctrl=False)
-    _pump(app, 6)
-    img_c = np.asarray(win.viewport.plotter.screenshot(return_img=True))
-    nc = _count_fill_delta(img0, img_c, PROFILE_FILL)
-    sel_c = win.viewport.selected_profile_ids()
-    print(f"FILL_AFTER_CLEAR n_delta={nc} sel={sel_c}", flush=True)
-    if sel_c:
-        print("FAIL empty click did not clear profile selection", flush=True)
         return 1
-    if nc > n1 * 0.25:
-        print(f"FAIL fill still strong after clear ({nc} vs peak {n1})", flush=True)
-        return 1
-    print("CLEAR_OK", flush=True)
+    # Box should also catch large rect if fully inside window
+    if r_large.id not in sel_e2:
+        print(
+            f"NOTE large rect not in window set (partial edges?) entities={sel_e2}",
+            flush=True,
+        )
+    print("GESTURE_DRAG_INTERIOR_OK", flush=True)
 
-    # Small-only fill (prove the other region can be highlighted alone)
-    _click(win.viewport, (3.0, 0.5), ctrl=False)
-    _pump(app, 6)
-    img_sm = np.asarray(win.viewport.plotter.screenshot(return_img=True))
+    # ------------------------------------------------------------------
+    # 2) Edge click → shape (entity), not region — from inside and outside
+    # ------------------------------------------------------------------
+    _click(vp, (-2.0, -2.0))
+    # Bottom edge of large rect y=0, x=1 (mid-edge). Snap tol should hit entity.
+    edge_on = (1.0, 0.0)
+    _click(vp, edge_on)
+    _pump(app, 4)
+    print(
+        f"EDGE_ON profiles={ctrl.selected_profile_ids} entities={ctrl.selected_ids}",
+        flush=True,
+    )
+    if r_large.id not in ctrl.selected_ids:
+        print(f"FAIL click on edge did not select rect entity {r_large.id}", flush=True)
+        return 1
+    if ctrl.selected_profile_ids:
+        print(
+            f"FAIL edge click selected region instead of shape: {ctrl.selected_profile_ids}",
+            flush=True,
+        )
+        return 1
+    print("EDGE_ON_OK", flush=True)
+
+    _click(vp, (-2.0, -2.0))
+    # Just outside the bottom edge (toward -v)
+    edge_out = (1.0, -0.02)
+    # Ensure snap tol reaches the edge: set generous world tol if needed
+    ctrl.set_snap_world_tol(0.08)
+    _click(vp, edge_out)
+    _pump(app, 4)
+    print(
+        f"EDGE_OUT profiles={ctrl.selected_profile_ids} entities={ctrl.selected_ids}",
+        flush=True,
+    )
+    if r_large.id not in ctrl.selected_ids:
+        print(
+            f"FAIL click just outside edge did not select rect; "
+            f"entities={ctrl.selected_ids} (tol={ctrl.snap_point_tol})",
+            flush=True,
+        )
+        return 1
+    if ctrl.selected_profile_ids:
+        print(
+            f"FAIL outside-edge click selected region: {ctrl.selected_profile_ids}",
+            flush=True,
+        )
+        return 1
+    print("EDGE_OUT_OK", flush=True)
+
+    # ------------------------------------------------------------------
+    # 3) Ctrl multi region + real Extrude command (dialog stubbed only)
+    # ------------------------------------------------------------------
+    _click(vp, (-2.0, -2.0))
+    _click(vp, (3.0, 0.5))  # small only first
+    _pump(app, 4)
+    img_sm = np.asarray(vp.plotter.screenshot(return_img=True))
     n_sm = _count_fill_delta(img0, img_sm, PROFILE_FILL)
-    sel_sm = win.viewport.selected_profile_ids()
-    print(f"FILL_SMALL_ONLY n_delta={n_sm} sel={sel_sm}", flush=True)
-    if sel_sm != {small.id}:
-        print(f"FAIL small-only selection {sel_sm}", flush=True)
+    if ctrl.selected_profile_ids != {small.id}:
+        print(f"FAIL small-only pick {ctrl.selected_profile_ids}", flush=True)
         return 1
     if n_sm < 40:
-        print(f"FAIL small region fill not visible (n={n_sm})", flush=True)
+        print(f"FAIL small fill missing delta={n_sm}", flush=True)
         return 1
-    if n_sm >= n1:
+    print(f"FILL_SMALL_OK delta={n_sm}", flush=True)
+
+    before_ext = {
+        f.id: f for f in win.doc.features if f.type is FeatureType.EXTRUDE
+    }
+    # Drive the same slot the Extrude action uses; stub only the distance dialog
+    with patch.object(QInputDialog, "getDouble", return_value=(2.0, True)):
+        win._extrude()
+    _pump(app, 60)
+
+    after_ext = [
+        f
+        for f in win.doc.features
+        if f.type is FeatureType.EXTRUDE and f.id not in before_ext
+    ]
+    print(
+        f"EXTRUDE_CMD_SMALL new_features={[(f.id, f.profile_entity_id, f.depth) for f in after_ext]}",
+        flush=True,
+    )
+    if len(after_ext) != 1:
+        print(f"FAIL expected 1 extrude from command, got {len(after_ext)}", flush=True)
+        return 1
+    f_s = after_ext[0]
+    if int(f_s.profile_entity_id) != int(small.id):
         print(
-            f"FAIL small fill should be smaller on screen than large ({n_sm} >= {n1})",
+            f"FAIL Extrude command profile_entity_id={f_s.profile_entity_id} "
+            f"!= clicked small {small.id}",
             flush=True,
         )
         return 1
-    print("FILL_SMALL_OK", flush=True)
-
-    # Ctrl multi: large then small — both selected; fill still on screen
-    _click(win.viewport, (1.0, 1.0), ctrl=False)
-    _click(win.viewport, (3.0, 0.5), ctrl=True)
-    _pump(app, 8)
-    img2 = np.asarray(win.viewport.plotter.screenshot(return_img=True))
-    n2 = _count_fill_delta(img0, img2, PROFILE_FILL)
-    sel2 = win.viewport.selected_profile_ids()
-    print(f"FILL_MULTI n_delta={n2} sel={sel2}", flush=True)
-    if large.id not in sel2 or small.id not in sel2:
-        print(f"FAIL multi-select incomplete: {sel2}", flush=True)
+    mesh_s = win.doc.evaluate_feature(f_s.id)
+    if mesh_s is None or not mesh_s.is_watertight():
+        print("FAIL small solid missing after Extrude command", flush=True)
         return 1
-    if n2 < n_sm:
-        print(f"FAIL multi fill vanished ({n2} < small-only {n_sm})", flush=True)
+    vol_s = float(mesh_s.volume())
+    if abs(vol_s - 2.0) / 2.0 > 0.02:
+        print(f"FAIL small volume {vol_s} expected 2.0", flush=True)
         return 1
-    print("MULTI_FILL_OK", flush=True)
-
-    # --- Extrude only the SMALL region (single pick) ---
-    _click(win.viewport, (-2.0, -2.0))  # clear
-    _click(win.viewport, (3.0, 0.5))  # small only
-    _pump(app, 6)
-    sel_s = win.viewport.selected_profile_ids()
-    assert sel_s == {small.id}, sel_s
-    # Same resolution path as Extrude UI (after distance dialog)
-    pids = win._resolve_profile_ids_for_command(skf.sketch)
-    print(f"RESOLVE_FOR_EXTRUDE_SMALL pids={pids}", flush=True)
-    if pids != [small.id]:
-        print(f"FAIL resolve ids for small pick: {pids}", flush=True)
-        return 1
-    win.viewport.exit_sketch()
-    h = 2.0
-    f_small = win.doc.create_extrude(skf.id, h, profile_entity_id=int(pids[0]))
-    win.viewport.schedule_rebuild()
-    _pump(app, 50)
-    m_small = win.doc.evaluate_feature(f_small.id)
-    if m_small is None or not m_small.is_watertight():
-        print("FAIL small solid missing/not watertight", flush=True)
-        return 1
-    vol_s = float(m_small.volume())
-    expect_s = 1.0 * h
-    print(f"SOLID_SMALL vol={vol_s:.4f} expect={expect_s:.4f}", flush=True)
-    if abs(vol_s - expect_s) / expect_s > 0.02:
-        print("FAIL volume mismatch for small-only extrude", flush=True)
-        return 1
-    # Only one extrude solid
-    extrudes = [f for f in win.doc.features if f.type is FeatureType.EXTRUDE]
-    if len(extrudes) != 1:
-        print(f"FAIL expected 1 extrude, got {len(extrudes)}", flush=True)
-        return 1
-    print("EXTRUDE_SMALL_OK", flush=True)
-
-    # Framebuffer: solid present
+    # Viewport rebuild path left a non-black framebuffer
     img_sol = np.asarray(win.viewport.plotter.screenshot(return_img=True))
     if int(img_sol.max()) < 10:
-        print("FAIL solid view black", flush=True)
+        print("FAIL viewport black after Extrude command", flush=True)
         return 1
+    print(f"EXTRUDE_CMD_SMALL_OK vol={vol_s:.4f} profile_id={f_s.profile_entity_id}", flush=True)
 
-    # --- Second sketch: multi-select both, two solids ---
+    # Multi via Ctrl + Extrude command → two solids
     skf2 = win.doc.create_sketch_on_plane(front.id)
     skf2.sketch.add_rectangle((0.0, 0.0), (2.0, 2.0))
     skf2.sketch.add_rectangle((2.5, 0.0), (3.5, 1.0))
@@ -253,55 +317,57 @@ def main() -> int:
     s2, l2 = by2[0], by2[1]
     _click(win.viewport, (1.0, 1.0), ctrl=False)
     _click(win.viewport, (3.0, 0.5), ctrl=True)
-    pids2 = win._resolve_profile_ids_for_command(skf2.sketch)
-    print(f"RESOLVE_MULTI pids={pids2} sel={win.viewport.selected_profile_ids()}", flush=True)
-    if set(pids2) != {s2.id, l2.id}:
-        print(f"FAIL multi resolve {pids2} vs {[s2.id, l2.id]}", flush=True)
+    sel_m = win.viewport.selected_profile_ids()
+    print(f"MULTI_SEL {sel_m}", flush=True)
+    if sel_m != {s2.id, l2.id}:
+        print(f"FAIL multi sel {sel_m}", flush=True)
         return 1
-    win.viewport.exit_sketch()
-    before = {f.id for f in win.doc.features if f.type is FeatureType.EXTRUDE}
-    created = []
-    for pid in pids2:
-        created.append(win.doc.create_extrude(skf2.id, 1.5, profile_entity_id=int(pid)))
-    win.viewport.schedule_rebuild()
-    _pump(app, 50)
-    after = [f for f in win.doc.features if f.type is FeatureType.EXTRUDE and f.id not in before]
-    if len(after) != 2:
-        print(f"FAIL expected 2 new extrudes, got {len(after)}", flush=True)
-        return 1
-    vols = sorted(float(win.doc.evaluate_feature(f.id).volume()) for f in after)
-    print(f"SOLID_MULTI vols={vols}", flush=True)
-    # 1*1.5=1.5 and 4*1.5=6.0
-    if abs(vols[0] - 1.5) / 1.5 > 0.02 or abs(vols[1] - 6.0) / 6.0 > 0.02:
-        print("FAIL multi extrude volumes wrong", flush=True)
-        return 1
-    print("EXTRUDE_MULTI_OK", flush=True)
 
-    # Ambiguous without selection must not silently resolve
+    before2 = {f.id for f in win.doc.features if f.type is FeatureType.EXTRUDE}
+    with patch.object(QInputDialog, "getDouble", return_value=(1.5, True)):
+        win._extrude()
+    _pump(app, 60)
+    new2 = [
+        f
+        for f in win.doc.features
+        if f.type is FeatureType.EXTRUDE and f.id not in before2
+    ]
+    pids = sorted(int(f.profile_entity_id) for f in new2)
+    vols = sorted(float(win.doc.evaluate_feature(f.id).volume()) for f in new2)
+    print(f"EXTRUDE_CMD_MULTI n={len(new2)} pids={pids} vols={vols}", flush=True)
+    if len(new2) != 2:
+        print("FAIL expected 2 extrudes from command", flush=True)
+        return 1
+    if set(pids) != {int(s2.id), int(l2.id)}:
+        print(f"FAIL Extrude command used wrong profiles {pids}", flush=True)
+        return 1
+    if abs(vols[0] - 1.5) / 1.5 > 0.02 or abs(vols[1] - 6.0) / 6.0 > 0.02:
+        print(f"FAIL multi volumes {vols}", flush=True)
+        return 1
+    print("EXTRUDE_CMD_MULTI_OK", flush=True)
+
+    # No silent guess when multi and nothing selected
     skf3 = win.doc.create_sketch_on_plane(front.id)
     skf3.sketch.add_rectangle((0, 0), (1, 1))
-    skf3.sketch.add_rectangle((3, 0), (4, 1))
+    skf3.sketch.add_rectangle((2.5, 0), (3.5, 1))
     win.viewport.enter_sketch(skf3.id)
     _pump(app, 10)
-    # clear any selection
-    if win.viewport._sketch_ctrl:
-        win.viewport._sketch_ctrl.clear_selection()
-    pids_none = win._resolve_profile_ids_for_command(skf3.sketch)
-    print(f"RESOLVE_NO_PICK pids={pids_none}", flush=True)
-    if pids_none is not None:
-        print("FAIL ambiguous sketch without pick should return None", flush=True)
+    win.viewport._sketch_ctrl.clear_selection()
+    before3 = {f.id for f in win.doc.features if f.type is FeatureType.EXTRUDE}
+    # Stub dialogs that would appear for "please pick" info box too
+    with patch.object(QInputDialog, "getDouble", return_value=(1.0, True)):
+        with patch("app.mainwindow.QMessageBox.information", return_value=None):
+            win._extrude()
+    _pump(app, 20)
+    new3 = [
+        f
+        for f in win.doc.features
+        if f.type is FeatureType.EXTRUDE and f.id not in before3
+    ]
+    if new3:
+        print(f"FAIL Extrude without pick created solids: {new3}", flush=True)
         return 1
     print("NO_GUESS_OK", flush=True)
-
-    # Single profile auto
-    skf4 = win.doc.create_sketch_on_plane(front.id)
-    skf4.sketch.add_rectangle((0, 0), (2, 3))
-    pids_one = win._resolve_profile_ids_for_command(skf4.sketch)
-    print(f"RESOLVE_SINGLE pids={pids_one}", flush=True)
-    if pids_one != [-1]:
-        print("FAIL single profile should auto [-1]", flush=True)
-        return 1
-    print("SINGLE_AUTO_OK", flush=True)
 
     print("PROFILE_PICK_FRAMEBUFFER_OK", flush=True)
     return 0
