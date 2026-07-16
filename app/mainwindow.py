@@ -712,12 +712,16 @@ class MainWindow(QMainWindow):
         kind = type(prof).__name__.replace("Entity", "")
         return f"{kind} id={getattr(prof, 'id', '?')}"
 
-    def _pick_closed_profile(self, sketch, *, title: str = "Select Profile") -> int:
-        """List all closed profiles (rects/circles + virtual line-loops) for user pick.
+    def _resolve_profile_ids_for_command(self, sketch, *, title: str = "Select Profile"):
+        """Which closed regions to use for Extrude/Revolve/etc.
 
-        Returns preferred_outer_id for resolve_profiles / create_* methods.
-        Returns -2 if user cancelled, -1 if a single profile needs no pick.
-        Raises ValueError if there are no closed profiles.
+        Returns a list of preferred_outer_id values for create_* calls:
+          * [-1] — single / nested auto-resolve (no pick needed)
+          * [id, ...] — one or more regions selected in the sketch
+          * None — user must pick (caller shows a message); empty list cancelled
+
+        Disjoint multi-profile sketches no longer use a text list; click the
+        filled region in sketch mode (Ctrl-click to multi-select).
         """
         try:
             profiles = list_closed_profiles(sketch)
@@ -725,33 +729,44 @@ class MainWindow(QMainWindow):
             raise
         if not profiles:
             raise ValueError("sketch has no closed profile")
-        # If resolve_profiles succeeds without preferred id, no pick needed
+        # Single or nested: resolve_profiles succeeds without a preferred id
         try:
             resolve_profiles(sketch)
-            return -1
+            return [-1]
         except ValueError as exc:
             if "ambiguous" not in str(exc).lower():
                 raise
-        labels = [self._profile_label(p) for p in profiles]
-        if not labels:
-            raise ValueError("sketch has no closed profile")
-        choice, ok = QInputDialog.getItem(
-            self,
-            title,
-            "Multiple disjoint closed profiles found.\n"
-            "Select which profile to use:",
-            labels,
-            0,
-            False,
+        # Disjoint: require sketch-region selection (no list popup)
+        sel = (
+            self.viewport.selected_profile_ids()
+            if self.viewport.in_sketch_mode
+            else set()
         )
-        if not ok or not choice:
-            return -2  # cancelled
-        idx = labels.index(choice)
-        prof = profiles[idx]
-        return int(getattr(prof, "id", -1))
+        # Keep only ids that still exist as closed profiles
+        valid = {int(getattr(p, "id", -1)) for p in profiles}
+        chosen = [pid for pid in sel if pid in valid]
+        # Line-loop synthetic ids are in valid; also accept if any profile matches
+        if not chosen and sel:
+            # sel might use a line id that belongs to a loop
+            for p in profiles:
+                pid = int(getattr(p, "id", -1))
+                if pid in sel:
+                    chosen.append(pid)
+                elif isinstance(p, ClosedLineLoop) and any(
+                    lid in sel for lid in p.line_ids
+                ):
+                    chosen.append(pid)
+        if not chosen:
+            return None  # need pick
+        # de-dupe preserving order
+        out: list[int] = []
+        for pid in chosen:
+            if pid not in out:
+                out.append(pid)
+        return out
 
     def _extrude(self) -> None:
-        """Extrude (pad) a closed sketch profile via distance dialog + rebuild worker."""
+        """Extrude (pad) closed sketch region(s) via distance dialog + rebuild worker."""
         sid = self._resolve_closed_sketch_id()
         skf = self.doc.find(sid) if sid >= 0 else None
         if skf is None or skf.sketch is None:
@@ -775,6 +790,32 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No closed profile to extrude", 4000)
             return
 
+        try:
+            profile_ids = self._resolve_profile_ids_for_command(
+                skf.sketch, title="Select Profile to Extrude"
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Extrude", str(exc))
+            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
+            return
+        if profile_ids is None:
+            QMessageBox.information(
+                self,
+                "Extrude",
+                "This sketch has more than one closed region.\n\n"
+                "Click inside a region to select it (filled highlight),\n"
+                "Ctrl+click to select more, then Extrude again.\n"
+                "Click empty space to clear the selection.",
+            )
+            self.statusBar().showMessage(
+                "Click a closed region in the sketch, then Extrude", 5000
+            )
+            # Stay in / enter sketch so the user can pick
+            if not self.viewport.in_sketch_mode:
+                self.viewport.enter_sketch(sid)
+                self._set_sketch_ribbon_enabled(True)
+            return
+
         dist, ok = QInputDialog.getDouble(
             self,
             "Extrude (Pad)",
@@ -792,21 +833,13 @@ class MainWindow(QMainWindow):
             self.viewport.exit_sketch()
             self._set_sketch_ribbon_enabled(False)
 
+        created = []
         try:
-            profile_entity_id = self._pick_closed_profile(
-                skf.sketch, title="Select Profile to Extrude"
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Extrude", str(exc))
-            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
-            return
-        if profile_entity_id == -2:
-            return  # cancelled picker
-
-        try:
-            feat = self.doc.create_extrude(
-                sid, float(dist), profile_entity_id=profile_entity_id
-            )
+            for pid in profile_ids:
+                feat = self.doc.create_extrude(
+                    sid, float(dist), profile_entity_id=int(pid)
+                )
+                created.append(feat)
         except ValueError as exc:
             QMessageBox.warning(self, "Extrude", str(exc))
             self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
@@ -815,11 +848,11 @@ class MainWindow(QMainWindow):
         self.viewport.schedule_rebuild()
         self.viewport.refresh_sketches()
         self._refresh_tree()
-        self._sync_selection(feat.id)
-        # Direction defaults forward; flip Reverse in PropertyManager after create
-        # (QInputDialog cannot host a checkbox).
+        if created:
+            self._sync_selection(created[-1].id)
+        names = ", ".join(f.name for f in created)
         self.statusBar().showMessage(
-            f"Created {feat.name} (distance={dist:g}) — use Reverse direction in PropertyManager to flip",
+            f"Created {names} (distance={dist:g}) — Reverse direction in PropertyManager to flip",
             4000,
         )
 
@@ -860,24 +893,38 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
+        try:
+            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Revolve", str(exc))
+            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
+            return
+        if profile_ids is None:
+            QMessageBox.information(
+                self,
+                "Revolve",
+                "Multiple closed regions — click the one to revolve in the sketch "
+                "(filled highlight), then Revolve again.",
+            )
+            if not self.viewport.in_sketch_mode:
+                self.viewport.enter_sketch(sid)
+                self._set_sketch_ribbon_enabled(True)
+            return
+        if len(profile_ids) > 1:
+            QMessageBox.information(
+                self,
+                "Revolve",
+                "Revolve uses one region at a time. Select a single region, then Revolve.",
+            )
+            return
+
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
             self._set_sketch_ribbon_enabled(False)
 
         try:
-            profile_entity_id = self._pick_closed_profile(
-                skf.sketch, title="Select Profile to Revolve"
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Revolve", str(exc))
-            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
-            return
-        if profile_entity_id == -2:
-            return
-
-        try:
             feat = self.doc.create_revolve(
-                sid, angle_degrees=float(ang), profile_entity_id=profile_entity_id
+                sid, angle_degrees=float(ang), profile_entity_id=int(profile_ids[0])
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Revolve", str(exc))
@@ -947,20 +994,34 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
         try:
-            profile_entity_id = self._pick_closed_profile(
-                skf.sketch, title="Select Profile to Fillet"
-            )
+            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
         except ValueError as exc:
             QMessageBox.warning(self, "Fillet", str(exc))
             self.statusBar().showMessage(f"Fillet failed: {exc}", 4000)
             return
-        if profile_entity_id == -2:
+        if profile_ids is None:
+            QMessageBox.information(
+                self,
+                "Fillet",
+                "Multiple closed regions — click the one to fillet in the sketch, "
+                "then Fillet again.",
+            )
+            if not self.viewport.in_sketch_mode:
+                self.viewport.enter_sketch(sid)
+                self._set_sketch_ribbon_enabled(True)
             return
+        if len(profile_ids) > 1:
+            QMessageBox.information(
+                self,
+                "Fillet",
+                "Fillet uses one region at a time. Select a single region, then Fillet.",
+            )
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             feat = self.doc.create_fillet(
@@ -968,7 +1029,7 @@ class MainWindow(QMainWindow):
                 float(dist),
                 float(radius),
                 segments=int(segs),
-                profile_entity_id=profile_entity_id,
+                profile_entity_id=int(profile_ids[0]),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Fillet", str(exc))
@@ -1042,20 +1103,34 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
         try:
-            profile_entity_id = self._pick_closed_profile(
-                skf.sketch, title="Select Profile to Pocket"
-            )
+            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
         except ValueError as exc:
             QMessageBox.warning(self, "Pocket", str(exc))
             self.statusBar().showMessage(f"Pocket failed: {exc}", 4000)
             return
-        if profile_entity_id == -2:
+        if profile_ids is None:
+            QMessageBox.information(
+                self,
+                "Pocket",
+                "Multiple closed regions — click the outer region in the sketch, "
+                "then Pocket again.",
+            )
+            if not self.viewport.in_sketch_mode:
+                self.viewport.enter_sketch(sid)
+                self._set_sketch_ribbon_enabled(True)
             return
+        if len(profile_ids) > 1:
+            QMessageBox.information(
+                self,
+                "Pocket",
+                "Pocket uses one outer region. Select a single region, then Pocket.",
+            )
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self._set_sketch_ribbon_enabled(False)
 
         try:
             feat = self.doc.create_pocket(
@@ -1064,7 +1139,7 @@ class MainWindow(QMainWindow):
                 float(hr),
                 (float(cx), float(cy)),
                 segments=int(segs),
-                profile_entity_id=profile_entity_id,
+                profile_entity_id=int(profile_ids[0]),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Pocket", str(exc))

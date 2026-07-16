@@ -26,6 +26,7 @@ from app.theme import (
     PLANE_FRONT,
     PLANE_RIGHT,
     PLANE_TOP,
+    PROFILE_FILL,
     SEL_BOX_CROSSING,
     SEL_BOX_WINDOW,
     SKETCH_COLOR,
@@ -300,6 +301,7 @@ class _InteractorFilter(QObject):
                 event.position().x(),
                 event.position().y(),
                 shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                ctrl=bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier),
             )
             return True  # consume — lock camera
         if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
@@ -312,6 +314,7 @@ class _InteractorFilter(QObject):
                 event.position().x(),
                 event.position().y(),
                 shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                ctrl=bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier),
             )
             return True
         if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
@@ -319,6 +322,7 @@ class _InteractorFilter(QObject):
                 event.position().x(),
                 event.position().y(),
                 shift=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+                ctrl=bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier),
             )
             return True
         if et == QEvent.Type.KeyPress:
@@ -1423,6 +1427,70 @@ class Viewport(QWidget):
             color=SKETCH_V, line_width=2, name="__sk_v", pickable=False, render=False,
         )
 
+    def selected_profile_ids(self) -> Set[int]:
+        """Closed-region ids currently selected in sketch mode (for Extrude)."""
+        if self._sketch_ctrl is None:
+            return set()
+        return set(self._sketch_ctrl.selected_profile_ids)
+
+    def _profile_fill_polydata(self, profile) -> Optional[pv.PolyData]:
+        """Filled polygon in world space for a closed profile highlight."""
+        from cadcore.profiles import profile_polygon_uv
+
+        if self._sketch_ctrl is None:
+            return None
+        fr = self._sketch_ctrl.sketch.frame
+        uvs = profile_polygon_uv(profile)
+        if len(uvs) < 3:
+            return None
+        pts = np.array([fr.to_world(uv) for uv in uvs], dtype=float)
+        n = len(pts)
+        # VTK polygon face: [n, i0, i1, ..., i{n-1}]
+        faces = np.hstack([[n], np.arange(n, dtype=np.int64)])
+        return pv.PolyData(pts, faces=faces)
+
+    def _update_profile_fill_visual(self) -> None:
+        """Show translucent fills for selected closed regions (profile pick)."""
+        self._remove_actor("__sk_profile_fill")
+        # Also clear multi-part fills
+        for name in list(self._overlay_actors.keys()):
+            if name.startswith("__sk_profile_fill"):
+                self._remove_actor(name)
+        if self._sketch_ctrl is None or not self._sketch_ctrl.selected_profile_ids:
+            return
+        from cadcore.profiles import profile_by_id
+
+        meshes: list[pv.PolyData] = []
+        for pid in self._sketch_ctrl.selected_profile_ids:
+            prof = profile_by_id(self._sketch_ctrl.sketch, pid)
+            if prof is None:
+                continue
+            pd = self._profile_fill_polydata(prof)
+            if pd is not None and pd.n_points >= 3:
+                meshes.append(pd)
+        if not meshes:
+            return
+        merged = meshes[0]
+        for m in meshes[1:]:
+            try:
+                merged = merged.merge(m)
+            except Exception:
+                pass
+        fill = PROFILE_FILL or SKETCH_SELECTED or ACCENT
+        # High opacity + no lighting so the fill reads clearly on both themes
+        # (soft-GL still blends a little with the gradient behind).
+        self._add_overlay_mesh(
+            merged,
+            color=fill,
+            opacity=0.72,
+            name="__sk_profile_fill",
+            pickable=False,
+            render=False,
+            show_edges=False,
+            lighting=False,
+            ambient=1.0,
+        )
+
     def _clear_sketch_overlays(self) -> None:
         for name in list(self._sketch_entity_actors):
             self._remove_actor(f"sk_e_{name}")
@@ -1438,6 +1506,7 @@ class Viewport(QWidget):
             "__sk_infer",
             "__sk_junctions",
             "__sk_dims",
+            "__sk_profile_fill",
         ):
             self._remove_actor(n)
         # Drop per-line dim labels if any
@@ -1944,7 +2013,9 @@ class Viewport(QWidget):
             return None
         return self._sketch_ctrl.sketch.frame.to_local(hit)
 
-    def _sketch_mouse_move(self, x: float, y: float, *, shift: bool = False) -> None:
+    def _sketch_mouse_move(
+        self, x: float, y: float, *, shift: bool = False, ctrl: bool = False
+    ) -> None:
         if self._sketch_ctrl is None:
             return
         t0 = time.perf_counter()
@@ -1993,7 +2064,9 @@ class Viewport(QWidget):
             self._update_handles_visual()
         self._request_render()
 
-    def _sketch_mouse_press(self, x: float, y: float, *, shift: bool = False) -> None:
+    def _sketch_mouse_press(
+        self, x: float, y: float, *, shift: bool = False, ctrl: bool = False
+    ) -> None:
         if self._sketch_ctrl is None:
             return
         self._update_snap_tolerance()
@@ -2010,7 +2083,7 @@ class Viewport(QWidget):
                     self._drag_before = snapshot_entity(ent0)
         n_before = len(self._sketch_ctrl.sketch.entities)
         msg = self._sketch_ctrl.on_press(
-            uv, display_xy=(float(x), float(y)), shift=shift
+            uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
         )
         sk = self._sketch_ctrl.sketch
         if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
@@ -2046,16 +2119,35 @@ class Viewport(QWidget):
         elif msg and msg.startswith("Drag"):
             self._begin_draw_lod()
             self.sketch_status.emit(f"Sketch: {msg}")
+        elif msg and msg.startswith("Selected profile"):
+            self._end_draw_lod()
+            self._clear_selbox()
+            self._rebuild_all_sketch_entities()
+            self._update_profile_fill_visual()
+            n = len(self._sketch_ctrl.selected_profile_ids)
+            self.sketch_status.emit(
+                f"Sketch: {n} region(s) selected" if n != 1 else "Sketch: 1 region selected"
+            )
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self._do_render()
+            return
         elif msg and msg.startswith("Selected"):
             self._end_draw_lod()
             self._clear_selbox()
             self._rebuild_all_sketch_entities()
+            self._update_profile_fill_visual()
             n = len(self._sketch_ctrl.selected_ids)
             self.sketch_status.emit(f"Sketch: Select ({n})" if n != 1 else "Sketch: Select")
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self._do_render()
+            return
         elif msg == "BoxSelect":
             self._begin_draw_lod()
             self._clear_selbox()
             self._rebuild_all_sketch_entities()  # clear highlight if selection wiped
+            self._update_profile_fill_visual()
             self.sketch_status.emit("Sketch: box select…")
         elif msg:
             # First click of a draw: enter light LOD; preview appears on next move
@@ -2066,7 +2158,9 @@ class Viewport(QWidget):
             self.sketch_status.emit(f"Sketch: {msg}")
         self._request_render()
 
-    def _sketch_mouse_release(self, x: float, y: float, *, shift: bool = False) -> None:
+    def _sketch_mouse_release(
+        self, x: float, y: float, *, shift: bool = False, ctrl: bool = False
+    ) -> None:
         if self._sketch_ctrl is None:
             return
         uv = self._mouse_to_uv(x, y)
@@ -2079,7 +2173,7 @@ class Viewport(QWidget):
         was = self._sketch_ctrl.drag
         was_box = self._sketch_ctrl.box_select is not None
         msg = self._sketch_ctrl.on_release(
-            uv, display_xy=(float(x), float(y)), shift=shift
+            uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
         )
         if was is not None:
             ent = self._sketch_ctrl.sketch.find_entity(was.entity_id)
@@ -2102,6 +2196,7 @@ class Viewport(QWidget):
             self._rebuild_all_sketch_entities()
             self._update_handles_visual()
             self._update_dim_labels()
+            self._update_profile_fill_visual()
             n = len(self._sketch_ctrl.selected_ids)
             if msg and msg.startswith("BoxSelect:"):
                 parts = msg.split(":")

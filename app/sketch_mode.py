@@ -107,8 +107,10 @@ class SketchController:
         self.drag: Optional[DragState] = None
         self.box_select: Optional[BoxSelectState] = None
         self.hover_handle: Optional[Handle] = None
-        # Multi-selection source of truth
+        # Multi-selection source of truth (entity geometry)
         self.selected_ids: Set[int] = set()
+        # Closed-region (extrude profile) selection — ids may be negative (line loops)
+        self.selected_profile_ids: Set[int] = set()
         self.preview_uv: Optional[Vec2] = None
         self.last_snap: SnapResult = SnapResult((0, 0), "none")
         # World-unit point snap radius; viewport overwrites from pixel scale
@@ -130,17 +132,39 @@ class SketchController:
             self.selected_ids.clear()
         else:
             self.selected_ids = {int(eid)}
+            self.selected_profile_ids.clear()
 
     def clear_selection(self) -> None:
         self.selected_ids.clear()
+        self.selected_profile_ids.clear()
 
     def set_selection(self, ids) -> None:
         self.selected_ids = {int(i) for i in ids if int(i) >= 0}
+        if self.selected_ids:
+            self.selected_profile_ids.clear()
 
     def add_to_selection(self, ids) -> None:
         for i in ids:
             if int(i) >= 0:
                 self.selected_ids.add(int(i))
+        if self.selected_ids:
+            self.selected_profile_ids.clear()
+
+    def clear_profile_selection(self) -> None:
+        self.selected_profile_ids.clear()
+
+    def set_profile_selection(self, ids) -> None:
+        self.selected_profile_ids = {int(i) for i in ids}
+        if self.selected_profile_ids:
+            self.selected_ids.clear()
+
+    def toggle_profile_id(self, pid: int) -> None:
+        pid = int(pid)
+        if pid in self.selected_profile_ids:
+            self.selected_profile_ids.discard(pid)
+        else:
+            self.selected_profile_ids.add(pid)
+        self.selected_ids.clear()
 
     def set_snap_world_tol(self, point_tol: float, *, grid: Optional[float] = None) -> None:
         """Update world-space snap tolerances (from pixel radius × world/px)."""
@@ -395,6 +419,7 @@ class SketchController:
         *,
         display_xy: Optional[Tuple[float, float]] = None,
         shift: bool = False,
+        ctrl: bool = False,
     ) -> Optional[str]:
         if self.tool == SketchTool.SELECT:
             h = self.pick_handle(raw_uv)
@@ -408,9 +433,24 @@ class SketchController:
                     start_uv=h.uv,
                 )
                 return f"Drag {h.name}"
+            # Closed region fill takes priority over edge-body picks so clicking
+            # "inside the shape" selects the region for Extrude (Ctrl multi-adds).
+            from cadcore.profiles import pick_closed_profile_at
+
+            prof = pick_closed_profile_at(self.sketch, raw_uv)
+            if prof is not None:
+                self.box_select = None
+                pid = int(getattr(prof, "id", -1))
+                if ctrl or shift:
+                    self.toggle_profile_id(pid)
+                else:
+                    self.set_profile_selection([pid])
+                n = len(self.selected_profile_ids)
+                return f"Selected profile {pid} (n={n})"
             eid = self.pick_entity_body(raw_uv)
             if eid is not None:
                 self.box_select = None
+                self.selected_profile_ids.clear()
                 if shift:
                     # Shift-click toggles / adds single entity
                     if eid in self.selected_ids:
@@ -420,10 +460,12 @@ class SketchController:
                 else:
                     self.selected_entity_id = eid
                 return f"Selected entity {eid}"
-            # Empty space → start box select (clear unless Shift-add)
-            baseline = set(self.selected_ids) if shift else set()
-            if not shift:
+            # Empty space → start box select (clear unless Shift/Ctrl-add)
+            multi = bool(shift or ctrl)
+            baseline = set(self.selected_ids) if multi else set()
+            if not multi:
                 self.selected_ids.clear()
+                self.selected_profile_ids.clear()
             xy = (
                 (float(display_xy[0]), float(display_xy[1]))
                 if display_xy is not None
@@ -436,7 +478,7 @@ class SketchController:
                 current_uv=uv,
                 current_xy=xy,
                 baseline_ids=baseline,
-                add_mode=bool(shift),
+                add_mode=multi,
             )
             return "BoxSelect"
 
@@ -454,6 +496,7 @@ class SketchController:
         *,
         display_xy: Optional[Tuple[float, float]] = None,
         shift: bool = False,
+        ctrl: bool = False,
     ) -> Optional[str]:
         if self.drag is not None:
             sn = self.snap(raw_uv, drawing=False)
@@ -466,13 +509,14 @@ class SketchController:
             bs.current_uv = (float(raw_uv[0]), float(raw_uv[1]))
             if display_xy is not None:
                 bs.current_xy = (float(display_xy[0]), float(display_xy[1]))
-            # Shift on release also enables add
-            add = bs.add_mode or bool(shift)
+            # Shift/Ctrl on release also enables add
+            add = bs.add_mode or bool(shift or ctrl)
             self.box_select = None
             if bs.drag_px < BOX_SELECT_MIN_PX:
-                # Click empty: keep cleared selection (or baseline if was shift-only click)
+                # Click empty: keep cleared selection (or baseline if was multi-add click)
                 if not add:
                     self.selected_ids.clear()
+                    self.selected_profile_ids.clear()
                 return "BoxSelectClear"
             u0, v0, u1, v1 = bs.uv_rect()
             window = bs.is_window
@@ -481,6 +525,7 @@ class SketchController:
                 self.selected_ids = set(bs.baseline_ids) | hits
             else:
                 self.selected_ids = set(hits)
+            self.selected_profile_ids.clear()
             mode = "window" if window else "crossing"
             return f"BoxSelect:{mode}:{len(self.selected_ids)}"
         return None

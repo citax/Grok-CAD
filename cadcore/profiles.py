@@ -259,6 +259,49 @@ def point_in_profile(uv: Vec2, profile: object, *, margin: float = 0.0) -> bool:
     return False
 
 
+def profile_area(profile: object) -> float:
+    """Signed-area magnitude of a closed profile (for innermost pick)."""
+    if isinstance(profile, ClosedLineLoop):
+        return float(profile.area())
+    if isinstance(profile, RectEntity):
+        u0, u1 = sorted([profile.c0[0], profile.c1[0]])
+        v0, v1 = sorted([profile.c0[1], profile.c1[1]])
+        return abs((u1 - u0) * (v1 - v0))
+    if isinstance(profile, CircleEntity):
+        return float(np.pi * profile.radius * profile.radius)
+    return 0.0
+
+
+def pick_closed_profile_at(sketch: Sketch, uv: Vec2) -> Optional[object]:
+    """Closed profile containing ``uv``, preferring the smallest (innermost).
+
+    Returns None if the point is outside every closed region.
+    """
+    try:
+        closed = list_closed_profiles(sketch)
+    except ValueError:
+        return None
+    hits = [p for p in closed if point_in_profile(uv, p)]
+    if not hits:
+        return None
+    return min(hits, key=profile_area)
+
+
+def profile_by_id(sketch: Sketch, profile_id: int) -> Optional[object]:
+    """Look up a closed profile (entity or virtual line-loop) by id."""
+    try:
+        closed = list_closed_profiles(sketch)
+    except ValueError:
+        return None
+    pid = int(profile_id)
+    for p in closed:
+        if int(getattr(p, "id", -1)) == pid:
+            return p
+        if isinstance(p, ClosedLineLoop) and pid in p.line_ids:
+            return p
+    return None
+
+
 def _point_in_poly(uv: Vec2, verts: Sequence[Vec2]) -> bool:
     x, y = float(uv[0]), float(uv[1])
     n = len(verts)

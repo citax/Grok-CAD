@@ -49,6 +49,8 @@ _PALETTES: Dict[str, Dict[str, str]] = {
         "SKETCH_COLOR": "#1A202C",  # near-black geometry
         "SKETCH_PREVIEW": "#CA8A04",  # gold preview
         "SKETCH_SELECTED": "#7C3AED",  # vivid violet selection
+        # Filled closed-region highlight (extrude profile pick) — high contrast on light bg
+        "PROFILE_FILL": "#7C3AED",
         "SEL_BOX_WINDOW": "#1E3A8A",  # navy window box
         "SEL_BOX_CROSSING": "#BE123C",  # rose crossing box
         "HANDLE_COLOR": "#D97706",
@@ -80,6 +82,8 @@ _PALETTES: Dict[str, Dict[str, str]] = {
         "SKETCH_COLOR": "#E2E8F0",
         "SKETCH_PREVIEW": "#FBBF24",
         "SKETCH_SELECTED": "#34D399",  # green (was cyan — farther from blue window)
+        # Filled closed-region highlight — bright amber on dark bg
+        "PROFILE_FILL": "#FBBF24",
         "SEL_BOX_WINDOW": "#2563EB",
         "SEL_BOX_CROSSING": "#E879F9",  # pink-magenta
         "HANDLE_COLOR": "#FDE047",
@@ -97,6 +101,7 @@ AXIS_X = AXIS_Y = AXIS_Z = AXIS_LABEL = ""
 SOLID_COLOR = SOLID_SELECTED = ""
 PLANE_FRONT = PLANE_TOP = PLANE_RIGHT = ""
 SKETCH_COLOR = SKETCH_PREVIEW = SKETCH_SELECTED = ""
+PROFILE_FILL = ""
 SEL_BOX_WINDOW = SEL_BOX_CROSSING = ""
 HANDLE_COLOR = HANDLE_HOVER = SKETCH_GRID = SKETCH_H = SKETCH_V = ""
 
@@ -127,7 +132,7 @@ def apply_palette(name: str) -> str:
     global AXIS_X, AXIS_Y, AXIS_Z, AXIS_LABEL
     global SOLID_COLOR, SOLID_SELECTED
     global PLANE_FRONT, PLANE_TOP, PLANE_RIGHT
-    global SKETCH_COLOR, SKETCH_PREVIEW, SKETCH_SELECTED
+    global SKETCH_COLOR, SKETCH_PREVIEW, SKETCH_SELECTED, PROFILE_FILL
     global SEL_BOX_WINDOW, SEL_BOX_CROSSING
     global HANDLE_COLOR, HANDLE_HOVER, SKETCH_GRID, SKETCH_H, SKETCH_V
 
@@ -156,6 +161,7 @@ def apply_palette(name: str) -> str:
     SKETCH_COLOR = p["SKETCH_COLOR"]
     SKETCH_PREVIEW = p["SKETCH_PREVIEW"]
     SKETCH_SELECTED = p["SKETCH_SELECTED"]
+    PROFILE_FILL = p["PROFILE_FILL"]
     SEL_BOX_WINDOW = p["SEL_BOX_WINDOW"]
     SEL_BOX_CROSSING = p["SEL_BOX_CROSSING"]
     HANDLE_COLOR = p["HANDLE_COLOR"]
