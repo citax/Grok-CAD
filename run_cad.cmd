@@ -22,5 +22,10 @@ set "QT_QPA_PLATFORM="
 set "QT_XCB_GL_INTEGRATION="
 
 cd /d "%ROOT%"
-"%VENV%\Scripts\python.exe" -m app.main %*
+REM Prefer pythonw for Desktop/GUI launch (no console window). Fall back to python.exe.
+if exist "%VENV%\Scripts\pythonw.exe" (
+  start "" "%VENV%\Scripts\pythonw.exe" -m app.main %*
+) else (
+  "%VENV%\Scripts\python.exe" -m app.main %*
+)
 exit /b %ERRORLEVEL%

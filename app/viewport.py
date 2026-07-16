@@ -426,6 +426,11 @@ class Viewport(QWidget):
             self.plotter = None  # type: ignore
             return
 
+        # pyvistaqt maps VTK trackball cursors (hand / size-all / resize) onto the
+        # Qt interactor via CursorChangedEvent → setCursor(). Leave the platform
+        # default: never set a shape on the GL widget.
+        self._disable_vtk_cursor_overrides()
+
         # Graphite vertical gradient (top lighter → bottom darker)
         try:
             self.plotter.set_background(VP_BG_BOTTOM, top=VP_BG_TOP)
@@ -441,6 +446,27 @@ class Viewport(QWidget):
     @property
     def in_sketch_mode(self) -> bool:
         return self._sketch_ctrl is not None
+
+    def _disable_vtk_cursor_overrides(self) -> None:
+        """Stop pyvistaqt/VTK from calling QWidget.setCursor on the interactor.
+
+        QVTKRenderWindowInteractor (pyvistaqt/rwi.py) observes CursorChangedEvent
+        and maps VTK_CURSOR_* to Qt shapes. That is what changes the mouse over
+        the 3D view after our own setCursor code was removed.
+        """
+        if self.plotter is None:
+            return
+        iw = self.plotter.interactor
+        if iw is None:
+            return
+
+        def _platform_cursor(*_args, **_kwargs) -> None:
+            iw.unsetCursor()
+
+        # Replace ShowCursor / HideCursor used by CursorChangedEvent + VTK hide
+        iw.ShowCursor = _platform_cursor  # type: ignore[method-assign]
+        iw.HideCursor = _platform_cursor  # type: ignore[method-assign]
+        iw.unsetCursor()
 
     # ----- setup -----
     def _configure_softgl_render(self) -> None:
