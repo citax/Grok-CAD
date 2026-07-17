@@ -319,26 +319,42 @@ class MainWindow(QMainWindow):
         insert_m.addAction(act_pok)
 
     def _ribbon_button(self, act: QAction) -> QToolButton:
+        """SolidWorks-style large command button: icon above text."""
         btn = QToolButton()
         btn.setDefaultAction(act)
         btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        btn.setIconSize(QSize(28, 28))
+        btn.setIconSize(QSize(32, 32))
         btn.setAutoRaise(True)
+        btn.setMinimumSize(QSize(70, 58))
         return btn
 
+    @staticmethod
+    def _cmd_separator() -> QWidget:
+        """Vertical group separator between command clusters (SW ribbon groups)."""
+        from PySide6.QtWidgets import QFrame
+
+        sep = QFrame()
+        sep.setObjectName("CmdGroupSep")
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Plain)
+        sep.setFixedWidth(1)
+        return sep
+
     def _build_command_manager(self) -> None:
-        """SolidWorks-inspired CommandManager: Features / Sketch / Evaluate tabs."""
+        """SolidWorks CommandManager: Features / Sketch / Evaluate tabs + large buttons."""
         bar = QToolBar("CommandManager")
         bar.setObjectName("CommandManagerBar")
         bar.setMovable(False)
         bar.setFloatable(False)
+        bar.setIconSize(QSize(32, 32))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
 
         self.cmd_tabs = QTabWidget()
         self.cmd_tabs.setObjectName("CommandManager")
         self.cmd_tabs.setDocumentMode(True)
+        self.cmd_tabs.setUsesScrollButtons(True)
 
-        # --- Features tab ---
+        # --- Features tab (SW: Sketch + Features groups) ---
         self.act_sketch = QAction(
             fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self
         )
@@ -382,10 +398,13 @@ class MainWindow(QMainWindow):
 
         feat_w = QWidget()
         feat_row = QHBoxLayout(feat_w)
-        feat_row.setContentsMargins(4, 2, 4, 2)
-        feat_row.setSpacing(4)
+        feat_row.setContentsMargins(6, 4, 6, 4)
+        feat_row.setSpacing(2)
+        # Group: Sketch entry
+        feat_row.addWidget(self._ribbon_button(self.act_sketch))
+        feat_row.addWidget(self._cmd_separator())
+        # Group: solid features
         for act in (
-            self.act_sketch,
             self.act_extrude,
             self.act_revolve,
             self.act_fillet,
@@ -393,13 +412,15 @@ class MainWindow(QMainWindow):
         ):
             feat_row.addWidget(self._ribbon_button(act))
         feat_row.addStretch(1)
-        self.cmd_tabs.addTab(feat_w, "Features")
+        self.cmd_tabs.addTab(
+            feat_w, fa_icon("fa5s.cube", color=ACCENT), "Features"
+        )
 
-        # --- Sketch tab ---
+        # --- Sketch tab (SW: tools | dimensions | constraints | exit) ---
         sketch_w = QWidget()
         sk_row = QHBoxLayout(sketch_w)
-        sk_row.setContentsMargins(4, 2, 4, 2)
-        sk_row.setSpacing(4)
+        sk_row.setContentsMargins(6, 4, 6, 4)
+        sk_row.setSpacing(2)
         group = QActionGroup(self)
         group.setExclusive(True)
         tool_defs = (
@@ -424,7 +445,11 @@ class MainWindow(QMainWindow):
             group.addAction(act)
             self._sketch_tool_actions[tool] = act
             sk_row.addWidget(self._ribbon_button(act))
-        # H / V / Equal — constraints that earn their place next to dimensions
+            # Separator after draw tools, before dimension
+            if tool is SketchTool.CIRCLE:
+                sk_row.addWidget(self._cmd_separator())
+        sk_row.addWidget(self._cmd_separator())
+        # Constraints group
         self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horizontal", self)
         self.act_horiz.setToolTip("Make selected line(s) horizontal")
         self.act_horiz.setShortcut(QKeySequence("H"))
@@ -442,6 +467,7 @@ class MainWindow(QMainWindow):
         self.act_equal.setShortcut(QKeySequence("="))
         self.act_equal.triggered.connect(self._make_equal)
         sk_row.addWidget(self._ribbon_button(self.act_equal))
+        sk_row.addWidget(self._cmd_separator())
         self.act_exit_sketch = QAction(
             fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit Sketch", self
         )
@@ -449,24 +475,29 @@ class MainWindow(QMainWindow):
         self.act_exit_sketch.triggered.connect(self._exit_sketch)
         sk_row.addWidget(self._ribbon_button(self.act_exit_sketch))
         sk_row.addStretch(1)
-        self._sketch_tab_index = self.cmd_tabs.addTab(sketch_w, "Sketch")
+        self._sketch_tab_index = self.cmd_tabs.addTab(
+            sketch_w, fa_icon("fa5s.pencil-alt", color=ACCENT), "Sketch"
+        )
 
         # --- Evaluate tab ---
         eval_w = QWidget()
         ev_row = QHBoxLayout(eval_w)
-        ev_row.setContentsMargins(4, 2, 4, 2)
+        ev_row.setContentsMargins(6, 4, 6, 4)
         ev_row.addWidget(self._ribbon_button(self.act_export_stl))
         ev_row.addStretch(1)
-        self.cmd_tabs.addTab(eval_w, "Evaluate")
+        self.cmd_tabs.addTab(
+            eval_w, fa_icon("fa5s.chart-bar", color=ACCENT), "Evaluate"
+        )
 
         # Stretch ribbon across full width
         host = QWidget()
+        host.setObjectName("CommandManagerHost")
         hl = QVBoxLayout(host)
         hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
         hl.addWidget(self.cmd_tabs)
         host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.addWidget(host)
-        # Keep a hidden sketch_tb flag for code that toggles sketch chrome visibility
         self.sketch_tb = bar  # type: ignore[assignment]
         self._set_sketch_ribbon_enabled(False)
 

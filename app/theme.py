@@ -24,40 +24,41 @@ _THEME_QSS = Path(__file__).with_name("theme.qss")
 # ---------------------------------------------------------------------------
 _PALETTES: Dict[str, Dict[str, str]] = {
     "light": {
-        # SolidWorks-like chrome: light grey panels, blue accent
-        "BG_APP": "#E8EAED",
-        "BG_PANEL": "#F5F6F8",
-        "BG_ELEVATED": "#FFFFFF",
-        "ACCENT": "#2B6CB0",
-        "TEXT_PRIMARY": "#1A202C",
-        "TEXT_SECONDARY": "#4A5568",
-        "BORDER": "#CBD5E0",
-        # Viewport: soft cool grey-blue gradient
-        "VP_BG_TOP": "#D0D7E2",
-        "VP_BG_BOTTOM": "#B8C2D0",
-        "GRID_COLOR": "#718096",
-        "AXIS_X": "#C53030",
-        "AXIS_Y": "#276749",
-        "AXIS_Z": "#2B6CB0",
-        "AXIS_LABEL": "#1A202C",
-        "SOLID_COLOR": "#718096",
-        "SOLID_SELECTED": "#C05621",
-        "PLANE_FRONT": "#3182CE",
-        "PLANE_TOP": "#38A169",
-        "PLANE_RIGHT": "#E53E3E",
+        # SolidWorks-like chrome: cool light grey panels, SW blue accent
+        "BG_APP": "#D6D9DE",
+        "BG_PANEL": "#E8EAED",
+        "BG_ELEVATED": "#F7F8FA",
+        "ACCENT": "#0070C0",  # classic SW command blue
+        "TEXT_PRIMARY": "#1B1F23",
+        "TEXT_SECONDARY": "#5C6570",
+        "BORDER": "#B8BEC6",
+        # Viewport: soft neutral grey (SW graphics area — not blue-tinted)
+        "VP_BG_TOP": "#E4E7EC",
+        "VP_BG_BOTTOM": "#C8CDD6",
+        "GRID_COLOR": "#8A929C",
+        # RGB triad (SW reference triad / origin arrows)
+        "AXIS_X": "#E53935",  # red  — Right
+        "AXIS_Y": "#43A047",  # green — Top
+        "AXIS_Z": "#1E88E5",  # blue  — Front
+        "AXIS_LABEL": "#1B1F23",
+        "SOLID_COLOR": "#8B9199",
+        "SOLID_SELECTED": "#E65100",
+        "PLANE_FRONT": "#1E88E5",
+        "PLANE_TOP": "#43A047",
+        "PLANE_RIGHT": "#E53935",
         # Dark geometry on light viewport (high contrast)
-        "SKETCH_COLOR": "#1A202C",  # near-black geometry
-        "SKETCH_PREVIEW": "#CA8A04",  # gold preview
-        "SKETCH_SELECTED": "#7C3AED",  # vivid violet selection
-        # Filled closed-region highlight (extrude profile pick) — high contrast on light bg
-        "PROFILE_FILL": "#7C3AED",
-        "SEL_BOX_WINDOW": "#1E3A8A",  # navy window box
-        "SEL_BOX_CROSSING": "#BE123C",  # rose crossing box
-        "HANDLE_COLOR": "#D97706",
-        "HANDLE_HOVER": "#C2410C",
-        "SKETCH_GRID": "#A0AEC0",
-        "SKETCH_H": "#C53030",
-        "SKETCH_V": "#276749",
+        "SKETCH_COLOR": "#1B1F23",
+        "SKETCH_PREVIEW": "#F9A825",
+        "SKETCH_SELECTED": "#6A1B9A",
+        "PROFILE_FILL": "#7B1FA2",
+        "SEL_BOX_WINDOW": "#0D47A1",
+        "SEL_BOX_CROSSING": "#C62828",
+        "HANDLE_COLOR": "#EF6C00",
+        "HANDLE_HOVER": "#E65100",
+        # Sketch: faint grid; H=red / V=green like SW sketcher
+        "SKETCH_GRID": "#B0B7C0",
+        "SKETCH_H": "#E53935",
+        "SKETCH_V": "#43A047",
     },
     "dark": {
         "BG_APP": "#1e2228",

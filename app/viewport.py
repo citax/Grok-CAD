@@ -545,22 +545,30 @@ class Viewport(QWidget):
 
     def _setup_helpers(self) -> None:
         assert self.plotter is not None
-        # No environment bounds box — keeps the scene uncluttered.
+        # SolidWorks-like: no environment bounds box; no scene-spanning grey axes.
+        # Orientation lives in the corner triad; model origin is a short RGB triad.
+        self._origin_axes_actor = None
+        self._corner_axes_actor = None
         self._refresh_world_helpers(force=True)
-        # Corner orientation triad — RGB axes + high-contrast caption labels.
-        # PyVista 0.48 add_axes() has no label_color kwarg — set caption colours
-        # on the vtkAxesActor after creation (do not swallow API errors).
+        # Corner reference triad (SW bottom-left compass) — fixed screen size.
         try:
             actor = self.plotter.add_axes(
-                line_width=2,
+                interactive=False,
+                line_width=3,
                 xlabel="X",
                 ylabel="Y",
                 zlabel="Z",
                 x_color=AXIS_X,
                 y_color=AXIS_Y,
                 z_color=AXIS_Z,
-                viewport=(0.0, 0.0, 0.18, 0.18),
+                # Compact SW-style corner footprint
+                viewport=(0.0, 0.0, 0.14, 0.14),
+                cone_radius=0.45,
+                shaft_length=0.78,
+                tip_length=0.22,
+                ambient=0.55,
             )
+            self._corner_axes_actor = actor
             self._style_axes_captions(actor)
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
@@ -595,12 +603,19 @@ class Viewport(QWidget):
         return 50.0
 
     def _refresh_world_helpers(self, *, force: bool = False) -> None:
-        """Rebuild origin glyph + world XYZ axes sized for the current scene."""
+        """Rebuild SW-style origin RGB triad + scale reference planes.
+
+        Big CAD packages (SolidWorks, Fusion, Inventor) do **not** draw long
+        monochrome axis lines through the scene. They use:
+          * a small RGB origin triad at (0,0,0)
+          * a fixed corner orientation triad (screen-space)
+        """
         if not self.plotter:
             return
         char = self._compute_char_mm()
         new_half = plane_half_mm(char)
-        new_axis = axis_length_mm(char)
+        # Short origin triad — ~12% of characteristic size (readable, not dominant)
+        new_axis = max(6.0, min(axis_length_mm(char) * 0.55, char * 0.12, 40.0))
         if (
             not force
             and abs(char - self._char_mm) / max(self._char_mm, 1.0) < 0.08
@@ -611,39 +626,78 @@ class Viewport(QWidget):
         self._axis_len = new_axis
         prev_plane = self._plane_half
         self._plane_half = new_half
-        oh, rr = origin_glyph_sizes(char)
-        self._remove_actor("__origin")
-        self.plotter.add_mesh(
-            _origin_glyph_polydata(half=oh, ring_r=rr),
-            color=TEXT_PRIMARY,
-            line_width=2.0,
-            name="__origin",
-            pickable=False,
-            render=False,
-        )
-        axis_color = GRID_COLOR
-        L = float(self._axis_len)
-        for end, name in (
-            ((L, 0, 0), "__ax"),
-            ((0, L, 0), "__ay"),
-            ((0, 0, L), "__az"),
-        ):
+
+        # Remove legacy monochrome helpers if present
+        for name in ("__origin", "__ax", "__ay", "__az"):
             self._remove_actor(name)
-            self.plotter.add_mesh(
-                pv.Line((0, 0, 0), end),
-                color=axis_color,
-                line_width=1.5,
-                name=name,
-                pickable=False,
-                opacity=0.45,
-                render=False,
-            )
+
+        L = float(self._axis_len)
+        self._install_origin_rgb_triad(L)
+
         # Rebuild reference planes when half-extent changes materially
         if force or abs(prev_plane - self._plane_half) / max(prev_plane, 1.0) > 0.08:
             self._rebuild_reference_planes()
         # Keep sketch-mode visibility rules
         if self.in_sketch_mode:
             self._set_sketch_2d_chrome(True)
+
+    def _install_origin_rgb_triad(self, length_mm: float) -> None:
+        """Short RGB arrow triad at world origin (SolidWorks origin style)."""
+        if not self.plotter:
+            return
+        L = max(3.0, float(length_mm))
+        # Remove previous origin axes actor from the renderer
+        prev = getattr(self, "_origin_axes_actor", None)
+        if prev is not None:
+            try:
+                self.plotter.renderer.RemoveActor(prev)
+            except Exception:
+                try:
+                    self.plotter.remove_actor(prev, render=False)
+                except Exception:
+                    pass
+            self._origin_axes_actor = None
+        try:
+            actor = self.plotter.add_axes_at_origin(
+                x_color=AXIS_X,
+                y_color=AXIS_Y,
+                z_color=AXIS_Z,
+                xlabel="",
+                ylabel="",
+                zlabel="",
+                line_width=2,
+                labels_off=True,
+            )
+            # vtkAxesActor total length in world units
+            try:
+                actor.SetTotalLength(L, L, L)
+            except Exception:
+                pass
+            try:
+                actor.SetShaftTypeToCylinder()
+                actor.SetTipTypeToCone()
+                actor.SetCylinderRadius(0.025)
+                actor.SetConeRadius(0.08)
+            except Exception:
+                pass
+            self._origin_axes_actor = actor
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] origin triad: {exc}", file=sys.stderr)
+            # Fallback: three short coloured line segments
+            for end, name, col in (
+                ((L, 0, 0), "__ax", AXIS_X),
+                ((0, L, 0), "__ay", AXIS_Y),
+                ((0, 0, L), "__az", AXIS_Z),
+            ):
+                self._remove_actor(name)
+                self.plotter.add_mesh(
+                    pv.Line((0, 0, 0), end),
+                    color=col,
+                    line_width=3.0,
+                    name=name,
+                    pickable=False,
+                    render=False,
+                )
 
     def _rebuild_reference_planes(self) -> None:
         if not self.plotter or self._doc is None:
@@ -1337,27 +1391,26 @@ class Viewport(QWidget):
         self.sketch_exited.emit()
 
     def _set_sketch_2d_chrome(self, enabled: bool) -> None:
-        """Toggle 2D sketch chrome: hide world 3D axes/solids clutter; flat lines only."""
+        """Toggle 2D sketch chrome: hide 3D origin triad; keep sketch H/V axes."""
         if not self.plotter:
             return
-        # World XYZ helpers are 3D cues — hide while sketching in pure 2D
-        for name in ("__ax", "__ay", "__az"):
+        vis = 0 if enabled else 1
+        # Short RGB origin triad (world) — hide in pure 2D sketch
+        for name in ("__ax", "__ay", "__az", "__origin"):
             act = self._get_named_actor(name)
             if act is not None:
                 try:
-                    act.SetVisibility(0 if enabled else 1)
+                    act.SetVisibility(vis)
                 except Exception:
                     pass
-        # Corner orientation triad is 3D — hide in sketch
-        try:
-            for name, actor in list(self.plotter.actors.items()):
-                if "Axes" in name or name.startswith("CubeAxes"):
-                    try:
-                        actor.SetVisibility(0 if enabled else 1)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        oa = getattr(self, "_origin_axes_actor", None)
+        if oa is not None:
+            try:
+                oa.SetVisibility(vis)
+            except Exception:
+                pass
+        # Corner orientation triad is still useful in sketch (SW keeps it) — leave on.
+        # (Previously hidden; SW sketcher keeps the corner triad for orientation.)
 
     def sketch_cursor_uv(self) -> Optional[Vec2]:
         """Last known sketch-plane UV under the cursor (for paste placement)."""
@@ -1533,17 +1586,17 @@ class Viewport(QWidget):
         self.plotter.add_mesh(
             grid, color=SKETCH_GRID, line_width=1, name="__sk_grid", pickable=False, render=False
         )
-        # H axis (u) and V axis (v) through origin — coplanar with user strokes
-        # Axis length matches grid half so orientation reads at the working scale.
+        # Sketch H (red) / V (green) axes — SolidWorks sketcher convention.
+        # Slightly thicker than grid; full grid span so orientation reads at any zoom.
         self._remove_actor("__sk_h")
         self._remove_actor("__sk_v")
         self.plotter.add_mesh(
             pv.Line(fr.to_world((-half, 0)), fr.to_world((half, 0))),
-            color=SKETCH_H, line_width=2, name="__sk_h", pickable=False, render=False,
+            color=SKETCH_H, line_width=2.5, name="__sk_h", pickable=False, render=False,
         )
         self.plotter.add_mesh(
             pv.Line(fr.to_world((0, -half)), fr.to_world((0, half))),
-            color=SKETCH_V, line_width=2, name="__sk_v", pickable=False, render=False,
+            color=SKETCH_V, line_width=2.5, name="__sk_v", pickable=False, render=False,
         )
 
     def selected_profile_ids(self) -> Set[int]:
