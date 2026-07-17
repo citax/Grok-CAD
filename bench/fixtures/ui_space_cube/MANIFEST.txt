@@ -1,0 +1,24 @@
+passed=22 failed=0
+OK opening: no feature selected (no amber slab)
+OK plane half=16 (open)
+OK planes at low opacity on open
+OK Space: menu visible with 13 actions
+OK Space break: no menu when shortcut disabled (check is sharp)
+OK chamfered cube topology faces=6 edges=12 corners=8
+OK view cube controller installed
+OK no legacy ball gizmo attribute
+OK face:+x → right side_ok comp=51.20 Δ=49.31
+OK face:-x → left side_ok comp=-51.20 Δ=101.47
+OK face:+y → top side_ok comp=51.20 Δ=58.99
+OK face:-y → bottom side_ok comp=-51.20 Δ=96.16
+OK face:+z → front side_ok comp=51.20 Δ=49.31
+OK face:-z → back side_ok comp=-51.20 Δ=101.47
+OK +X vs -X camera differ by 102.4
+OK corner iso: camera offset all axes [29.56033378 29.56033378 29.56033378] Δ=47.07
+OK cube drag orbit moved camera Δ=17.50
+OK cube mouse click changed view Δ=12.58
+OK tiny part screenshot
+OK large part screenshot
+OK sketch mode
+OK toolbar chrome grabbed
+

@@ -6,7 +6,7 @@ import os
 from typing import Dict
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
@@ -99,13 +99,16 @@ class MainWindow(QMainWindow):
         if getattr(self.viewport, "gl_renderer", ""):
             self._on_renderer_info(self.viewport.gl_renderer)
 
-        for f in self.doc.features:
-            if f.type is FeatureType.PLANE_FRONT:
-                self.doc.selected_id = f.id
-                break
+        # Opening screen: do NOT pre-select a plane — selection paints a heavy
+        # amber fill and turns the empty workspace into an unreadable smear.
+        self.doc.selected_id = -1
         self._refresh_tree()
-        self._sync_selection(self.doc.selected_id)
+        self._sync_selection(-1)
         self._set_ready_status()
+        # Space must work even when focus is inside the VTK interactor
+        self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._space_shortcut.activated.connect(self._on_space_bar)
 
     # ----- chrome -----
     def _format_env_status(self) -> str:
@@ -1622,16 +1625,19 @@ class MainWindow(QMainWindow):
             if text and (text.isdigit() or text in ".-"):
                 if self.viewport._accept_length_char(text):
                     return
-        # Space → view orientation picker (SolidWorks-style view shortcut)
-        if event.key() == Qt.Key.Key_Space and not self.viewport.in_sketch_mode:
-            self._show_view_orientation_menu()
-            return
         super().keyPressEvent(event)
+
+    def _on_space_bar(self) -> None:
+        """Application-wide Space: view picker (VTK steals focus from MainWindow)."""
+        if self.viewport.in_sketch_mode:
+            return
+        self._show_view_orientation_menu()
 
     def _show_view_orientation_menu(self) -> None:
         """Space-bar view menu: standard views + axis look-along."""
         menu = QMenu(self)
         menu.setObjectName("ViewOrientationMenu")
+        menu.setTitle("View Orientation")
         views = (
             ("Front", "front"),
             ("Back", "back"),
@@ -1655,6 +1661,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_fit = menu.addAction("Zoom to Fit")
         act_fit.triggered.connect(self.viewport.zoom_to_fit)
-        # Pop near the viewport centre
+        # Pop near the viewport centre so the user sees it
         gp = self.viewport.mapToGlobal(self.viewport.rect().center())
-        menu.exec(gp)
+        menu.popup(gp)
+        # Keep a ref so GC does not kill the menu before the user clicks
+        self._view_menu = menu

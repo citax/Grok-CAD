@@ -583,7 +583,8 @@ class Viewport(QWidget):
         self._origin_axes_actor = None
         self._corner_axes_actor = None
         self._corner_axes_widget = None
-        self._camera_orient_widget = None
+        self._camera_orient_widget = None  # legacy name; unused (was ball-gizmo)
+        self._view_cube = None
         self._axes_viewport = (0.0, 0.0, 0.13, 0.13)  # bottom-left fraction
         self._refresh_world_helpers(force=True)
         self._fit_empty_workspace()
@@ -606,7 +607,6 @@ class Viewport(QWidget):
             )
             self._corner_axes_actor = actor
             self._style_axes_captions(actor)
-            # Keep a handle on the orientation marker widget for hit-tests
             try:
                 self._corner_axes_widget = self.plotter.renderer.axes_widget
             except Exception:
@@ -614,16 +614,25 @@ class Viewport(QWidget):
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
             raise
-        # Fusion/VTK camera orientation widget — interactive chamfered cube+axes
-        # that steers the camera when faces/corners are clicked (better than a
-        # static annotated cube for actual view jumps).
+        # Real chamfered view cube (top-right) — face/corner click + drag orbit
         try:
-            self._camera_orient_widget = self.plotter.add_camera_orientation_widget(
-                animate=True, n_frames=12
+            from app.view_cube_widget import ViewCubeController, apply_cube_view
+
+            def _on_cube_view(token: str) -> None:
+                apply_cube_view(self, token)
+                if self._view_cube is not None:
+                    self._view_cube.sync_orientation()
+
+            def _on_cube_orbit(daz: float, delv: float) -> None:
+                self.orbit_camera(daz, delv)
+
+            self._view_cube = ViewCubeController(
+                self, on_view=_on_cube_view, on_orbit=_on_cube_orbit
             )
+            self._view_cube.install()
         except Exception as exc:  # noqa: BLE001
-            print(f"[viewport] camera orientation widget: {exc}", file=sys.stderr)
-            self._camera_orient_widget = None
+            print(f"[viewport] view cube: {exc}", file=sys.stderr)
+            self._view_cube = None
 
     def _compute_char_mm(self) -> float:
         """Characteristic scene length (mm) from solids + sketches + default."""
@@ -826,10 +835,11 @@ class Viewport(QWidget):
             for prefix in ("plane_", "edge_"):
                 self._remove_actor(f"{prefix}{f.id}")
             # Quieter than before — still readable when empty/sketching
+            # Very light fill + clear border (empty scene must stay readable)
             self.plotter.add_mesh(
                 _plane_surface(f.type, half=half),
                 color=color,
-                opacity=0.18,
+                opacity=0.07,
                 name=f"plane_{f.id}",
                 pickable=True,
                 smooth_shading=False,
@@ -839,7 +849,7 @@ class Viewport(QWidget):
             self.plotter.add_mesh(
                 _plane_border(f.type, half=half),
                 color=color,
-                line_width=1.5,
+                line_width=2.0,
                 name=f"edge_{f.id}",
                 pickable=False,
                 render=False,
@@ -1220,6 +1230,8 @@ class Viewport(QWidget):
 
     def _do_render(self) -> None:
         if self.plotter:
+            if self._view_cube is not None:
+                self._view_cube.sync_orientation()
             t0 = time.perf_counter()
             self.plotter.render()
             self._render_count += 1
@@ -1293,14 +1305,14 @@ class Viewport(QWidget):
                     if f is not None and is_reference_plane(f.type):
                         prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
                 elif selected:
-                    # High opacity + warm amber so the pick is unmistakable
-                    prop.SetOpacity(0.72)
+                    # Selected: clearer but not a solid brown slab
+                    prop.SetOpacity(0.28)
                     prop.SetColor(*sel_rgb)
                     prop.SetEdgeVisibility(1)
                     prop.SetEdgeColor(*sel_edge)
                     prop.SetLineWidth(3.0)
                 else:
-                    prop.SetOpacity(0.18)
+                    prop.SetOpacity(0.07)
                     if f is not None and is_reference_plane(f.type):
                         prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
                     prop.SetEdgeVisibility(0)
@@ -2825,6 +2837,8 @@ class Viewport(QWidget):
             self.plotter.reset_camera_clipping_range()
         except Exception:
             pass
+        if self._view_cube is not None:
+            self._view_cube.sync_orientation()
         self._request_render()
         self.status_message.emit(f"View: {key.capitalize()}")
         self.view_changed.emit(key)
@@ -2846,6 +2860,51 @@ class Viewport(QWidget):
         name = opposite if reverse else primary
         self.set_view(name)
         return name
+
+    def set_view_from_direction(self, direction) -> None:
+        """Place camera along ``direction`` looking at scene focus (unit-ish)."""
+        if not self.plotter:
+            return
+        d = np.asarray(direction, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(d))
+        if n < 1e-12:
+            self.set_view("iso")
+            return
+        d = d / n
+        dist = self._view_distance()
+        fx, fy, fz = self._scene_focus()
+        pos = (fx + d[0] * dist, fy + d[1] * dist, fz + d[2] * dist)
+        # Prefer world +Y as up unless looking along Y
+        up = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(d, up))) > 0.9:
+            up = np.array([0.0, 0.0, -1.0 if d[1] > 0 else 1.0])
+        self.plotter.camera_position = [pos, (fx, fy, fz), tuple(up)]
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
+        if self._view_cube is not None:
+            self._view_cube.sync_orientation()
+        self._request_render()
+        self.view_changed.emit("direction")
+        self.status_message.emit("View: custom")
+
+    def orbit_camera(self, azimuth_deg: float, elevation_deg: float) -> None:
+        """Orbit main camera by degrees (used by view-cube drag)."""
+        if not self.plotter:
+            return
+        try:
+            cam = self.plotter.camera
+            cam.Azimuth(float(azimuth_deg))
+            cam.Elevation(float(elevation_deg))
+            cam.OrthogonalizeViewUp()
+            self.plotter.reset_camera_clipping_range()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] orbit: {exc}", file=sys.stderr)
+            return
+        if self._view_cube is not None:
+            self._view_cube.sync_orientation()
+        self._request_render()
 
     def fit_empty_workspace(self) -> None:
         """Public alias for opening-screen camera fit."""
