@@ -135,10 +135,10 @@ def main() -> int:
             _fail(f"{lab} colour too dark mean={mean:.2f}")
         else:
             _ok(f"{lab} pale mean={mean:.2f} label={face_label_text(lab)}")
-    if vp._view_cube is None or vp._view_cube._actor is None:
+    if vp._view_cube is None or not getattr(vp._view_cube, "_actors", None):
         _fail("view cube missing")
     else:
-        prop = vp._view_cube._actor.GetProperty()
+        prop = vp._view_cube._actors[0].GetProperty()
         if prop.GetLighting():
             _fail("cube lighting ON — causes black faces on soft-GL")
         else:
@@ -148,27 +148,95 @@ def main() -> int:
             _fail(f"face labels missing (have {nlab})")
         else:
             _ok(f"face labels present n={nlab}")
+            # At least one label should be visible (front-facing) after sync
+            vis = 0
+            for item in vp._view_cube._label_actors:
+                ta = item[1] if isinstance(item, tuple) else item
+                try:
+                    if ta.GetVisibility():
+                        vis += 1
+                except Exception:
+                    pass
+            if vis < 1:
+                _fail("no front-facing face labels visible")
+            else:
+                _ok(f"front-facing labels visible n={vis}")
 
-    # Sample top-right corner of screenshot — must not be near-black mean
+    # Sample cube pad of screenshot. Mean alone is soft (light main scene shows
+    # through PreserveColorBuffer). Dark-pixel fraction catches a black blob:
+    # pale cube ≈ 0–2% dark; black faces ≈ 40%+ dark.
+    def _cube_pad(img):
+        h, w = img.shape[:2]
+        x0, x1 = int(w * 0.80), int(w * 0.995)
+        y0, y1 = int(h * (1.0 - 0.995)), int(h * (1.0 - 0.80))
+        crop = img[y0:y1, x0:x1, :3].astype(np.float64)
+        lum = crop.mean(axis=2)
+        return crop, lum, (y0, y1, x0, x1)
+
+    DARK_FRAC_FAIL = 0.20  # ≥ this → black-blob fail
+
     if img0 is not None:
-        h, w = img0.shape[:2]
-        # cube viewport ~ top-right 20%
-        crop = img0[0 : int(h * 0.22), int(w * 0.78) :, :3].astype(np.float64)
-        mean = float(crop.mean())
-        # Black blob was ~0–30; pale cube on light panel should be > 80
-        if mean < 60:
-            _fail(f"cube corner of opening shot is dark mean={mean:.1f} (black blob)")
+        crop, lum, (y0, y1, x0, x1) = _cube_pad(img0)
+        mean = float(lum.mean())
+        dark_frac = float((lum < 40).mean())
+        if dark_frac >= DARK_FRAC_FAIL or mean < 60:
+            _fail(
+                f"cube corner is a black blob mean={mean:.1f} dark_frac={dark_frac:.2f}"
+            )
         else:
-            _ok(f"cube corner luminance mean={mean:.1f} (not black)")
-    _shot(vp, "open_empty_cube_close.png")
+            _ok(f"cube corner pale mean={mean:.1f} dark_frac={dark_frac:.3f}")
+        try:
+            from PIL import Image
 
-    # Break-on-purpose: force black colours → luminance gate must fail if re-run logic
-    print("\n=== CUBE LOOK BREAK-ON-PURPOSE ===", flush=True)
-    black_mean = (0.05 + 0.05 + 0.05) / 3.0
-    if black_mean < 0.75:
-        _ok("cube colour break: black mean fails pale gate (check is sharp)")
+            Image.fromarray(img0[y0:y1, x0:x1, :3].astype(np.uint8)).save(
+                str(OUT / "open_empty_cube_close.png")
+            )
+            print(f"SHOT {OUT / 'open_empty_cube_close.png'}", flush=True)
+        except Exception as exc:
+            _fail(f"cube close crop: {exc}")
+            _shot(vp, "open_empty_cube_close.png")
     else:
-        _fail("pale gate is soft")
+        _shot(vp, "open_empty_cube_close.png")
+
+    # Break-on-purpose: force black actor colours. Gate must go red (dark_frac high).
+    print("\n=== CUBE LOOK BREAK-ON-PURPOSE ===", flush=True)
+    cube = vp._view_cube
+    saved_colors = []
+    try:
+        for act in cube._actors:
+            c = act.GetProperty().GetColor()
+            saved_colors.append(tuple(c))
+            act.GetProperty().SetColor(0.02, 0.02, 0.02)
+        for item in cube._label_actors:
+            ta = item[1] if isinstance(item, tuple) else item
+            ta.VisibilityOff()
+        broken = _shot(vp, "_break_black_cube.png")
+        try:
+            (OUT / "_break_black_cube.png").unlink(missing_ok=True)
+        except Exception:
+            pass
+        if broken is not None:
+            _, blum, _ = _cube_pad(broken)
+            bmean = float(blum.mean())
+            bdark = float((blum < 40).mean())
+            if bdark >= DARK_FRAC_FAIL:
+                _ok(
+                    f"cube colour break: forced black → dark_frac={bdark:.2f} "
+                    f"mean={bmean:.1f} fails gate"
+                )
+            else:
+                _fail(
+                    f"cube colour break soft: forced black dark_frac={bdark:.2f} "
+                    f"(threshold {DARK_FRAC_FAIL})"
+                )
+        else:
+            _fail("cube colour break: no screenshot")
+    finally:
+        for act, c in zip(cube._actors, saved_colors):
+            act.GetProperty().SetColor(*c)
+        cube.sync_orientation()
+        _pump(app, 4)
+        vp._do_render()
 
     # ------------------------------------------------------------------
     # SPACE
@@ -251,20 +319,27 @@ def main() -> int:
     else:
         _fail("cube pad miss with logical size")
 
-    # Break-on-purpose: force wrong division in a local check
-    def broken_in_cube(qx, qy):
-        # classic bug: use VTK device size with Qt coords
-        dw, dh = vp.plotter.window_size
-        nx = qx / float(dw)
-        ny = 1.0 - qy / float(dh)
-        v = vp._view_cube.VIEWPORT
-        return v[0] <= nx <= v[2] and v[1] <= ny <= v[3]
+    # Break-on-purpose: classic bug divides Qt logical coords by device size.
+    # On a simulated DPR=2 screen the cube pad centre must MISS — sharp check.
+    def _broken_invp(qx, qy, interactor, viewport):
+        try:
+            dw = float(interactor.width()) * float(interactor.devicePixelRatioF())
+            dh = float(interactor.height()) * float(interactor.devicePixelRatioF())
+        except Exception:
+            dw, dh = float(interactor.width()), float(interactor.height())
+        if dw < 1 or dh < 1:
+            return False
+        nx = float(qx) / dw
+        ny = 1.0 - float(qy) / dh
+        vx0, vy0, vx1, vy1 = viewport
+        return vx0 <= nx <= vx1 and vy0 <= ny <= vy1
 
-    # On DPR=1 window_size may equal logical — force a synthetic mismatch
-    # by comparing helpers: if we pretend device is 2x and use broken fn with
-    # logical coords of cube centre, it should miss when sizes differ.
-    # We already proved ok_new and not ok_old above.
-    _ok("DPI break scenario documented via DPR=2 logical vs device")
+    dead = _broken_invp(720, 40, iw2, vp._view_cube.VIEWPORT)
+    live = invp(720, 40, iw2, vp._view_cube.VIEWPORT)
+    if live and not dead:
+        _ok("DPI break: broken device-size hit misses pad; fixed helper hits")
+    else:
+        _fail(f"DPI break soft live={live} dead={dead}")
 
     # ------------------------------------------------------------------
     # CUBE MOUSE — no fallback

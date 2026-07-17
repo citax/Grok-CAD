@@ -1,4 +1,4 @@
-passed=24 failed=0
+passed=25 failed=0
 OK opening: no feature selected
 OK plane half=16
 OK planes low opacity
@@ -7,14 +7,15 @@ OK face:+y pale mean=0.87 label=Top
 OK face:+z pale mean=0.89 label=Front
 OK cube lighting OFF (readable fills)
 OK face labels present n=6
-OK cube corner luminance mean=133.4 (not black)
-OK cube colour break: black mean fails pale gate (check is sharp)
+OK front-facing labels visible n=3
+OK cube corner pale mean=218.4 dark_frac=0.018
+OK cube colour break: forced black → dark_frac=0.46 mean=118.4 fails gate
 OK Space: menu with 13 actions
 OK Space break: no menu when shortcut disabled
 OK DPR=2: logical hit works; device-width division misses (covers dead screen)
 OK triad pad hit-test via logical size
 OK cube pad hit-test via logical size
-OK DPI break scenario documented via DPR=2 logical vs device
+OK DPI break: broken device-size hit misses pad; fixed helper hits
 OK cube mouse face click moved camera Δ=101.47
 OK cube mouse drag orbit Δ=20.35
 OK triad mouse click moved camera Δ=49.31

@@ -1,27 +1,14 @@
-"""Interactive chamfered view cube in a corner overlay renderer.
-
-Behaviours (Fusion / SolidWorks style):
-  * Click a face  → look straight down that axis (+/−)
-  * Click a corner → isometric from that octant
-  * Click an edge → half-iso between the two faces
-  * Drag on the cube → orbit the main camera (same free look as scene drag)
-
-Pale labelled faces (not a black blob). Hit-tests use Qt logical → VTK device
-conversion so multi-monitor / HiDPI screens work.
-"""
+"""Interactive chamfered view cube — pale labelled faces, HiDPI-safe hits."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import numpy as np
+import pyvista as pv
 from PySide6.QtCore import QEvent, QObject, Qt
 
-from app.display_coords import (
-    in_normalized_viewport,
-    qt_to_normalized,
-    qt_to_vtk_display,
-)
+from app.display_coords import in_normalized_viewport, qt_to_vtk_display
 from app.view_cube import (
     build_chamfered_cube,
     color_for_region,
@@ -35,9 +22,6 @@ if TYPE_CHECKING:
 
 
 class ViewCubeController(QObject):
-    """Owns a corner renderer with a chamfered cube + mouse handling."""
-
-    # Fraction of the render window (VTK y-up coords)
     VIEWPORT = (0.80, 0.80, 0.995, 0.995)
 
     def __init__(
@@ -52,13 +36,13 @@ class ViewCubeController(QObject):
         self.on_view = on_view
         self.on_orbit = on_orbit
         self._renderer = None
-        self._actor = None
+        self._actors: List = []
         self._label_actors: list = []
         self._labels: List[str] = []
+        self._pick_actor = None
         self._press: Optional[Tuple[float, float]] = None
         self._dragged = False
         self._active = False
-        self._filter_installed = False
 
     def install(self) -> None:
         plotter = self.vp.plotter
@@ -66,80 +50,92 @@ class ViewCubeController(QObject):
             return
         poly, labels = build_chamfered_cube(half=1.0, chamfer=0.30)
         self._labels = labels
-        colors = np.zeros((len(labels), 3), dtype=np.uint8)
-        for i, lab in enumerate(labels):
-            r, g, b = color_for_region(lab)
-            colors[i] = (int(r * 255), int(g * 255), int(b * 255))
-        poly.cell_data["RGB"] = colors
+        full = pv.wrap(poly)
 
         from vtkmodules.vtkRenderingCore import (
             vtkActor,
-            vtkBillboardTextActor3D,
             vtkPolyDataMapper,
             vtkRenderer,
         )
 
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly)
-        mapper.SetScalarModeToUseCellData()
-        mapper.SelectColorArray("RGB")
-        mapper.SetColorModeToDirectScalars()
-        mapper.ScalarVisibilityOn()
-        actor = vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetEdgeVisibility(1)
-        prop.SetEdgeColor(0.35, 0.38, 0.42)
-        prop.SetLineWidth(1.0)
-        # CRITICAL: lighting off — with lighting on soft-GL, direct RGB faces go black
-        prop.LightingOff()
-        prop.SetAmbient(1.0)
-        prop.SetDiffuse(0.0)
-        prop.SetSpecular(0.0)
-        self._actor = actor
-
         ren = vtkRenderer()
         ren.SetViewport(*self.VIEWPORT)
         ren.InteractiveOff()
-        ren.SetBackground(0.94, 0.95, 0.97)
+        ren.SetBackground(0.93, 0.94, 0.96)
         try:
-            ren.SetBackgroundAlpha(0.55)
+            ren.SetBackgroundAlpha(0.70)
         except Exception:
             pass
         try:
             ren.PreserveColorBufferOn()
         except Exception:
             pass
-        ren.AddActor(actor)
 
-        # Face labels (SolidWorks/Fusion style readable text)
-        self._label_actors = []
+        # One solid-colour actor per cell — lighting OFF so soft-GL stays pale.
+        # Face actors are NOT pickable; a separate full mesh carries cell IDs.
+        self._actors = []
+        for i, lab in enumerate(labels):
+            cell = full.extract_cells([i])
+            try:
+                surf = cell.extract_surface(algorithm="dataset_surface")
+            except TypeError:
+                try:
+                    surf = cell.extract_surface()
+                except Exception:
+                    surf = cell
+            except Exception:
+                surf = cell
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(surf)
+            mapper.ScalarVisibilityOff()
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.PickableOff()
+            r, g, b = color_for_region(lab)
+            prop = actor.GetProperty()
+            prop.SetColor(float(r), float(g), float(b))
+            prop.LightingOff()
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            prop.SetEdgeVisibility(1)
+            prop.SetEdgeColor(0.35, 0.38, 0.42)
+            prop.SetLineWidth(1.0)
+            prop.SetOpacity(1.0)
+            ren.AddActor(actor)
+            self._actors.append(actor)
+
+        # Combined pick mesh: full topology, slight opacity so soft-GL still picks
+        pmap = vtkPolyDataMapper()
+        pmap.SetInputData(poly)
+        pmap.ScalarVisibilityOff()
+        pactor = vtkActor()
+        pactor.SetMapper(pmap)
+        pactor.GetProperty().SetOpacity(0.01)
+        pactor.GetProperty().LightingOff()
+        pactor.GetProperty().SetColor(1.0, 1.0, 1.0)
+        pactor.PickableOn()
+        ren.AddActor(pactor)
+        self._pick_actor = pactor
+
+        # Face labels as real 3D vector text lying on each face (SW/Fusion style).
+        # Billboard text clipped to gibberish in the tiny overlay viewport.
+        self._label_actors = []  # list of (face_label, actor)
         for lab in labels:
             text = face_label_text(lab)
-            pos = face_label_position(lab, half=1.0)
-            if text is None or pos is None:
+            if text is None:
                 continue
-            ta = vtkBillboardTextActor3D()
-            ta.SetInput(text)
-            ta.SetPosition(*pos)
-            tp = ta.GetTextProperty()
-            tp.SetFontSize(16)
-            tp.SetBold(1)
-            tp.SetColor(0.15, 0.17, 0.20)
-            tp.SetJustificationToCentered()
-            tp.SetVerticalJustificationToCentered()
-            try:
-                tp.ShadowOff()
-            except Exception:
-                pass
-            ren.AddActor(ta)
-            self._label_actors.append(ta)
+            actor = self._make_face_label_actor(lab, text)
+            if actor is None:
+                continue
+            ren.AddActor(actor)
+            self._label_actors.append((lab, actor))
 
         ren.ResetCamera()
         cam = ren.GetActiveCamera()
         cam.SetParallelProjection(1)
-        cam.SetParallelScale(1.65)
-        cam.SetPosition(2.4, 2.0, 2.4)
+        cam.SetParallelScale(1.70)
+        cam.SetPosition(2.5, 2.1, 2.5)
         cam.SetFocalPoint(0, 0, 0)
         cam.SetViewUp(0, 1, 0)
 
@@ -155,7 +151,6 @@ class ViewCubeController(QObject):
 
         try:
             plotter.interactor.installEventFilter(self)
-            self._filter_installed = True
         except Exception:
             pass
         self.sync_orientation()
@@ -167,11 +162,96 @@ class ViewCubeController(QObject):
             except Exception:
                 pass
         self._renderer = None
-        self._actor = None
+        self._actors = []
         self._label_actors = []
+        self._pick_actor = None
+
+    @staticmethod
+    def _face_normal(lab: str) -> Optional[np.ndarray]:
+        return {
+            "face:+x": np.array([1.0, 0.0, 0.0]),
+            "face:-x": np.array([-1.0, 0.0, 0.0]),
+            "face:+y": np.array([0.0, 1.0, 0.0]),
+            "face:-y": np.array([0.0, -1.0, 0.0]),
+            "face:+z": np.array([0.0, 0.0, 1.0]),
+            "face:-z": np.array([0.0, 0.0, -1.0]),
+        }.get(lab)
+
+    @staticmethod
+    def _make_face_label_actor(lab: str, text: str):
+        """Build a dark 3D vector-text actor centred on a cube face."""
+        from vtkmodules.vtkCommonTransforms import vtkTransform
+        from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
+        from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
+        from vtkmodules.vtkRenderingFreeType import vtkVectorText
+
+        # Outward normal and in-face axes so text reads upright on each face
+        # when the cube is viewed in the usual iso orientation.
+        basis = {
+            # right-hand: u across, v up-on-face, n outward
+            "face:+x": (np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0])),
+            "face:-x": (np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0]), np.array([-1.0, 0.0, 0.0])),
+            "face:+y": (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0])),
+            "face:-y": (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]), np.array([0.0, -1.0, 0.0])),
+            "face:+z": (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            "face:-z": (np.array([-1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, -1.0])),
+        }.get(lab)
+        if basis is None:
+            return None
+        u, v, n = basis
+        pos = face_label_position(lab, half=1.0)
+        if pos is None:
+            return None
+
+        vt = vtkVectorText()
+        vt.SetText(text)
+        vt.Update()
+        bounds = vt.GetOutput().GetBounds()
+        # Centre the glyph at origin before placing on the face
+        cx = 0.5 * (bounds[0] + bounds[1])
+        cy = 0.5 * (bounds[2] + bounds[3])
+        tw = max(1e-6, bounds[1] - bounds[0])
+        th = max(1e-6, bounds[3] - bounds[2])
+        # Fit inside face square (~1.4 half-extent after chamfer)
+        target = 1.15
+        scale = min(target / tw, target / th * 0.55)
+
+        # p' = R * S * (p - center) + origin  where R columns = (u, v, n)
+        origin = np.asarray(pos, float) + n * 0.04
+        tf = vtkTransform()
+        tf.PostMultiply()
+        tf.Translate(-cx, -cy, 0.0)
+        tf.Scale(scale, scale, scale)
+        from vtkmodules.vtkCommonMath import vtkMatrix4x4
+
+        m4 = vtkMatrix4x4()
+        m4.Identity()
+        for i in range(3):
+            m4.SetElement(i, 0, float(u[i]))
+            m4.SetElement(i, 1, float(v[i]))
+            m4.SetElement(i, 2, float(n[i]))
+            m4.SetElement(i, 3, float(origin[i]))
+        tf.Concatenate(m4)
+
+        tpd = vtkTransformPolyDataFilter()
+        tpd.SetInputConnection(vt.GetOutputPort())
+        tpd.SetTransform(tf)
+        tpd.Update()
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(tpd.GetOutputPort())
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.PickableOff()
+        prop = actor.GetProperty()
+        prop.SetColor(0.12, 0.14, 0.18)
+        prop.LightingOff()
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        return actor
 
     def sync_orientation(self) -> None:
-        """Match cube orientation to the main camera (cube faces world axes)."""
         if self._renderer is None or self.vp.plotter is None:
             return
         try:
@@ -185,13 +265,21 @@ class ViewCubeController(QObject):
                 return
             direction = direction / n
             cam = self._renderer.GetActiveCamera()
-            dist = 3.2
-            cam.SetPosition(*(direction * dist))
+            cam.SetPosition(*(direction * 3.3))
             cam.SetFocalPoint(0.0, 0.0, 0.0)
             cam.SetViewUp(*up)
             cam.SetParallelProjection(1)
-            cam.SetParallelScale(1.65)
+            cam.SetParallelScale(1.70)
             self._renderer.ResetCameraClippingRange()
+            # Only show labels on faces pointing toward the camera (no back-face soup)
+            for lab, ta in self._label_actors:
+                nrm = self._face_normal(lab)
+                if nrm is None:
+                    continue
+                if float(np.dot(nrm, direction)) > 0.12:
+                    ta.VisibilityOn()
+                else:
+                    ta.VisibilityOff()
         except Exception:
             pass
 
@@ -205,8 +293,7 @@ class ViewCubeController(QObject):
         return in_normalized_viewport(qx, qy, iw, self.VIEWPORT)
 
     def _pick_region(self, qx: float, qy: float) -> Optional[str]:
-        """Cell-pick the cube using DPI-correct VTK display coords."""
-        if self._renderer is None or self.vp.plotter is None or self._actor is None:
+        if self._renderer is None or self.vp.plotter is None:
             return None
         iw = self._interactor()
         if iw is None:
@@ -216,7 +303,7 @@ class ViewCubeController(QObject):
 
             vx, vy, _dw, _dh = qt_to_vtk_display(qx, qy, iw, self.vp.plotter)
             picker = vtkCellPicker()
-            picker.SetTolerance(0.02)
+            picker.SetTolerance(0.025)
             ok = picker.Pick(vx, vy, 0, self._renderer)
             if not ok:
                 return None
@@ -275,7 +362,6 @@ class ViewCubeController(QObject):
 
 
 def apply_cube_view(viewport: "Viewport", token: str) -> str:
-    """Apply a view token from region_to_view; returns standard view name used."""
     if token.startswith("iso:"):
         signs = token.split(":", 1)[1]
         sx = 1.0 if "+x" in signs else (-1.0 if "-x" in signs else 1.0)
