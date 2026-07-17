@@ -45,3 +45,7 @@ Thumbs.db
 # Qt / aqt noise
 aqtinstall.log
 bench/_ui_shots/
+# Committed regression screenshots (env/axis proof)
+!bench/fixtures/
+!bench/fixtures/**
+

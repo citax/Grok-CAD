@@ -48,7 +48,9 @@ from cadcore.scale import (
     characteristic_length_from_bounds,
     characteristic_length_from_points,
     origin_glyph_sizes,
+    origin_triad_policy,
     plane_half_mm,
+    reference_planes_should_show,
     sketch_entity_uv_extent,
     sketch_grid_params,
     sketch_parallel_scale,
@@ -602,28 +604,58 @@ class Viewport(QWidget):
             return characteristic_length_from_points(pts, default=50.0)
         return 50.0
 
-    def _refresh_world_helpers(self, *, force: bool = False) -> None:
-        """Rebuild SW-style origin RGB triad + scale reference planes.
+    def _part_extent_mm(self) -> float:
+        """Largest solid AABB diagonal currently cached (mm)."""
+        best = 0.0
+        for verts, _faces in self._solid_mesh_cache.values():
+            if verts is None or len(verts) == 0:
+                continue
+            best = max(
+                best,
+                characteristic_length_from_points(verts, default=0.0),
+            )
+        return float(best)
 
-        Big CAD packages (SolidWorks, Fusion, Inventor) do **not** draw long
-        monochrome axis lines through the scene. They use:
-          * a small RGB origin triad at (0,0,0)
-          * a fixed corner orientation triad (screen-space)
+    def _has_display_solids(self) -> bool:
+        return bool(self._solid_fps) or bool(self._solid_mesh_cache)
+
+    def _selected_is_plane(self) -> bool:
+        if self._doc is None:
+            return False
+        f = self._doc.find(self._selected_id)
+        return f is not None and is_reference_plane(f.type)
+
+    def _refresh_world_helpers(self, *, force: bool = False) -> None:
+        """Update origin marker + plane scale/visibility for current scene.
+
+        Orientation at any size: **corner triad only** (screen-fixed).
+        World-origin RGB arrows are suppressed whenever solids are shown so
+        they never skewer a tiny part or hide inside a large one.
         """
         if not self.plotter:
             return
         char = self._compute_char_mm()
         new_half = plane_half_mm(char)
-        # Short origin triad — ~12% of characteristic size (readable, not dominant)
-        new_axis = max(6.0, min(axis_length_mm(char) * 0.55, char * 0.12, 40.0))
+        has_solids = self._has_display_solids()
+        show_origin, new_axis = origin_triad_policy(
+            has_display_solids=has_solids,
+            char_mm=char,
+            part_extent_mm=self._part_extent_mm(),
+        )
         if (
             not force
             and abs(char - self._char_mm) / max(self._char_mm, 1.0) < 0.08
             and abs(new_axis - self._axis_len) / max(self._axis_len, 1.0) < 0.08
+            and show_origin == getattr(self, "_origin_shown", None)
+            and has_solids == getattr(self, "_had_solids", None)
         ):
+            # Still refresh plane visibility (selection may have changed)
+            self._apply_plane_visibility()
             return
         self._char_mm = char
         self._axis_len = new_axis
+        self._origin_shown = show_origin
+        self._had_solids = has_solids
         prev_plane = self._plane_half
         self._plane_half = new_half
 
@@ -631,24 +663,23 @@ class Viewport(QWidget):
         for name in ("__origin", "__ax", "__ay", "__az"):
             self._remove_actor(name)
 
-        L = float(self._axis_len)
-        self._install_origin_rgb_triad(L)
+        if show_origin and new_axis > 1e-9:
+            self._install_origin_rgb_triad(new_axis)
+        else:
+            self._clear_origin_rgb_triad()
 
         # Rebuild reference planes when half-extent changes materially
         if force or abs(prev_plane - self._plane_half) / max(prev_plane, 1.0) > 0.08:
             self._rebuild_reference_planes()
+        else:
+            self._apply_plane_visibility()
         # Keep sketch-mode visibility rules
         if self.in_sketch_mode:
             self._set_sketch_2d_chrome(True)
 
-    def _install_origin_rgb_triad(self, length_mm: float) -> None:
-        """Short RGB arrow triad at world origin (SolidWorks origin style)."""
-        if not self.plotter:
-            return
-        L = max(3.0, float(length_mm))
-        # Remove previous origin axes actor from the renderer
+    def _clear_origin_rgb_triad(self) -> None:
         prev = getattr(self, "_origin_axes_actor", None)
-        if prev is not None:
+        if prev is not None and self.plotter is not None:
             try:
                 self.plotter.renderer.RemoveActor(prev)
             except Exception:
@@ -656,7 +687,16 @@ class Viewport(QWidget):
                     self.plotter.remove_actor(prev, render=False)
                 except Exception:
                     pass
-            self._origin_axes_actor = None
+        self._origin_axes_actor = None
+        for name in ("__ax", "__ay", "__az"):
+            self._remove_actor(name)
+
+    def _install_origin_rgb_triad(self, length_mm: float) -> None:
+        """Small RGB origin triad for **empty** scenes only (see origin_triad_policy)."""
+        if not self.plotter:
+            return
+        L = max(1.0, float(length_mm))
+        self._clear_origin_rgb_triad()
         try:
             actor = self.plotter.add_axes_at_origin(
                 x_color=AXIS_X,
@@ -668,7 +708,6 @@ class Viewport(QWidget):
                 line_width=2,
                 labels_off=True,
             )
-            # vtkAxesActor total length in world units
             try:
                 actor.SetTotalLength(L, L, L)
             except Exception:
@@ -676,14 +715,13 @@ class Viewport(QWidget):
             try:
                 actor.SetShaftTypeToCylinder()
                 actor.SetTipTypeToCone()
-                actor.SetCylinderRadius(0.025)
-                actor.SetConeRadius(0.08)
+                actor.SetCylinderRadius(0.03)
+                actor.SetConeRadius(0.09)
             except Exception:
                 pass
             self._origin_axes_actor = actor
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] origin triad: {exc}", file=sys.stderr)
-            # Fallback: three short coloured line segments
             for end, name, col in (
                 ((L, 0, 0), "__ax", AXIS_X),
                 ((0, L, 0), "__ay", AXIS_Y),
@@ -699,6 +737,32 @@ class Viewport(QWidget):
                     render=False,
                 )
 
+    def _apply_plane_visibility(self) -> None:
+        """Show/hide reference planes per SolidWorks/Fusion-style policy."""
+        if not self.plotter or self._doc is None:
+            return
+        show = reference_planes_should_show(
+            has_display_solids=self._has_display_solids(),
+            in_sketch_mode=self.in_sketch_mode,
+            selected_is_plane=self._selected_is_plane(),
+        )
+        self._planes_env_visible = show
+        for f in self._doc.features:
+            if not is_reference_plane(f.type):
+                continue
+            # Feature.visible is user pin; env policy is additional gate
+            vis = 1 if (show and f.visible) else 0
+            for prefix in ("plane_", "edge_"):
+                name = f"{prefix}{f.id}"
+                act = self._get_named_actor(name)
+                if act is None and name in getattr(self.plotter, "actors", {}):
+                    act = self.plotter.actors.get(name)
+                if act is not None:
+                    try:
+                        act.SetVisibility(vis)
+                    except Exception:
+                        pass
+
     def _rebuild_reference_planes(self) -> None:
         if not self.plotter or self._doc is None:
             return
@@ -709,10 +773,11 @@ class Viewport(QWidget):
             color = PLANE_COLORS[f.type]
             for prefix in ("plane_", "edge_"):
                 self._remove_actor(f"{prefix}{f.id}")
+            # Quieter than before — still readable when empty/sketching
             self.plotter.add_mesh(
                 _plane_surface(f.type, half=half),
                 color=color,
-                opacity=0.32,
+                opacity=0.18,
                 name=f"plane_{f.id}",
                 pickable=True,
                 smooth_shading=False,
@@ -722,12 +787,13 @@ class Viewport(QWidget):
             self.plotter.add_mesh(
                 _plane_border(f.type, half=half),
                 color=color,
-                line_width=2,
+                line_width=1.5,
                 name=f"edge_{f.id}",
                 pickable=False,
                 render=False,
             )
         self._planes_built = True
+        self._apply_plane_visibility()
         self._restyle_selection_only()
 
     @staticmethod
@@ -980,8 +1046,9 @@ class Viewport(QWidget):
         if self._selected_id == fid:
             return
         self._selected_id = fid
+        # Selecting a plane may re-show planes when solids are present
+        self._apply_plane_visibility()
         self._restyle_selection_only()
-        self._request_render()
         self._request_render()
 
     def schedule_rebuild(self, *, immediate_planes: bool = False) -> None:
@@ -1065,16 +1132,7 @@ class Viewport(QWidget):
         if not self.plotter or self._doc is None:
             return
         if self._planes_built:
-            for f in self._doc.features:
-                if not is_reference_plane(f.type):
-                    continue
-                for prefix in ("plane_", "edge_"):
-                    name = f"{prefix}{f.id}"
-                    if name in self.plotter.actors:
-                        try:
-                            self.plotter.actors[name].SetVisibility(1 if f.visible else 0)
-                        except Exception:
-                            pass
+            self._apply_plane_visibility()
             return
         self._rebuild_reference_planes()
         self._request_render()
@@ -1177,13 +1235,13 @@ class Viewport(QWidget):
                         prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
                 elif selected:
                     # High opacity + warm amber so the pick is unmistakable
-                    prop.SetOpacity(0.78)
+                    prop.SetOpacity(0.72)
                     prop.SetColor(*sel_rgb)
                     prop.SetEdgeVisibility(1)
                     prop.SetEdgeColor(*sel_edge)
                     prop.SetLineWidth(3.0)
                 else:
-                    prop.SetOpacity(0.32)
+                    prop.SetOpacity(0.18)
                     if f is not None and is_reference_plane(f.type):
                         prop.SetColor(*_hex_to_rgb01(PLANE_COLORS[f.type]))
                     prop.SetEdgeVisibility(0)
@@ -1351,6 +1409,8 @@ class Viewport(QWidget):
         self._set_parallel_projection(True, parallel_scale=p_scale)
         self._set_sketch_2d_chrome(True)
         self._ensure_sketch_overlay_layer()
+        # Planes visible again in sketch (SW shows the sketch plane context)
+        self._apply_plane_visibility()
 
         self._install_sketch_filter()
         try:
@@ -1385,6 +1445,8 @@ class Viewport(QWidget):
         # Leave 2D sketch: restore 3D chrome + perspective for solids
         self._set_sketch_2d_chrome(False)
         self._set_parallel_projection(False)
+        # Solids present → hide planes again (SW View/Hide Planes behaviour)
+        self._apply_plane_visibility()
         self._restyle_selection_only()
         self.refresh_sketches()
         self._request_render()
@@ -2556,6 +2618,7 @@ class Viewport(QWidget):
         self._selected_id = fid
         # Capture planar face under the pick for sketch-on-face
         self._capture_face_pick(fid, mesh)
+        self._apply_plane_visibility()
         self._restyle_selection_only()
         self._request_render()
         self.feature_picked.emit(fid)

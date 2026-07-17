@@ -75,10 +75,68 @@ def characteristic_length_from_points(
 
 
 def axis_length_mm(char_mm: float) -> float:
-    """World-axis arm length so axes read clearly next to geometry."""
+    """Legacy helper: preferred world-axis arm for empty scenes only.
+
+    Prefer :func:`origin_triad_policy` for display decisions — a fixed
+    minimum length (e.g. 6–8 mm) will skewer a 3 mm part.
+    """
     c = max(float(char_mm), 1.0)
-    # ~22% of characteristic size, clamped
     return max(MIN_AXIS_MM, min(c * 0.22, c * 0.5))
+
+
+def origin_triad_policy(
+    *,
+    has_display_solids: bool,
+    char_mm: float = 50.0,
+    part_extent_mm: float = 0.0,
+) -> Tuple[bool, float]:
+    """Whether to show a world-origin RGB triad, and its arm length (mm).
+
+    Orientation at any part size is the **corner** triad (screen-fixed).
+    A world-origin triad that scales with a floor will stab through tiny
+    parts; one that is small absolute will vanish inside large solids.
+
+    Policy (SolidWorks-like):
+      * Solids on screen → **no** world-origin arrows (corner triad only).
+      * Empty scene → small origin triad for empty-workspace orientation,
+        never larger than ~10% of the workspace, never a large floor.
+    """
+    if has_display_solids:
+        return False, 0.0
+    c = max(float(char_mm), 1.0)
+    # Empty workspace: modest triad, no 6 mm floor that dominates mm-scale work
+    L = min(max(c * 0.08, 2.0), 12.0)
+    if part_extent_mm > 1e-9:
+        # Never longer than 25% of the largest part span
+        L = min(L, float(part_extent_mm) * 0.25)
+    return True, float(L)
+
+
+def reference_planes_should_show(
+    *,
+    has_display_solids: bool,
+    in_sketch_mode: bool,
+    selected_is_plane: bool,
+) -> bool:
+    """SolidWorks/Fusion-style plane visibility.
+
+    Evidence:
+      * SW: View → Hide/Show → Planes; Q toggles planes/origins/coordinate
+        systems — planes are **not** forced on while viewing solids
+        (help.solidworks.com; Javelin “How to Hide and Show Planes”).
+      * Fusion: Object Visibility toggles origin planes independently of
+        bodies (Autodesk support: display settings → object visibility).
+
+    Policy here:
+      * Empty document / no solids → show planes (need them to start).
+      * Solids on screen → hide planes unless the user selected a plane
+        (about to sketch) or is inside sketch mode.
+    """
+    if in_sketch_mode:
+        return True
+    if not has_display_solids:
+        return True
+    return bool(selected_is_plane)
 
 
 def plane_half_mm(char_mm: float) -> float:
