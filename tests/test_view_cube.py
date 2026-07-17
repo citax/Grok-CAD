@@ -37,3 +37,14 @@ def test_cube_has_volume_extent():
     assert b[1] - b[0] > 1.5
     assert b[3] - b[2] > 1.5
     assert b[5] - b[4] > 1.5
+
+
+def test_face_colors_are_pale_not_black():
+    """Faces must be light enough to read (not a black blob)."""
+    from app.view_cube import color_for_region, face_label_text
+
+    for lab in ("face:+x", "face:-x", "face:+y", "face:-y", "face:+z", "face:-z"):
+        r, g, b = color_for_region(lab)
+        # Mean channel well above mid-grey
+        assert (r + g + b) / 3.0 > 0.75, (lab, r, g, b)
+        assert face_label_text(lab) is not None

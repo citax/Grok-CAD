@@ -169,14 +169,49 @@ def region_to_view(label: str) -> Optional[str]:
 
 
 def color_for_region(label: str) -> Tuple[float, float, float]:
-    """RGB 0..1 for cube cells — faces tinted by axis, edges/corners neutral."""
-    if label.startswith("face:+x") or label.startswith("face:-x"):
-        return (0.90, 0.35, 0.32)  # red family
-    if label.startswith("face:+y") or label.startswith("face:-y"):
-        return (0.35, 0.72, 0.40)  # green
-    if label.startswith("face:+z") or label.startswith("face:-z"):
-        return (0.32, 0.55, 0.90)  # blue
+    """RGB 0..1 — pale readable faces (Fusion/SW style), not saturated dark.
+
+    Lighting is off on the cube actor; these are final display colours.
+    """
+    # Pale face fills with a hint of axis colour so +X vs +Y is obvious
+    if label == "face:+x":
+        return (0.98, 0.82, 0.82)  # pale red  (Right)
+    if label == "face:-x":
+        return (0.95, 0.88, 0.88)  # softer red (Left)
+    if label == "face:+y":
+        return (0.82, 0.95, 0.84)  # pale green (Top)
+    if label == "face:-y":
+        return (0.88, 0.95, 0.90)  # softer green (Bottom)
+    if label == "face:+z":
+        return (0.82, 0.88, 0.98)  # pale blue (Front)
+    if label == "face:-z":
+        return (0.88, 0.90, 0.96)  # softer blue (Back)
     if label.startswith("corner"):
-        return (0.82, 0.84, 0.88)
-    # edges
-    return (0.70, 0.73, 0.78)
+        return (0.97, 0.97, 0.98)  # near-white chamfer
+    # edges — light grey bevels
+    return (0.90, 0.91, 0.93)
+
+
+def face_label_text(label: str) -> Optional[str]:
+    """Human-readable text drawn on a face (SolidWorks-style)."""
+    return {
+        "face:+x": "Right",
+        "face:-x": "Left",
+        "face:+y": "Top",
+        "face:-y": "Bottom",
+        "face:+z": "Front",
+        "face:-z": "Back",
+    }.get(label)
+
+
+def face_label_position(label: str, half: float = 1.0) -> Optional[Tuple[float, float, float]]:
+    """World position slightly outside the face centre for a text label."""
+    o = float(half) * 1.02
+    return {
+        "face:+x": (o, 0.0, 0.0),
+        "face:-x": (-o, 0.0, 0.0),
+        "face:+y": (0.0, o, 0.0),
+        "face:-y": (0.0, -o, 0.0),
+        "face:+z": (0.0, 0.0, o),
+        "face:-z": (0.0, 0.0, -o),
+    }.get(label)

@@ -2927,23 +2927,25 @@ class Viewport(QWidget):
         """If click is over the bottom-left triad, snap camera to that axis.
 
         Returns view name applied, or None if the click was outside the triad.
-        Qt display coords: origin top-left, y down.
+        Qt display coords: origin top-left, y down (logical pixels).
+
+        Uses Qt widget size for hit-testing (not VTK window_size) so multi-monitor
+        HiDPI screens where devicePixelRatio ≠ 1 still hit correctly.
         """
         if not self.plotter or self.in_sketch_mode:
             return None
         try:
-            w = float(self.plotter.window_size[0])
-            h = float(self.plotter.window_size[1])
+            from app.display_coords import in_normalized_viewport, qt_to_normalized
+
+            iw = self.plotter.interactor
+            if not in_normalized_viewport(
+                display_x, display_y, iw, self._axes_viewport
+            ):
+                return None
+            nx, ny = qt_to_normalized(display_x, display_y, iw)
         except Exception:
             return None
-        if w < 2 or h < 2:
-            return None
         vx0, vy0, vx1, vy1 = self._axes_viewport  # VTK: bottom-left origin, y up
-        # Qt y down → VTK-normalized y up
-        nx = float(display_x) / w
-        ny = 1.0 - float(display_y) / h
-        if not (vx0 <= nx <= vx1 and vy0 <= ny <= vy1):
-            return None
         # Local coords in triad pad (0..1)
         lx = (nx - vx0) / max(1e-9, vx1 - vx0)
         ly = (ny - vy0) / max(1e-9, vy1 - vy0)
