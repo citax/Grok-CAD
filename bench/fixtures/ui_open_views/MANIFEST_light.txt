@@ -1,0 +1,18 @@
+theme=light
+passed=15 failed=0
+OK empty plane half=16 (≤22)
+OK open empty has structure std=57.2
+OK open: corner triad region has colour variation
+OK command strip sections: ['Features', 'Sketch', 'Evaluate']
+OK no QTabWidget command tabs
+OK camera orientation widget present (view cube)
+OK triad click → view=right cameraΔ=54.412
+OK camera moved significantly Δ=54.41
+OK view_along_axis x → right Δ=49.31
+OK space-menu target top Δ=72.41
+OK tiny solid displayed
+OK tiny part screenshot has content
+OK large solid displayed
+OK large part screenshot has content
+OK sketch mode
+

@@ -14,9 +14,9 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSizePolicy,
-    QTabWidget,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -319,18 +319,18 @@ class MainWindow(QMainWindow):
         insert_m.addAction(act_pok)
 
     def _ribbon_button(self, act: QAction) -> QToolButton:
-        """SolidWorks-style large command button: icon above text."""
+        """Compact command icon with label under — section strip style."""
         btn = QToolButton()
         btn.setDefaultAction(act)
         btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        btn.setIconSize(QSize(32, 32))
+        btn.setIconSize(QSize(22, 22))
         btn.setAutoRaise(True)
-        btn.setMinimumSize(QSize(70, 58))
+        btn.setObjectName("CmdStripButton")
+        btn.setMinimumSize(QSize(52, 48))
         return btn
 
     @staticmethod
     def _cmd_separator() -> QWidget:
-        """Vertical group separator between command clusters (SW ribbon groups)."""
         from PySide6.QtWidgets import QFrame
 
         sep = QFrame()
@@ -340,21 +340,42 @@ class MainWindow(QMainWindow):
         sep.setFixedWidth(1)
         return sep
 
+    def _make_cmd_section(self, title: str, actions: list) -> QWidget:
+        """One labelled section of the always-visible command strip."""
+        from PySide6.QtWidgets import QFrame
+
+        box = QWidget()
+        box.setObjectName("CmdSection")
+        col = QVBoxLayout(box)
+        col.setContentsMargins(8, 4, 8, 4)
+        col.setSpacing(2)
+        head = QLabel(title)
+        head.setObjectName("CmdSectionTitle")
+        head.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        col.addWidget(head)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        for act in actions:
+            row.addWidget(self._ribbon_button(act))
+        row.addStretch(0)
+        col.addLayout(row)
+        return box
+
     def _build_command_manager(self) -> None:
-        """SolidWorks CommandManager: Features / Sketch / Evaluate tabs + large buttons."""
+        """Single always-visible strip: Features | Sketch | Evaluate sections."""
         bar = QToolBar("CommandManager")
         bar.setObjectName("CommandManagerBar")
         bar.setMovable(False)
         bar.setFloatable(False)
-        bar.setIconSize(QSize(32, 32))
+        bar.setIconSize(QSize(22, 22))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
 
-        self.cmd_tabs = QTabWidget()
-        self.cmd_tabs.setObjectName("CommandManager")
-        self.cmd_tabs.setDocumentMode(True)
-        self.cmd_tabs.setUsesScrollButtons(True)
+        # No tabs — one strip. Keep cmd_tabs alias None for old call sites.
+        self.cmd_tabs = None  # type: ignore[assignment]
+        self._sketch_tab_index = -1
 
-        # --- Features tab (SW: Sketch + Features groups) ---
+        # --- Actions (shared) ---
         self.act_sketch = QAction(
             fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self
         )
@@ -396,31 +417,6 @@ class MainWindow(QMainWindow):
         self.act_pocket.setShortcut(QKeySequence("P"))
         self.act_pocket.triggered.connect(self._pocket)
 
-        feat_w = QWidget()
-        feat_row = QHBoxLayout(feat_w)
-        feat_row.setContentsMargins(6, 4, 6, 4)
-        feat_row.setSpacing(2)
-        # Group: Sketch entry
-        feat_row.addWidget(self._ribbon_button(self.act_sketch))
-        feat_row.addWidget(self._cmd_separator())
-        # Group: solid features
-        for act in (
-            self.act_extrude,
-            self.act_revolve,
-            self.act_fillet,
-            self.act_pocket,
-        ):
-            feat_row.addWidget(self._ribbon_button(act))
-        feat_row.addStretch(1)
-        self.cmd_tabs.addTab(
-            feat_w, fa_icon("fa5s.cube", color=ACCENT), "Features"
-        )
-
-        # --- Sketch tab (SW: tools | dimensions | constraints | exit) ---
-        sketch_w = QWidget()
-        sk_row = QHBoxLayout(sketch_w)
-        sk_row.setContentsMargins(6, 4, 6, 4)
-        sk_row.setSpacing(2)
         group = QActionGroup(self)
         group.setExclusive(True)
         tool_defs = (
@@ -435,6 +431,7 @@ class MainWindow(QMainWindow):
                 "Driving dimension — click entity, type size (D)",
             ),
         )
+        sketch_tool_actions: list = []
         for tool, label, icon_name, tip in tool_defs:
             act = QAction(fa_icon(icon_name), label, self)
             act.setToolTip(tip)
@@ -444,61 +441,68 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda checked=False, t=tool: self._on_sketch_tool(t))
             group.addAction(act)
             self._sketch_tool_actions[tool] = act
-            sk_row.addWidget(self._ribbon_button(act))
-            # Separator after draw tools, before dimension
-            if tool is SketchTool.CIRCLE:
-                sk_row.addWidget(self._cmd_separator())
-        sk_row.addWidget(self._cmd_separator())
-        # Constraints group
+            sketch_tool_actions.append(act)
+
         self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horizontal", self)
         self.act_horiz.setToolTip("Make selected line(s) horizontal")
         self.act_horiz.setShortcut(QKeySequence("H"))
         self.act_horiz.triggered.connect(self._make_horizontal)
-        sk_row.addWidget(self._ribbon_button(self.act_horiz))
         self.act_vert = QAction(fa_icon("fa5s.arrows-alt-v"), "Vertical", self)
         self.act_vert.setToolTip("Make selected line(s) vertical")
         self.act_vert.setShortcut(QKeySequence("V"))
         self.act_vert.triggered.connect(self._make_vertical)
-        sk_row.addWidget(self._ribbon_button(self.act_vert))
         self.act_equal = QAction(fa_icon("fa5s.equals"), "Equal", self)
         self.act_equal.setToolTip(
             "Make selected lines equal length (first is source)"
         )
         self.act_equal.setShortcut(QKeySequence("="))
         self.act_equal.triggered.connect(self._make_equal)
-        sk_row.addWidget(self._ribbon_button(self.act_equal))
-        sk_row.addWidget(self._cmd_separator())
         self.act_exit_sketch = QAction(
-            fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit Sketch", self
+            fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit", self
         )
         self.act_exit_sketch.setToolTip("Exit sketch mode (Esc when idle)")
         self.act_exit_sketch.triggered.connect(self._exit_sketch)
-        sk_row.addWidget(self._ribbon_button(self.act_exit_sketch))
-        sk_row.addStretch(1)
-        self._sketch_tab_index = self.cmd_tabs.addTab(
-            sketch_w, fa_icon("fa5s.pencil-alt", color=ACCENT), "Sketch"
-        )
 
-        # --- Evaluate tab ---
-        eval_w = QWidget()
-        ev_row = QHBoxLayout(eval_w)
-        ev_row.setContentsMargins(6, 4, 6, 4)
-        ev_row.addWidget(self._ribbon_button(self.act_export_stl))
-        ev_row.addStretch(1)
-        self.cmd_tabs.addTab(
-            eval_w, fa_icon("fa5s.chart-bar", color=ACCENT), "Evaluate"
-        )
-
-        # Stretch ribbon across full width
+        # Full-width host strip
         host = QWidget()
         host.setObjectName("CommandManagerHost")
-        hl = QVBoxLayout(host)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
-        hl.addWidget(self.cmd_tabs)
+        strip = QHBoxLayout(host)
+        strip.setContentsMargins(4, 2, 4, 2)
+        strip.setSpacing(0)
+
+        strip.addWidget(
+            self._make_cmd_section(
+                "Features",
+                [
+                    self.act_sketch,
+                    self.act_extrude,
+                    self.act_revolve,
+                    self.act_fillet,
+                    self.act_pocket,
+                ],
+            )
+        )
+        strip.addWidget(self._cmd_separator())
+        strip.addWidget(
+            self._make_cmd_section(
+                "Sketch",
+                sketch_tool_actions
+                + [
+                    self.act_horiz,
+                    self.act_vert,
+                    self.act_equal,
+                    self.act_exit_sketch,
+                ],
+            )
+        )
+        strip.addWidget(self._cmd_separator())
+        strip.addWidget(self._make_cmd_section("Evaluate", [self.act_export_stl]))
+        strip.addStretch(1)
+
         host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.addWidget(host)
         self.sketch_tb = bar  # type: ignore[assignment]
+        self._cmd_strip = host
         self._set_sketch_ribbon_enabled(False)
 
     def _set_sketch_ribbon_enabled(self, on: bool) -> None:
@@ -507,8 +511,6 @@ class MainWindow(QMainWindow):
         for name in ("act_exit_sketch", "act_horiz", "act_vert", "act_equal"):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(on)
-        if on and hasattr(self, "cmd_tabs"):
-            self.cmd_tabs.setCurrentIndex(self._sketch_tab_index)
 
     def _build_heads_up_view_bar(self) -> None:
         """Floating SolidWorks-style heads-up view tools over the viewport."""
@@ -1620,4 +1622,39 @@ class MainWindow(QMainWindow):
             if text and (text.isdigit() or text in ".-"):
                 if self.viewport._accept_length_char(text):
                     return
+        # Space → view orientation picker (SolidWorks-style view shortcut)
+        if event.key() == Qt.Key.Key_Space and not self.viewport.in_sketch_mode:
+            self._show_view_orientation_menu()
+            return
         super().keyPressEvent(event)
+
+    def _show_view_orientation_menu(self) -> None:
+        """Space-bar view menu: standard views + axis look-along."""
+        menu = QMenu(self)
+        menu.setObjectName("ViewOrientationMenu")
+        views = (
+            ("Front", "front"),
+            ("Back", "back"),
+            ("Top", "top"),
+            ("Bottom", "bottom"),
+            ("Right", "right"),
+            ("Left", "left"),
+            ("Isometric", "iso"),
+        )
+        for label, key in views:
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda checked=False, k=key: self.viewport.set_view(k)
+            )
+        menu.addSeparator()
+        for label, axis in (("Look +X", "x"), ("Look +Y", "y"), ("Look +Z", "z")):
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda checked=False, a=axis: self.viewport.view_along_axis(a)
+            )
+        menu.addSeparator()
+        act_fit = menu.addAction("Zoom to Fit")
+        act_fit.triggered.connect(self.viewport.zoom_to_fit)
+        # Pop near the viewport centre
+        gp = self.viewport.mapToGlobal(self.viewport.rect().center())
+        menu.exec(gp)

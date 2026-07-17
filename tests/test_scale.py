@@ -37,8 +37,14 @@ def test_axis_scales_with_part_size():
 
 
 def test_plane_half_grows_with_char():
-    assert plane_half_mm(50.0) < plane_half_mm(500.0)
-    assert plane_half_mm(500.0) >= 200.0
+    # Empty scene uses fixed modest half; growth applies when solids exist
+    assert plane_half_mm(50.0, has_display_solids=False) == plane_half_mm(
+        500.0, has_display_solids=False
+    )
+    assert plane_half_mm(50.0, has_display_solids=True) < plane_half_mm(
+        500.0, has_display_solids=True
+    )
+    assert plane_half_mm(500.0, has_display_solids=True) >= 200.0
 
 
 def test_sketch_grid_readable_at_metre_scale():

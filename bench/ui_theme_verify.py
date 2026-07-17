@@ -131,16 +131,24 @@ def main() -> int:
         return 1
 
     # SolidWorks chrome presence
-    has_cmd = hasattr(win, "cmd_tabs") and win.cmd_tabs is not None
+    has_cmd = getattr(win, "_cmd_strip", None) is not None or (
+        hasattr(win, "cmd_tabs") and win.cmd_tabs is not None
+    )
     has_hud = hasattr(win, "_hud") and win._hud is not None and win._hud.isVisible()
     print(f"CHROME command_manager={int(has_cmd)} heads_up={int(has_hud)}", flush=True)
     if not has_cmd or not has_hud:
         print("CHROME_FAIL", flush=True)
         return 1
     print("CHROME_OK ribbon+hud", flush=True)
+    if getattr(win, "cmd_tabs", None) is not None:
+        strip_info = (
+            f"tabs={win.cmd_tabs.count()} "
+            f"labels={[win.cmd_tabs.tabText(i) for i in range(win.cmd_tabs.count())]}"
+        )
+    else:
+        strip_info = "single_strip=1"
     print(
-        f"LOOK chrome: CommandManager tabs={win.cmd_tabs.count()} "
-        f"labels={[win.cmd_tabs.tabText(i) for i in range(win.cmd_tabs.count())]}; "
+        f"LOOK chrome: CommandManager {strip_info}; "
         f"HUD size={win._hud.width()}x{win._hud.height()} top-center",
         flush=True,
     )

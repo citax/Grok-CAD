@@ -13,6 +13,9 @@ import numpy as np
 
 # Fallback when the document has no geometry yet (still a readable workspace).
 DEFAULT_CHAR_MM = 50.0
+# Empty opening screen: plane half-extent (mm). Large values fill the window
+# and produce an unreadable brown smear of three overlapping planes.
+EMPTY_PLANE_HALF_MM = 16.0
 # World axes / origin glyph: keep a usable minimum so empty scenes don't vanish.
 MIN_AXIS_MM = 8.0
 MIN_PLANE_HALF_MM = 5.0
@@ -139,10 +142,30 @@ def reference_planes_should_show(
     return bool(selected_is_plane)
 
 
-def plane_half_mm(char_mm: float) -> float:
-    """Reference-plane half-extent (square from -h..+h)."""
+def plane_half_mm(char_mm: float, *, has_display_solids: bool = False) -> float:
+    """Reference-plane half-extent (square from -h..+h).
+
+    Empty opening scene uses a fixed modest size so Front/Top/Right do not
+    fill the window as an overlapping brown smear.
+    """
+    if not has_display_solids:
+        return float(EMPTY_PLANE_HALF_MM)
     c = max(float(char_mm), 1.0)
     return max(MIN_PLANE_HALF_MM, c * 0.55)
+
+
+def empty_workspace_camera(
+    plane_half: float,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
+    """Iso camera for the empty opening screen: planes fully visible, not clipped.
+
+    Returns (position, focal_point, view_up).
+    """
+    h = max(float(plane_half), 5.0)
+    # Distance so the three plane squares fit with margin in a typical 16:10 window
+    dist = h * 3.2
+    pos = (dist * 0.85, dist * 0.62, dist * 0.85)
+    return pos, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)
 
 
 def origin_glyph_sizes(char_mm: float) -> Tuple[float, float]:

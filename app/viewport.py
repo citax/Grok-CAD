@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from typing import Dict, Optional, Sequence, Set, Tuple
@@ -44,9 +45,11 @@ from app.workers import GeometryRebuildJob, snapshot_features
 from cadcore.document import Document, FeatureType, is_reference_plane, is_solid_feature
 from cadcore.faces import plane_frame_from_face
 from cadcore.scale import (
+    EMPTY_PLANE_HALF_MM,
     axis_length_mm,
     characteristic_length_from_bounds,
     characteristic_length_from_points,
+    empty_workspace_camera,
     origin_glyph_sizes,
     origin_triad_policy,
     plane_half_mm,
@@ -372,6 +375,32 @@ class _InteractorFilter(QObject):
         return False
 
 
+class _ViewControlFilter(QObject):
+    """Intercept left-clicks on the bottom-left triad to snap standard views."""
+
+    def __init__(self, viewport: "Viewport") -> None:
+        super().__init__(viewport)
+        self.vp = viewport
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if self.vp.in_sketch_mode:
+            return False
+        if event.type() != QEvent.Type.MouseButtonPress:
+            return False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        try:
+            x = float(event.position().x())
+            y = float(event.position().y())
+        except Exception:
+            return False
+        name = self.vp.try_corner_axes_click(x, y)
+        if name is None:
+            return False
+        # Consumed — do not also mesh-pick through the triad
+        return True
+
+
 class Viewport(QWidget):
     feature_picked = Signal(int)
     status_message = Signal(str)
@@ -381,6 +410,8 @@ class Viewport(QWidget):
     renderer_info = Signal(str)
     # Smart Dimension: entity_id, role ("length"|"width"|"height"|"diameter")
     dimension_requested = Signal(int, str)
+    # Camera view changed via triad / cube / space menu (name of view)
+    view_changed = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -548,10 +579,14 @@ class Viewport(QWidget):
     def _setup_helpers(self) -> None:
         assert self.plotter is not None
         # SolidWorks-like: no environment bounds box; no scene-spanning grey axes.
-        # Orientation lives in the corner triad; model origin is a short RGB triad.
+        # Orientation: corner triad (bottom-left) + camera orientation cube (top-right).
         self._origin_axes_actor = None
         self._corner_axes_actor = None
+        self._corner_axes_widget = None
+        self._camera_orient_widget = None
+        self._axes_viewport = (0.0, 0.0, 0.13, 0.13)  # bottom-left fraction
         self._refresh_world_helpers(force=True)
+        self._fit_empty_workspace()
         # Corner reference triad (SW bottom-left compass) — fixed screen size.
         try:
             actor = self.plotter.add_axes(
@@ -563,8 +598,7 @@ class Viewport(QWidget):
                 x_color=AXIS_X,
                 y_color=AXIS_Y,
                 z_color=AXIS_Z,
-                # Compact SW-style corner footprint
-                viewport=(0.0, 0.0, 0.14, 0.14),
+                viewport=self._axes_viewport,
                 cone_radius=0.45,
                 shaft_length=0.78,
                 tip_length=0.22,
@@ -572,9 +606,24 @@ class Viewport(QWidget):
             )
             self._corner_axes_actor = actor
             self._style_axes_captions(actor)
+            # Keep a handle on the orientation marker widget for hit-tests
+            try:
+                self._corner_axes_widget = self.plotter.renderer.axes_widget
+            except Exception:
+                self._corner_axes_widget = getattr(self.plotter, "axes_widget", None)
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] add_axes: {exc}", file=sys.stderr)
             raise
+        # Fusion/VTK camera orientation widget — interactive chamfered cube+axes
+        # that steers the camera when faces/corners are clicked (better than a
+        # static annotated cube for actual view jumps).
+        try:
+            self._camera_orient_widget = self.plotter.add_camera_orientation_widget(
+                animate=True, n_frames=12
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] camera orientation widget: {exc}", file=sys.stderr)
+            self._camera_orient_widget = None
 
     def _compute_char_mm(self) -> float:
         """Characteristic scene length (mm) from solids + sketches + default."""
@@ -635,8 +684,8 @@ class Viewport(QWidget):
         if not self.plotter:
             return
         char = self._compute_char_mm()
-        new_half = plane_half_mm(char)
         has_solids = self._has_display_solids()
+        new_half = plane_half_mm(char, has_display_solids=has_solids)
         show_origin, new_axis = origin_triad_policy(
             has_display_solids=has_solids,
             char_mm=char,
@@ -676,6 +725,9 @@ class Viewport(QWidget):
         # Keep sketch-mode visibility rules
         if self.in_sketch_mode:
             self._set_sketch_2d_chrome(True)
+        elif not has_solids:
+            # Opening / empty scene: keep the camera framed so planes aren't a smear
+            self._fit_empty_workspace()
 
     def _clear_origin_rgb_triad(self) -> None:
         prev = getattr(self, "_origin_axes_actor", None)
@@ -836,6 +888,13 @@ class Viewport(QWidget):
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[viewport] picking: {exc}", file=sys.stderr)
+        # Corner triad click → standard view (when not in sketch mode)
+        try:
+            self._view_click_filter = _ViewControlFilter(self)
+            self.plotter.interactor.installEventFilter(self._view_click_filter)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] view click filter: {exc}", file=sys.stderr)
+            self._view_click_filter = None
 
     def _setup_interaction_lod(self) -> None:
         """Throttle VTK during camera drag; optional LOD / scaled render (perf methods)."""
@@ -2698,37 +2757,194 @@ class Viewport(QWidget):
         self._selected_id = int(solid_id)
         return frame
 
+    def _view_distance(self) -> float:
+        """Camera distance for standard views (scales with scene)."""
+        if self._has_display_solids():
+            return max(15.0, self._part_extent_mm() * 1.6, self._char_mm * 1.3)
+        h = float(self._plane_half) if self._plane_half > 0 else EMPTY_PLANE_HALF_MM
+        return max(h * 3.2, 40.0)
+
+    def _scene_focus(self) -> Tuple[float, float, float]:
+        """Focal point: solid centroid if present, else origin."""
+        if self._solid_mesh_cache:
+            pts = []
+            for verts, _ in self._solid_mesh_cache.values():
+                if verts is not None and len(verts):
+                    pts.append(np.asarray(verts, float).mean(axis=0))
+            if pts:
+                c = np.mean(np.stack(pts, axis=0), axis=0)
+                return (float(c[0]), float(c[1]), float(c[2]))
+        return (0.0, 0.0, 0.0)
+
+    def camera_snapshot(self) -> dict:
+        """Current camera pose — used by tests to prove the view actually moved."""
+        if not self.plotter:
+            return {}
+        cam = self.plotter.camera
+        return {
+            "position": tuple(float(x) for x in cam.GetPosition()),
+            "focal": tuple(float(x) for x in cam.GetFocalPoint()),
+            "up": tuple(float(x) for x in cam.GetViewUp()),
+        }
+
     def set_view(self, name: str) -> None:
         if not self.plotter or self.in_sketch_mode:
             if self.in_sketch_mode:
                 self.status_message.emit("Exit sketch to change standard views")
             return
-        dist = max(11.0, self._axis_len * 4.0, self._char_mm * 1.2)
-        focus = (0.0, 0.0, 0.0)
+        dist = self._view_distance()
+        focus = self._scene_focus()
+        fx, fy, fz = focus
         up = (0.0, 1.0, 0.0)
-        if name == "front":
-            pos = (0.0, 0.0, dist)
-        elif name == "back":
-            pos = (0.0, 0.0, -dist)
-        elif name == "top":
-            pos = (0.0, dist, 0.0)
+        key = (name or "iso").strip().lower()
+        if key in ("front", "+z", "z"):
+            pos = (fx, fy, fz + dist)
+            key = "front"
+        elif key in ("back", "-z"):
+            pos = (fx, fy, fz - dist)
+            key = "back"
+        elif key in ("top", "+y", "y"):
+            pos = (fx, fy + dist, fz)
             up = (0.0, 0.0, -1.0)
-        elif name == "bottom":
-            pos = (0.0, -dist, 0.0)
+            key = "top"
+        elif key in ("bottom", "-y"):
+            pos = (fx, fy - dist, fz)
             up = (0.0, 0.0, 1.0)
-        elif name == "right":
-            pos = (dist, 0.0, 0.0)
-        elif name == "left":
-            pos = (-dist, 0.0, 0.0)
+            key = "bottom"
+        elif key in ("right", "+x", "x"):
+            pos = (fx + dist, fy, fz)
+            key = "right"
+        elif key in ("left", "-x"):
+            pos = (fx - dist, fy, fz)
+            key = "left"
         else:
-            pos = (dist * 0.75, dist * 0.55, dist * 0.75)
-            name = "iso"
+            pos = (fx + dist * 0.75, fy + dist * 0.55, fz + dist * 0.75)
+            key = "iso"
         self.plotter.camera_position = [pos, focus, up]
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
         self._request_render()
-        self.status_message.emit(f"View: {name.capitalize()}")
+        self.status_message.emit(f"View: {key.capitalize()}")
+        self.view_changed.emit(key)
+
+    def view_along_axis(self, axis: str, *, reverse: bool = False) -> str:
+        """Look straight down a world axis (perpendicular view).
+
+        ``axis`` is 'x', 'y', or 'z'. Returns the standard view name applied.
+        """
+        a = (axis or "z").strip().lower()[:1]
+        mapping = {
+            "x": ("right", "left"),
+            "y": ("top", "bottom"),
+            "z": ("front", "back"),
+        }
+        if a not in mapping:
+            a = "z"
+        primary, opposite = mapping[a]
+        name = opposite if reverse else primary
+        self.set_view(name)
+        return name
+
+    def fit_empty_workspace(self) -> None:
+        """Public alias for opening-screen camera fit."""
+        self._fit_empty_workspace()
+
+    def _fit_empty_workspace(self) -> None:
+        """Frame the empty plane workspace so it is readable (not a brown smear)."""
+        if not self.plotter or self._has_display_solids():
+            return
+        h = float(self._plane_half) if self._plane_half > 0 else EMPTY_PLANE_HALF_MM
+        pos, focus, up = empty_workspace_camera(h)
+        self.plotter.camera_position = [pos, focus, up]
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
+        self._request_render()
+
+    def try_corner_axes_click(self, display_x: float, display_y: float) -> Optional[str]:
+        """If click is over the bottom-left triad, snap camera to that axis.
+
+        Returns view name applied, or None if the click was outside the triad.
+        Qt display coords: origin top-left, y down.
+        """
+        if not self.plotter or self.in_sketch_mode:
+            return None
+        try:
+            w = float(self.plotter.window_size[0])
+            h = float(self.plotter.window_size[1])
+        except Exception:
+            return None
+        if w < 2 or h < 2:
+            return None
+        vx0, vy0, vx1, vy1 = self._axes_viewport  # VTK: bottom-left origin, y up
+        # Qt y down → VTK-normalized y up
+        nx = float(display_x) / w
+        ny = 1.0 - float(display_y) / h
+        if not (vx0 <= nx <= vx1 and vy0 <= ny <= vy1):
+            return None
+        # Local coords in triad pad (0..1)
+        lx = (nx - vx0) / max(1e-9, vx1 - vx0)
+        ly = (ny - vy0) / max(1e-9, vy1 - vy0)
+        # Project unit axes into the current camera view plane and pick nearest
+        try:
+            cam = self.plotter.camera
+            # Camera basis
+            pos = np.asarray(cam.GetPosition(), float)
+            foc = np.asarray(cam.GetFocalPoint(), float)
+            up = np.asarray(cam.GetViewUp(), float)
+            forward = foc - pos
+            forward = forward / (np.linalg.norm(forward) + 1e-12)
+            right = np.cross(forward, up)
+            rn = np.linalg.norm(right)
+            if rn < 1e-12:
+                return None
+            right = right / rn
+            cup = np.cross(right, forward)
+            cup = cup / (np.linalg.norm(cup) + 1e-12)
+            # Click direction in pad space relative to center
+            cx, cy = lx - 0.5, ly - 0.5
+            if abs(cx) < 0.06 and abs(cy) < 0.06:
+                # Center click → iso
+                self.set_view("iso")
+                return "iso"
+            best_axis = "z"
+            best_dot = -1e9
+            for axis, vec in (
+                ("x", np.array([1.0, 0.0, 0.0])),
+                ("y", np.array([0.0, 1.0, 0.0])),
+                ("z", np.array([0.0, 0.0, 1.0])),
+            ):
+                # Project axis into camera plane
+                sx = float(np.dot(vec, right))
+                sy = float(np.dot(vec, cup))
+                sn = math.hypot(sx, sy)
+                if sn < 1e-6:
+                    continue
+                sx, sy = sx / sn, sy / sn
+                # Similarity to click vector
+                cn = math.hypot(cx, cy)
+                if cn < 1e-6:
+                    continue
+                dot = (sx * cx + sy * cy) / cn
+                if dot > best_dot:
+                    best_dot = dot
+                    best_axis = axis
+            if best_dot < 0.15:
+                return None
+            return self.view_along_axis(best_axis)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] corner axes click: {exc}", file=sys.stderr)
+            return None
 
     def zoom_to_fit(self) -> None:
         if not self.plotter:
+            return
+        if not self._has_display_solids():
+            self._fit_empty_workspace()
+            self.status_message.emit("Zoom to fit")
             return
         self.plotter.reset_camera()
         self._request_render()

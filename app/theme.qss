@@ -113,81 +113,62 @@ QPushButton#primaryButton {
     border-color: @ACCENT;
 }
 
-/* CommandManager — SolidWorks-style: tab strip + large icon+text commands */
+/* Command strip — single always-visible bar with labelled sections */
 QToolBar#CommandManagerBar {
-    background-color: @BG_PANEL;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 @BG_ELEVATED, stop:1 @BG_PANEL);
     border: none;
     border-bottom: 1px solid @BORDER;
     spacing: 0;
     padding: 0;
-    min-height: 96px;
+    min-height: 78px;
 }
-QTabWidget#CommandManager {
-    background-color: @BG_PANEL;
-    border: none;
+QWidget#CommandManagerHost {
+    background: transparent;
 }
-QTabWidget#CommandManager::pane {
-    background-color: @BG_ELEVATED;
-    border: none;
-    border-top: 1px solid @BORDER;
-    border-bottom: 1px solid @BORDER;
-    padding: 6px 10px 8px 10px;
-    min-height: 68px;
+QWidget#CmdSection {
+    background: transparent;
 }
-QTabWidget#CommandManager QTabBar {
-    background: @BG_PANEL;
-    alignment: left;
-}
-QTabWidget#CommandManager QTabBar::tab {
-    background: @BG_PANEL;
+QLabel#CmdSectionTitle {
     color: @TEXT_SECONDARY;
-    padding: 7px 18px 6px 18px;
-    margin-right: 1px;
-    border: none;
-    border-top-left-radius: 3px;
-    border-top-right-radius: 3px;
-    border-bottom: 3px solid transparent;
-    font-weight: 600;
-    font-size: 9pt;
-    min-width: 72px;
-}
-QTabWidget#CommandManager QTabBar::tab:hover {
-    color: @TEXT_PRIMARY;
-    background: @BG_ELEVATED;
-}
-QTabWidget#CommandManager QTabBar::tab:selected {
-    color: @ACCENT;
-    border-bottom: 3px solid @ACCENT;
-    background: @BG_ELEVATED;
-}
-/* Large command buttons — SW “Large Buttons with Text” */
-QTabWidget#CommandManager QToolButton {
-    min-width: 70px;
-    max-width: 96px;
-    min-height: 58px;
-    padding: 4px 6px 2px 6px;
     font-size: 8pt;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    padding: 0 2px 2px 2px;
+}
+QToolButton#CmdStripButton {
+    min-width: 50px;
+    max-width: 72px;
+    min-height: 46px;
+    padding: 2px 4px;
+    font-size: 7.5pt;
     font-weight: 500;
-    border-radius: 4px;
+    border-radius: 5px;
     background: transparent;
     border: 1px solid transparent;
+    color: @TEXT_PRIMARY;
 }
-QTabWidget#CommandManager QToolButton:hover {
-    background-color: @BG_PANEL;
+QToolButton#CmdStripButton:hover {
+    background-color: @BG_ELEVATED;
     border-color: @BORDER;
 }
-QTabWidget#CommandManager QToolButton:checked,
-QTabWidget#CommandManager QToolButton:pressed {
+QToolButton#CmdStripButton:checked,
+QToolButton#CmdStripButton:pressed {
     background-color: @ACCENT;
     border-color: @ACCENT;
     color: #ffffff;
 }
-/* Group separators between command clusters */
+QToolButton#CmdStripButton:disabled {
+    color: @TEXT_SECONDARY;
+    background: transparent;
+    border-color: transparent;
+}
 QFrame#CmdGroupSep {
     background-color: @BORDER;
     max-width: 1px;
     min-width: 1px;
-    margin: 8px 6px;
+    margin: 10px 6px;
 }
 
 /* Heads-up view toolbar over viewport — frosted SW-style chip */
