@@ -4,15 +4,15 @@ OK policy: solids → no world origin triad; planes hidden
 OK tiny solid_5 on display path
 OK tiny: no world-origin triad (corner triad only)
 OK tiny: reference planes hidden with solid
-OK tiny_solid_iso: solid content (std=70.7 mean=171.8)
+OK tiny_solid_iso: solid content (std=71.8 mean=169.0)
 OK large solid_5 on display path
 OK large: no world-origin triad
 OK large: reference planes hidden with solid
-OK large_solid_iso: solid content (std=76.2 mean=122.4)
-OK large_solid_side: solid content (std=74.4 mean=163.5)
+OK large_solid_iso: solid content (std=75.3 mean=118.8)
+OK large_solid_side: solid content (std=75.2 mean=160.5)
 OK sketch mode entered with solid in document
 OK corner triad present (orientation at any size)
 OK sketch screenshot has content
 OK after sketch exit: planes hidden again
-OK solid_after_sketch: solid content (std=53.7 mean=194.9)
+OK solid_after_sketch: solid content (std=54.0 mean=194.8)
 
