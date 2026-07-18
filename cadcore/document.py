@@ -778,6 +778,8 @@ class Document:
     features: List[Feature] = field(default_factory=list)
     selected_id: int = -1
     display_unit: Unit = Unit.MM
+    # Unsaved changes since last Save / Open / New
+    dirty: bool = False
     _next_id: int = 1
     _sketch_count: int = 0
     _extrude_count: int = 0
@@ -821,6 +823,7 @@ class Document:
         self._next_id = 1
         self.selected_id = -1
         self.name = "Untitled"
+        self.dirty = False
         self._sketch_count = 0
         self._extrude_count = 0
         self._revolve_count = 0
@@ -830,6 +833,12 @@ class Document:
         self._redo_stack.clear()
         self._clipboard = None
         self._paste_n = 0
+
+    def mark_dirty(self) -> None:
+        self.dirty = True
+
+    def mark_clean(self) -> None:
+        self.dirty = False
 
     # ----- history -----
     def can_undo(self) -> bool:
@@ -844,6 +853,7 @@ class Document:
             cmd.redo(self)
         self._undo_stack.append(cmd)
         self._redo_stack.clear()
+        self.dirty = True
 
     def undo(self) -> bool:
         """Undo last command. Empty stack → safe no-op (False)."""
@@ -852,6 +862,7 @@ class Document:
         cmd = self._undo_stack.pop()
         cmd.undo(self)
         self._redo_stack.append(cmd)
+        self.dirty = True
         return True
 
     def redo(self) -> bool:
@@ -861,6 +872,7 @@ class Document:
         cmd = self._redo_stack.pop()
         cmd.redo(self)
         self._undo_stack.append(cmd)
+        self.dirty = True
         return True
 
     def record_entity_add(self, sketch_id: int, ent: SketchEntity) -> None:
@@ -1028,7 +1040,10 @@ class Document:
         return ent
 
     def set_display_unit(self, unit: Unit) -> None:
-        self.display_unit = Unit(unit)
+        u = Unit(unit)
+        if self.display_unit is not u and self.display_unit != u:
+            self.dirty = True
+        self.display_unit = u
 
     def seed_reference_planes(self) -> None:
         have = {f.type for f in self.features}

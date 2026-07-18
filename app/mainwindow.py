@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Dict, Optional
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
@@ -51,6 +52,13 @@ from cadcore.document import (
 )
 from cadcore.mesh import write_stl_binary
 from cadcore.profiles import ClosedLineLoop, list_closed_profiles
+from cadcore.project_io import (
+    DEFAULT_EXTENSION,
+    ProjectIOError,
+    load_document,
+    replace_document_contents,
+    save_document,
+)
 from cadcore.sketch import (
     CircleEntity,
     LineEntity,
@@ -66,6 +74,8 @@ from cadcore.sketch import (
 )
 from cadcore.units import Unit, format_length, from_mm, parse_length, to_mm
 
+PROJECT_FILTER = "Grok CAD project (*.gcad);;JSON (*.json);;All files (*)"
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -74,6 +84,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self.doc = Document()
         self.doc.seed_reference_planes()
+        self.doc.mark_clean()
+        # Path of the open project file, or None if never saved
+        self._project_path: Optional[Path] = None
 
         self.viewport = Viewport(self)
         self.setCentralWidget(self.viewport)
@@ -105,6 +118,7 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         self._sync_selection(-1)
         self._set_ready_status()
+        self._update_window_title()
         # Space must work even when focus is inside the VTK interactor
         self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self._space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -186,9 +200,32 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         if fid >= 0 and self.doc.find(fid) is not None:
             self._sync_selection(fid)
+        self._update_window_title()
 
     def _build_menus(self) -> None:
         file_m = self.menuBar().addMenu("&File")
+        act_new = QAction(fa_icon("fa5s.file"), "&New", self)
+        act_new.setShortcut(QKeySequence.StandardKey.New)
+        act_new.setToolTip("Start a new empty project (Ctrl+N)")
+        act_new.triggered.connect(self._file_new)
+        file_m.addAction(act_new)
+        act_open = QAction(fa_icon("fa5s.folder-open"), "&Open…", self)
+        act_open.setShortcut(QKeySequence.StandardKey.Open)
+        act_open.setToolTip("Open a Grok CAD project (Ctrl+O)")
+        act_open.triggered.connect(self._file_open)
+        file_m.addAction(act_open)
+        file_m.addSeparator()
+        act_save = QAction(fa_icon("fa5s.save"), "&Save", self)
+        act_save.setShortcut(QKeySequence.StandardKey.Save)
+        act_save.setToolTip("Save the current project (Ctrl+S)")
+        act_save.triggered.connect(self._file_save)
+        file_m.addAction(act_save)
+        act_save_as = QAction(fa_icon("fa5s.save"), "Save &As…", self)
+        act_save_as.setShortcut(QKeySequence.StandardKey.SaveAs)
+        act_save_as.setToolTip("Save the project under a new name")
+        act_save_as.triggered.connect(self._file_save_as)
+        file_m.addAction(act_save_as)
+        file_m.addSeparator()
         self.act_export_stl = QAction(
             fa_icon("fa5s.file-export", color=ACCENT), "Export STL…", self
         )
@@ -746,6 +783,7 @@ class MainWindow(QMainWindow):
                 return
             self._refresh_tree()
             self._sync_selection(skf.id)
+            self._update_window_title()
             self.viewport.enter_sketch(skf.id)
             self._set_sketch_ribbon_enabled(True)
             self._sync_sketch_tool_ui(SketchTool.LINE)
@@ -766,6 +804,7 @@ class MainWindow(QMainWindow):
             return
         self._refresh_tree()
         self._sync_selection(skf.id)
+        self._update_window_title()
         self.viewport.enter_sketch(skf.id)
         self._set_sketch_ribbon_enabled(True)
         self._sync_sketch_tool_ui(SketchTool.LINE)
@@ -973,6 +1012,7 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         if created:
             self._sync_selection(created[-1].id)
+        self._update_window_title()
         names = ", ".join(f.name for f in created)
         shown = format_length(dist, self.doc.display_unit)
         self.statusBar().showMessage(
@@ -1059,6 +1099,7 @@ class MainWindow(QMainWindow):
         self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(feat.id)
+        self._update_window_title()
         self.statusBar().showMessage(
             f"Created {feat.name} (angle={ang:g}°)", 3000
         )
@@ -1148,6 +1189,7 @@ class MainWindow(QMainWindow):
         self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(feat.id)
+        self._update_window_title()
         unit = self.doc.display_unit
         self.statusBar().showMessage(
             f"Created {feat.name} (r={format_length(radius, unit)}, "
@@ -1261,11 +1303,155 @@ class MainWindow(QMainWindow):
         self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(feat.id)
+        self._update_window_title()
         self.statusBar().showMessage(
             f"Created {feat.name} (hole r={format_length(hr, unit)}, "
             f"dist={format_length(dist, unit)})",
             3000,
         )
+
+    # ----- project file (Save / Open / New) -----
+    def _update_window_title(self) -> None:
+        if self._project_path is not None:
+            name = self._project_path.name
+        else:
+            name = f"{self.doc.name}{DEFAULT_EXTENSION}" if self.doc.name else "Untitled.gcad"
+            if self.doc.name == "Untitled":
+                name = "Untitled.gcad"
+        dirty = " *" if self.doc.dirty else ""
+        self.setWindowTitle(f"Grok CAD — {name}{dirty}")
+
+    def _mark_dirty_and_title(self) -> None:
+        self.doc.mark_dirty()
+        self._update_window_title()
+
+    def _confirm_discard_if_dirty(self) -> bool:
+        """Return True if it is safe to discard the current document."""
+        if not self.doc.dirty:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unsaved changes")
+        box.setText("The current project has unsaved changes.")
+        box.setInformativeText("Do you want to save before continuing?")
+        save_btn = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("Don't Save", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return False
+        if clicked is save_btn:
+            return self._file_save()
+        return True  # Don't Save
+
+    def _reload_ui_from_document(self) -> None:
+        """After New / Open: rebind views and rebuild the scene."""
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self._set_sketch_ribbon_enabled(False)
+        self.viewport.set_document(self.doc)
+        self.props.set_document(self.doc)
+        self.props.clear()
+        # Sync unit menu checks
+        if hasattr(self, "_unit_actions"):
+            for u, act in self._unit_actions.items():
+                act.setChecked(u is self.doc.display_unit or u == self.doc.display_unit)
+        self._refresh_tree()
+        sid = self.doc.selected_id
+        if sid >= 0 and self.doc.find(sid) is not None:
+            self._sync_selection(sid)
+        else:
+            self.doc.selected_id = -1
+            self._sync_selection(-1)
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self.viewport.zoom_to_fit()
+        self._update_window_title()
+
+    def _file_new(self) -> None:
+        if not self._confirm_discard_if_dirty():
+            return
+        self.doc.clear()
+        self.doc.seed_reference_planes()
+        self.doc.selected_id = -1
+        self.doc.mark_clean()
+        self._project_path = None
+        self._reload_ui_from_document()
+        self.statusBar().showMessage("New project", 2500)
+
+    def _file_open(self) -> None:
+        if not self._confirm_discard_if_dirty():
+            return
+        path, _filt = QFileDialog.getOpenFileName(
+            self,
+            "Open Project",
+            str(self._project_path.parent) if self._project_path else "",
+            PROJECT_FILTER,
+        )
+        if not path:
+            return
+        try:
+            loaded = load_document(path)
+        except ProjectIOError as exc:
+            QMessageBox.warning(self, "Open Project", str(exc))
+            self.statusBar().showMessage(f"Open failed: {exc}", 5000)
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "Open Project", f"Could not read file:\n{exc}")
+            return
+        replace_document_contents(self.doc, loaded)
+        self._project_path = Path(path)
+        self._reload_ui_from_document()
+        self.statusBar().showMessage(f"Opened {self._project_path.name}", 4000)
+
+    def _file_save(self) -> bool:
+        """Save to current path, or Save As if none. Returns True on success."""
+        if self._project_path is None:
+            return self._file_save_as()
+        return self._write_project(self._project_path)
+
+    def _file_save_as(self) -> bool:
+        default = (
+            str(self._project_path)
+            if self._project_path is not None
+            else f"{self.doc.name or 'Untitled'}{DEFAULT_EXTENSION}"
+        )
+        path, _filt = QFileDialog.getSaveFileName(
+            self,
+            "Save Project As",
+            default,
+            PROJECT_FILTER,
+        )
+        if not path:
+            return False
+        p = Path(path)
+        if p.suffix.lower() not in (".gcad", ".json"):
+            p = p.with_suffix(DEFAULT_EXTENSION)
+        return self._write_project(p)
+
+    def _write_project(self, path: Path) -> bool:
+        try:
+            out = save_document(self.doc, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save Project", f"Could not write file:\n{exc}")
+            self.statusBar().showMessage(f"Save failed: {exc}", 5000)
+            return False
+        except (TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Save Project", f"Could not serialize project:\n{exc}")
+            return False
+        self._project_path = out
+        self.doc.mark_clean()
+        self._update_window_title()
+        self.statusBar().showMessage(f"Saved {out.name}", 4000)
+        return True
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if not self._confirm_discard_if_dirty():
+            event.ignore()
+            return
+        event.accept()
 
     def _export_stl(self) -> None:
         """Export the currently selected solid (extrude/revolve/…) as binary STL."""
@@ -1344,6 +1530,7 @@ class MainWindow(QMainWindow):
             if n > 0:
                 ctrl.clear_selection()
                 self.viewport.sync_sketch_visuals()
+                self._update_window_title()
                 self.statusBar().showMessage(
                     f"Deleted {n} entit{'y' if n == 1 else 'ies'}", 2000
                 )
@@ -1358,6 +1545,7 @@ class MainWindow(QMainWindow):
             self.viewport.refresh_sketches()
             self._refresh_tree()
             self._sync_selection(self.doc.selected_id)
+            self._update_window_title()
             self.statusBar().showMessage("Feature deleted", 2000)
 
     def _active_sketch_id(self) -> int:
@@ -1379,6 +1567,7 @@ class MainWindow(QMainWindow):
             self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(self.doc.selected_id)
+        self._update_window_title()
         self.statusBar().showMessage("Undo", 1500)
 
     def _redo(self) -> None:
@@ -1392,6 +1581,7 @@ class MainWindow(QMainWindow):
             self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(self.doc.selected_id)
+        self._update_window_title()
         self.statusBar().showMessage("Redo", 1500)
 
     def _copy(self) -> None:
@@ -1522,6 +1712,7 @@ class MainWindow(QMainWindow):
         mm = to_mm(val, unit)
         dim = self.doc.apply_sketch_dimension(sid, int(entity_id), role, mm)
         self.viewport.sync_sketch_visuals()
+        self._update_window_title()
         shown = format_length(measure_dimension_value(ent, role), unit)
         self.statusBar().showMessage(
             f"{role_label} → {shown}" + (f"  (dim #{dim.id})" if dim else ""),
