@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 
 
 class ViewCubeController(QObject):
-    # Top-right inset (normalized VTK viewport). ~11% of the window —
-    # previous (0.80…0.995) was nearly 20% and dominated the opening scene.
-    VIEWPORT = (0.885, 0.885, 0.995, 0.995)
+    # Top-right inset (normalized VTK viewport). Original was (0.80…0.995)
+    # ≈19.5% of the window; nudge only a little smaller (~16.5%).
+    VIEWPORT = (0.83, 0.83, 0.995, 0.995)
     # Orthographic half-height in cube units (cube half≈1): larger → more margin
-    PARALLEL_SCALE = 1.95
+    PARALLEL_SCALE = 1.75
     # Degrees per display pixel — low enough for fine control, high enough to feel direct
     ORBIT_DEG_PER_PX = 0.42
     # Click vs drag: once exceeded, every subsequent pixel moves the view
