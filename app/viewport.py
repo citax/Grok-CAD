@@ -2882,35 +2882,212 @@ class Viewport(QWidget):
         return 1.0 - (1.0 - t) ** 3
 
     @staticmethod
-    def _slerp_dir(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
-        """Spherical lerp of unit direction vectors (stable for camera orbit)."""
-        a = np.asarray(a, dtype=np.float64).reshape(3)
-        b = np.asarray(b, dtype=np.float64).reshape(3)
-        na = float(np.linalg.norm(a))
-        nb = float(np.linalg.norm(b))
-        if na < 1e-12 or nb < 1e-12:
-            return (1.0 - t) * a + t * b
-        a = a / na
-        b = b / nb
-        dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    def _camera_basis(
+        pos: np.ndarray, foc: np.ndarray, up: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Orthonormal camera frame (right, up, back).
+
+        ``back`` points from focus toward the camera (along the view ray from
+        the target). ``up`` is the true view-up after orthogonalization.
+        """
+        pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        foc = np.asarray(foc, dtype=np.float64).reshape(3)
+        up = np.asarray(up, dtype=np.float64).reshape(3)
+        back = pos - foc
+        bn = float(np.linalg.norm(back))
+        if bn < 1e-12:
+            back = np.array([0.0, 0.0, 1.0])
+        else:
+            back = back / bn
+        # right = normalize(up × back)  so (right, up, back) is right-handed
+        # and matches VTK (looking from pos toward foc = −back)
+        right = np.cross(up, back)
+        rn = float(np.linalg.norm(right))
+        if rn < 1e-12:
+            # up parallel to view ray — pick a stable alternate
+            alt = np.array([0.0, 0.0, 1.0]) if abs(back[1]) > 0.9 else np.array([0.0, 1.0, 0.0])
+            right = np.cross(alt, back)
+            rn = float(np.linalg.norm(right))
+            if rn < 1e-12:
+                right = np.array([1.0, 0.0, 0.0])
+                rn = 1.0
+        right = right / rn
+        true_up = np.cross(back, right)
+        un = float(np.linalg.norm(true_up))
+        if un > 1e-12:
+            true_up = true_up / un
+        return right, true_up, back
+
+    @staticmethod
+    def _basis_to_quat(
+        right: np.ndarray, up: np.ndarray, back: np.ndarray
+    ) -> np.ndarray:
+        """Rotation quaternion (w, x, y, z) for matrix with columns (right, up, back)."""
+        m00, m01, m02 = float(right[0]), float(up[0]), float(back[0])
+        m10, m11, m12 = float(right[1]), float(up[1]), float(back[1])
+        m20, m21, m22 = float(right[2]), float(up[2]), float(back[2])
+        tr = m00 + m11 + m22
+        if tr > 0.0:
+            s = math.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m21 - m12) / s
+            y = (m02 - m20) / s
+            z = (m10 - m01) / s
+        elif m00 > m11 and m00 > m22:
+            s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+            w = (m21 - m12) / s
+            x = 0.25 * s
+            y = (m01 + m10) / s
+            z = (m02 + m20) / s
+        elif m11 > m22:
+            s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+            w = (m02 - m20) / s
+            x = (m01 + m10) / s
+            y = 0.25 * s
+            z = (m12 + m21) / s
+        else:
+            s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+            w = (m10 - m01) / s
+            x = (m02 + m20) / s
+            y = (m12 + m21) / s
+            z = 0.25 * s
+        q = np.array([w, x, y, z], dtype=np.float64)
+        n = float(np.linalg.norm(q))
+        return q / n if n > 1e-15 else np.array([1.0, 0.0, 0.0, 0.0])
+
+    @staticmethod
+    def _quat_to_basis(q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Columns of the rotation matrix from quaternion (w,x,y,z)."""
+        w, x, y, z = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+        # right (col0), up (col1), back (col2)
+        right = np.array(
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y + z * w),
+                2.0 * (x * z - y * w),
+            ]
+        )
+        up = np.array(
+            [
+                2.0 * (x * y - z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z + x * w),
+            ]
+        )
+        back = np.array(
+            [
+                2.0 * (x * z + y * w),
+                2.0 * (y * z - x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ]
+        )
+        # Renormalize for safety
+        for v in (right, up, back):
+            n = float(np.linalg.norm(v))
+            if n > 1e-15:
+                v /= n
+        return right, up, back
+
+    @staticmethod
+    def _quat_slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+        """Shortest-path spherical lerp of unit quaternions (w,x,y,z)."""
+        q0 = np.asarray(q0, dtype=np.float64).reshape(4)
+        q1 = np.asarray(q1, dtype=np.float64).reshape(4)
+        t = float(t)
+        dot = float(np.dot(q0, q1))
+        # Shortest arc: flip one quaternion if needed
+        if dot < 0.0:
+            q1 = -q1
+            dot = -dot
         if dot > 0.9995:
-            v = (1.0 - t) * a + t * b
-            n = float(np.linalg.norm(v))
-            return v / n if n > 1e-12 else a
-        if dot < -0.9995:
-            # Opposite: pick an orthogonal axis and rotate through 180°
-            axis = np.cross(a, np.array([0.0, 1.0, 0.0]))
-            if float(np.linalg.norm(axis)) < 1e-8:
-                axis = np.cross(a, np.array([1.0, 0.0, 0.0]))
-            axis = axis / float(np.linalg.norm(axis))
-            # Rodrigues half-way path via intermediate
-            ang = math.pi * t
-            v = a * math.cos(ang) + np.cross(axis, a) * math.sin(ang)
-            n = float(np.linalg.norm(v))
-            return v / n if n > 1e-12 else b
-        omega = math.acos(dot)
-        so = math.sin(omega)
-        return (math.sin((1.0 - t) * omega) / so) * a + (math.sin(t * omega) / so) * b
+            q = q0 + t * (q1 - q0)
+            n = float(np.linalg.norm(q))
+            return q / n if n > 1e-15 else q0
+        dot = min(1.0, max(-1.0, dot))
+        theta = math.acos(dot)
+        s0 = math.sin((1.0 - t) * theta) / math.sin(theta)
+        s1 = math.sin(t * theta) / math.sin(theta)
+        q = s0 * q0 + s1 * q1
+        n = float(np.linalg.norm(q))
+        return q / n if n > 1e-15 else q0
+
+    @classmethod
+    def interpolate_camera_pose(
+        cls,
+        start_pos: Sequence[float],
+        start_foc: Sequence[float],
+        start_up: Sequence[float],
+        end_pos: Sequence[float],
+        end_foc: Sequence[float],
+        end_up: Sequence[float],
+        t: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Shortest-path camera pose at eased parameter ``t`` ∈ [0, 1].
+
+        Interpolates orientation as a single quaternion (not independent
+        direction + up slerps). Independent up slerp was spinning the scene
+        ~270° of roll on edge views even when start and end up agreed.
+        """
+        t = max(0.0, min(1.0, float(t)))
+        sp = np.asarray(start_pos, dtype=np.float64).reshape(3)
+        sf = np.asarray(start_foc, dtype=np.float64).reshape(3)
+        su = np.asarray(start_up, dtype=np.float64).reshape(3)
+        ep = np.asarray(end_pos, dtype=np.float64).reshape(3)
+        ef = np.asarray(end_foc, dtype=np.float64).reshape(3)
+        eu = np.asarray(end_up, dtype=np.float64).reshape(3)
+
+        sr, su2, sb = cls._camera_basis(sp, sf, su)
+        er, eu2, eb = cls._camera_basis(ep, ef, eu)
+        q0 = cls._basis_to_quat(sr, su2, sb)
+        q1 = cls._basis_to_quat(er, eu2, eb)
+        q = cls._quat_slerp(q0, q1, t)
+        _right, up_i, back_i = cls._quat_to_basis(q)
+
+        foc = (1.0 - t) * sf + t * ef
+        d0 = float(np.linalg.norm(sp - sf))
+        d1 = float(np.linalg.norm(ep - ef))
+        if d0 < 1e-9:
+            d0 = d1 if d1 > 1e-9 else 1.0
+        if d1 < 1e-9:
+            d1 = d0
+        dist = (1.0 - t) * d0 + t * d1
+        pos = foc + back_i * dist
+        return pos, foc, up_i
+
+    @classmethod
+    def measure_camera_up_path(
+        cls,
+        start_pos: Sequence[float],
+        start_foc: Sequence[float],
+        start_up: Sequence[float],
+        end_pos: Sequence[float],
+        end_foc: Sequence[float],
+        end_up: Sequence[float],
+        *,
+        samples: int = 48,
+    ) -> Tuple[float, float]:
+        """Return (path_roll_rad, endpoint_up_angle_rad) along the flight.
+
+        ``path_roll_rad`` is the integrated angle between consecutive view-up
+        vectors along the interpolated path. ``endpoint_up_angle_rad`` is the
+        angle between the true start and end view-up (after orthogonalization).
+        """
+        samples = max(2, int(samples))
+        _, su0, _ = cls._camera_basis(start_pos, start_foc, start_up)
+        _, eu0, _ = cls._camera_basis(end_pos, end_foc, end_up)
+        end_angle = math.acos(float(np.clip(np.dot(su0, eu0), -1.0, 1.0)))
+        path = 0.0
+        prev_up = su0
+        for i in range(1, samples + 1):
+            t = i / float(samples)
+            _p, _f, up = cls.interpolate_camera_pose(
+                start_pos, start_foc, start_up, end_pos, end_foc, end_up, t
+            )
+            up = up / (float(np.linalg.norm(up)) + 1e-15)
+            d = float(np.clip(np.dot(prev_up, up), -1.0, 1.0))
+            path += math.acos(d)
+            prev_up = up
+        return path, end_angle
 
     def animate_camera_to(
         self,
@@ -2921,7 +3098,12 @@ class Viewport(QWidget):
         duration_ms: int = 280,
         view_key: str = "",
     ) -> None:
-        """Smooth camera travel (Fusion/SW-style) instead of an instant snap."""
+        """Smooth camera travel (Fusion/SW-style) instead of an instant snap.
+
+        Orientation follows the *shortest* rotation between start and end
+        frames (quaternion slerp), so edge views no longer roll sideways and
+        right themselves mid-flight.
+        """
         if not self.plotter:
             return
         end_pos = np.asarray(pos, dtype=np.float64).reshape(3)
@@ -2963,30 +3145,17 @@ class Viewport(QWidget):
             return
 
         self._stop_camera_animation()
-        # Orbit-style: interpolate direction from focus + distance (less sliding)
-        start_dir = start_pos - start_foc
-        end_dir = end_pos - end_foc
-        start_dist = float(np.linalg.norm(start_dir))
-        end_dist = float(np.linalg.norm(end_dir))
-        if start_dist < 1e-9:
-            start_dist = end_dist if end_dist > 1e-9 else 1.0
-        if end_dist < 1e-9:
-            end_dist = start_dist
-
         interval = 16  # ~60 fps
         steps = max(1, int(round(float(duration_ms) / interval)))
         state = {
             "i": 0,
             "steps": steps,
+            "start_pos": start_pos,
             "start_foc": start_foc,
-            "end_foc": end_foc,
-            "start_dir": start_dir,
-            "end_dir": end_dir,
-            "start_dist": start_dist,
-            "end_dist": end_dist,
             "start_up": start_up,
-            "end_up": end_up,
             "end_pos": end_pos,
+            "end_foc": end_foc,
+            "end_up": end_up,
             "view_key": view_key,
         }
         self._cam_anim = state
@@ -3000,21 +3169,16 @@ class Viewport(QWidget):
                 return
             st["i"] += 1
             t = self._ease_out_cubic(st["i"] / float(st["steps"]))
-            foc = (1.0 - t) * st["start_foc"] + t * st["end_foc"]
-            direction = self._slerp_dir(st["start_dir"], st["end_dir"], t)
-            dist = (1.0 - t) * st["start_dist"] + t * st["end_dist"]
-            pos_i = foc + direction * dist
-            # Up: slerp then re-orthogonalize against look direction
-            up_i = self._slerp_dir(st["start_up"], st["end_up"], t)
-            look = -direction
-            # Remove look component from up
-            up_i = up_i - look * float(np.dot(up_i, look))
-            un = float(np.linalg.norm(up_i))
-            if un < 1e-9:
-                up_i = st["end_up"]
-            else:
-                up_i = up_i / un
-            self._apply_camera_pose(pos_i, foc, up_i, render=True)
+            pos_i, foc_i, up_i = self.interpolate_camera_pose(
+                st["start_pos"],
+                st["start_foc"],
+                st["start_up"],
+                st["end_pos"],
+                st["end_foc"],
+                st["end_up"],
+                t,
+            )
+            self._apply_camera_pose(pos_i, foc_i, up_i, render=True)
             if st["i"] >= st["steps"]:
                 timer.stop()
                 self._cam_anim_timer = None
