@@ -118,6 +118,7 @@ def serialize_feature(f: Feature) -> dict:
         "plane_id": int(f.plane_id),
         "profile_entity_id": int(f.profile_entity_id),
         "reversed": bool(f.reversed),
+        "through_all": bool(getattr(f, "through_all", False)),
         "revolve_angle": float(f.revolve_angle),
         "axis_origin": _vec2(f.axis_origin),
         "axis_direction": _vec2(f.axis_direction),
@@ -160,6 +161,7 @@ def deserialize_feature(data: dict) -> Feature:
         sketch=sketch,
         profile_entity_id=int(data.get("profile_entity_id", -1)),
         reversed=bool(data.get("reversed", False)),
+        through_all=bool(data.get("through_all", False)),
         revolve_angle=float(data.get("revolve_angle", 360.0)),
         axis_origin=(float(ao[0]), float(ao[1])),
         axis_direction=(float(ad[0]), float(ad[1])),
@@ -187,6 +189,7 @@ def document_to_dict(doc: Document) -> dict:
         "revolve_count": int(doc._revolve_count),
         "fillet_count": int(doc._fillet_count),
         "pocket_count": int(doc._pocket_count),
+        "cut_count": int(getattr(doc, "_cut_count", 0)),
         "features": [serialize_feature(f) for f in doc.features],
     }
 
@@ -217,6 +220,7 @@ def document_from_dict(data: dict) -> Document:
     doc._revolve_count = int(data.get("revolve_count", 0))
     doc._fillet_count = int(data.get("fillet_count", 0))
     doc._pocket_count = int(data.get("pocket_count", 0))
+    doc._cut_count = int(data.get("cut_count", 0))
     doc.features = []
     for fd in data.get("features") or []:
         doc.features.append(deserialize_feature(fd))
@@ -275,6 +279,7 @@ def replace_document_contents(target: Document, source: Document) -> None:
     target._revolve_count = source._revolve_count
     target._fillet_count = source._fillet_count
     target._pocket_count = source._pocket_count
+    target._cut_count = getattr(source, "_cut_count", 0)
     target._undo_stack.clear()
     target._redo_stack.clear()
     target._clipboard = None

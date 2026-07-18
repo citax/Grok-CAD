@@ -69,8 +69,8 @@ def test_type_switching_no_crash():
     order = [extrude, fillet, extrude, revolve, pocket, fillet, extrude]
     for feat in order:
         p.show_feature(feat)
-    # Final form is Extrude
-    assert abs(float(p._editors["depth"].value()) - 1.0) < 1e-9
+    # Final form is Extrude — typed QLineEdit, not spinbox
+    assert abs(float(p._editors["depth"].text()) - 1.0) < 1e-9
 
 
 def test_apply_button_changes_extrude_depth_and_volume():
@@ -88,7 +88,7 @@ def test_apply_button_changes_extrude_depth_and_volume():
     p = PropertyPanel()
     p.set_document(doc)
     p.show_feature(ex)
-    p._editors["depth"].setValue(3.5)
+    p._editors["depth"].setText("3.5")
     p.btn_apply.click()  # real button signal, not _on_apply()
     assert abs(ex.depth - 3.5) < 1e-12
     mesh1 = doc.evaluate_feature(ex.id)
@@ -135,7 +135,7 @@ def test_apply_fillet_radius_via_button():
     p = PropertyPanel()
     p.set_document(doc)
     p.show_feature(fil)
-    p._editors["radius"].setValue(0.6)
+    p._editors["radius"].setText("0.6")
     p.btn_apply.click()
     assert abs(fil.radius - 0.6) < 1e-12
 
@@ -146,13 +146,13 @@ def test_apply_revolve_and_pocket_via_button():
     p = PropertyPanel()
     p.set_document(doc)
     p.show_feature(revolve)
-    p._editors["angle"].setValue(90.0)
+    p._editors["angle"].setText("90")
     p.btn_apply.click()
     assert abs(revolve.revolve_angle - 90.0) < 1e-12
 
     p.show_feature(pocket)
-    p._editors["radius"].setValue(0.55)
-    p._editors["depth"].setValue(2.0)
+    p._editors["radius"].setText("0.55")
+    p._editors["depth"].setText("2")
     p.btn_apply.click()
     assert abs(pocket.radius - 0.55) < 1e-12
     assert abs(pocket.depth - 2.0) < 1e-12
@@ -169,7 +169,7 @@ def test_show_sketch_line_twice_and_apply():
     p.set_document(doc)
     p.show_sketch_line(skf.id, line)
     p.show_sketch_line(skf.id, line)
-    p._editors["line_len"].setValue(5.0)
+    p._editors["line_len"].setText("5")
     p.btn_apply.click()
     ent = skf.sketch.find_entity(line.id)
     assert isinstance(ent, LineEntity)

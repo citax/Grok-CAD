@@ -50,6 +50,7 @@ class FeatureType(Enum):
     REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
     FILLET = auto()  # fillet closed profile corners, then extrude
     POCKET = auto()  # circular through-hole pocket then extrude
+    CUT_EXTRUDE = auto()  # SolidWorks Extruded Cut: remove material from a solid
     # Kernel primitives (not primary UI path)
     BOX = auto()
     SPHERE = auto()
@@ -69,6 +70,7 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.REVOLVE: "Revolve",
         FeatureType.FILLET: "Fillet",
         FeatureType.POCKET: "Pocket",
+        FeatureType.CUT_EXTRUDE: "Cut-Extrude",
         FeatureType.BOX: "Box",
         FeatureType.SPHERE: "Sphere",
         FeatureType.CYLINDER: "Cylinder",
@@ -94,6 +96,17 @@ def is_boolean(t: FeatureType) -> bool:
     )
 
 
+def is_sketch_consuming_feature(t: FeatureType) -> bool:
+    """Features that absorb their source sketch (SolidWorks absorbed sketch)."""
+    return t in (
+        FeatureType.EXTRUDE,
+        FeatureType.REVOLVE,
+        FeatureType.FILLET,
+        FeatureType.POCKET,
+        FeatureType.CUT_EXTRUDE,
+    )
+
+
 def is_solid_feature(t: FeatureType) -> bool:
     """True if the feature can produce a triangle mesh with faces to sketch on."""
     return t in (
@@ -101,6 +114,7 @@ def is_solid_feature(t: FeatureType) -> bool:
         FeatureType.REVOLVE,
         FeatureType.FILLET,
         FeatureType.POCKET,
+        FeatureType.CUT_EXTRUDE,
         FeatureType.BOX,
         FeatureType.SPHERE,
         FeatureType.CYLINDER,
@@ -348,6 +362,9 @@ class Feature:
     # Pocket: radius = hole radius; hole_center_u/v = hole center in sketch UV
     hole_center_u: float = 0.0
     hole_center_v: float = 0.0
+    # Cut-Extrude: operand_a = sketch, operand_b = solid being cut;
+    # through_all = extend tool through the whole solid (ignores depth for tool size)
+    through_all: bool = False
     # Fillet: sharp source polygon in sketch UV (parametric radius edits)
     # List of (u, v); not closed (first != last). Empty = resolve from sketch.
     source_profile_uv: List[Tuple[float, float]] = field(default_factory=list)
@@ -786,6 +803,7 @@ class Document:
     _revolve_count: int = 0
     _fillet_count: int = 0
     _pocket_count: int = 0
+    _cut_count: int = 0
     # History / clipboard
     _undo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
     _redo_stack: List[HistoryCommand] = field(default_factory=list, repr=False)
@@ -829,6 +847,7 @@ class Document:
         self._revolve_count = 0
         self._fillet_count = 0
         self._pocket_count = 0
+        self._cut_count = 0
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._clipboard = None
@@ -1361,6 +1380,7 @@ class Document:
             "hole_center_u",
             "hole_center_v",
             "reversed",
+            "through_all",
             "name",
         )
         before = {k: getattr(f, k) for k in keys if hasattr(f, k)}
@@ -1450,6 +1470,123 @@ class Document:
             profile_entity_id=int(profile_entity_id),
             hole_center_u=hc[0],
             hole_center_v=hc[1],
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def absorbed_sketch_map(self) -> Dict[int, int]:
+        """Map sketch_feature_id → consuming solid feature id (SolidWorks absorbed)."""
+        out: Dict[int, int] = {}
+        for f in self.features:
+            if is_sketch_consuming_feature(f.type) and int(f.operand_a) >= 0:
+                # First consumer wins (a sketch used by one feature in our model)
+                if int(f.operand_a) not in out:
+                    out[int(f.operand_a)] = int(f.id)
+        return out
+
+    def create_cut_extrude(
+        self,
+        sketch_id: int,
+        target_solid_id: int,
+        distance: float,
+        *,
+        profile_entity_id: int = -1,
+        segments: int = 64,
+        reversed: bool = False,
+        through_all: bool = False,
+    ) -> Feature:
+        """SolidWorks Extruded Cut: subtract a sketched profile from a solid.
+
+        ``operand_a`` = sketch, ``operand_b`` = solid being cut.
+        ``through_all`` extends the tool through the target's bounding box.
+        """
+        skf = self.find(sketch_id)
+        if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
+            raise ValueError("cut requires a valid sketch feature")
+        target = self.find(target_solid_id)
+        if target is None or not is_solid_feature(target.type):
+            raise ValueError("cut requires a valid solid feature to cut into")
+        if target.type is FeatureType.CUT_EXTRUDE and target.id == target_solid_id:
+            pass  # can cut a previous cut result
+        sketch = skf.sketch
+        resolved = resolve_profiles(sketch, preferred_outer_id=profile_entity_id)
+        ent = resolved.outer
+        profile_entity_id = _profile_id(ent)
+        if not is_closed_profile(ent):
+            raise ValueError("cut profile is not a closed region")
+        dist = float(distance)
+        if not through_all and (not np.isfinite(dist) or dist <= 1e-12):
+            raise ValueError("cut depth must be a positive finite number")
+        # Validate by evaluating once
+        body = self.evaluate_feature(target_solid_id)
+        if body is None or body.empty:
+            raise ValueError("target solid has no geometry to cut")
+        tool_dist = dist
+        if through_all:
+            # Tool length: solid diagonal so it fully pierces from the sketch plane
+            lo = body.vertices.min(axis=0)
+            hi = body.vertices.max(axis=0)
+            tool_dist = float(np.linalg.norm(hi - lo)) * 2.0 + 1.0
+            tool_dist = max(tool_dist, 1.0)
+        rev = bool(reversed)
+        tool = extrude_profile(
+            ent,
+            tool_dist,
+            sketch.frame,
+            segments=int(segments),
+            holes=resolved.holes,
+            reversed=rev,
+        )
+        if through_all:
+            tool_rev = extrude_profile(
+                ent,
+                tool_dist,
+                sketch.frame,
+                segments=int(segments),
+                holes=resolved.holes,
+                reversed=not rev,
+            )
+            tool = boolean_op(tool, tool_rev, BooleanOp.UNION)
+        result = boolean_op(body, tool, BooleanOp.DIFFERENCE)
+        # Face sketches use outward normals — first try often misses the solid.
+        # Auto-flip the tool into the body when the cut removes no material.
+        if (
+            not through_all
+            and result is not None
+            and not result.empty
+            and abs(result.volume() - body.volume()) < 1e-6 * max(abs(body.volume()), 1.0)
+        ):
+            rev = not rev
+            tool = extrude_profile(
+                ent,
+                tool_dist,
+                sketch.frame,
+                segments=int(segments),
+                holes=resolved.holes,
+                reversed=rev,
+            )
+            result = boolean_op(body, tool, BooleanOp.DIFFERENCE)
+        if result is None or result.empty:
+            raise ValueError("cut removed the entire solid (empty result)")
+        if abs(result.volume() - body.volume()) < 1e-6 * max(abs(body.volume()), 1.0):
+            raise ValueError(
+                "cut did not remove any material (check profile is on the solid "
+                "and direction points into it)"
+            )
+        if not result.is_watertight():
+            raise ValueError("cut result is not watertight")
+        self._cut_count += 1
+        f = Feature(
+            type=FeatureType.CUT_EXTRUDE,
+            name=f"Cut-Extrude{self._cut_count}",
+            depth=float(dist) if not through_all else float(tool_dist),
+            segments=int(segments),
+            operand_a=sketch_id,
+            operand_b=target_solid_id,
+            profile_entity_id=int(profile_entity_id),
+            reversed=rev,
+            through_all=bool(through_all),
         )
         self.add_feature(f)
         self.record_feature_add(f)
@@ -1546,6 +1683,44 @@ class Document:
                 angle_degrees=f.revolve_angle,
                 segments=max(3, int(f.segments)),
             )
+        elif f.type is FeatureType.CUT_EXTRUDE:
+            skf = self.find(f.operand_a)
+            body = self.evaluate_feature(f.operand_b)
+            if skf is None or skf.sketch is None or body is None or body.empty:
+                return None
+            sketch = skf.sketch
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
+                return None
+            tool_dist = float(f.depth)
+            if bool(getattr(f, "through_all", False)):
+                lo = body.vertices.min(axis=0)
+                hi = body.vertices.max(axis=0)
+                tool_dist = float(np.linalg.norm(hi - lo)) * 2.0 + 1.0
+                tool_dist = max(tool_dist, 1.0)
+            rev = bool(getattr(f, "reversed", False))
+            tool = extrude_profile(
+                resolved.outer,
+                tool_dist,
+                sketch.frame,
+                segments=max(3, int(f.segments)),
+                holes=resolved.holes,
+                reversed=rev,
+            )
+            if bool(getattr(f, "through_all", False)):
+                tool_rev = extrude_profile(
+                    resolved.outer,
+                    tool_dist,
+                    sketch.frame,
+                    segments=max(3, int(f.segments)),
+                    holes=resolved.holes,
+                    reversed=not rev,
+                )
+                tool = boolean_op(tool, tool_rev, BooleanOp.UNION)
+            mesh = boolean_op(body, tool, BooleanOp.DIFFERENCE)
         elif f.type is FeatureType.BOX:
             mesh = make_box(f.width, f.height, f.depth)
         elif f.type is FeatureType.SPHERE:
@@ -1577,6 +1752,9 @@ class Document:
                     used.add(f.operand_a)
                 if f.operand_b >= 0:
                     used.add(f.operand_b)
+            # Cut consumes its target solid (like boolean difference operand)
+            if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
+                used.add(f.operand_b)
         out: Dict[int, Mesh] = {}
         for f in self.features:
             if not f.visible or f.suppressed or is_reference_plane(f.type):

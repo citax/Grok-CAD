@@ -43,6 +43,7 @@ def feature_fingerprint(f: Feature) -> str:
         f"{f.hole_center_u:.6g},{f.hole_center_v:.6g}",
         f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
         str(int(bool(f.reversed))),
+        str(int(bool(getattr(f, "through_all", False)))),
         str(int(f.visible)),
         str(int(f.suppressed)),
     ]
@@ -56,6 +57,7 @@ def feature_fingerprint(f: Feature) -> str:
         FeatureType.REVOLVE,
         FeatureType.FILLET,
         FeatureType.POCKET,
+        FeatureType.CUT_EXTRUDE,
         FeatureType.SKETCH,
     ):
         parts.append(sketch_fingerprint(f.sketch))
@@ -220,6 +222,46 @@ def evaluate_solids_snapshot(
                 angle_degrees=f.revolve_angle,
                 segments=max(3, int(f.segments)),
             )
+        elif f.type is FeatureType.CUT_EXTRUDE:
+            skf = by_id.get(f.operand_a)
+            body = eval_one(f.operand_b)
+            if skf is None or skf.sketch is None or body is None or body.empty:
+                cache[fid] = None
+                return None
+            sketch = skf.sketch
+            try:
+                resolved = resolve_profiles(
+                    sketch, preferred_outer_id=f.profile_entity_id
+                )
+            except ValueError:
+                cache[fid] = None
+                return None
+            tool_dist = float(f.depth)
+            if bool(getattr(f, "through_all", False)):
+                lo = body.vertices.min(axis=0)
+                hi = body.vertices.max(axis=0)
+                tool_dist = float(np.linalg.norm(hi - lo)) * 2.0 + 1.0
+                tool_dist = max(tool_dist, 1.0)
+            rev = bool(getattr(f, "reversed", False))
+            tool = extrude_profile(
+                resolved.outer,
+                tool_dist,
+                sketch.frame,
+                segments=max(3, int(f.segments)),
+                holes=resolved.holes,
+                reversed=rev,
+            )
+            if bool(getattr(f, "through_all", False)):
+                tool_rev = extrude_profile(
+                    resolved.outer,
+                    tool_dist,
+                    sketch.frame,
+                    segments=max(3, int(f.segments)),
+                    holes=resolved.holes,
+                    reversed=not rev,
+                )
+                tool = boolean_op(tool, tool_rev, BooleanOp.UNION)
+            mesh = boolean_op(body, tool, BooleanOp.DIFFERENCE)
         elif f.type is FeatureType.BOX:
             mesh = make_box(f.width, f.height, f.depth)
         elif f.type is FeatureType.SPHERE:
@@ -250,6 +292,8 @@ def evaluate_solids_snapshot(
                 used.add(f.operand_a)
             if f.operand_b >= 0:
                 used.add(f.operand_b)
+        if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
+            used.add(f.operand_b)
 
     results: Dict[int, Tuple[np.ndarray, np.ndarray, str]] = {}
     for f in features:
@@ -267,6 +311,7 @@ def evaluate_solids_snapshot(
             FeatureType.REVOLVE,
             FeatureType.FILLET,
             FeatureType.POCKET,
+            FeatureType.CUT_EXTRUDE,
         ):
             skf = by_id.get(f.operand_a)
             if skf is not None and skf.sketch is not None and f.sketch is None:

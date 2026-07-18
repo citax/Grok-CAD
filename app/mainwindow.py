@@ -47,6 +47,7 @@ from cadcore.document import (
     first_closed_profile,
     is_closed_profile,
     is_reference_plane,
+    is_sketch_consuming_feature,
     is_solid_feature,
     resolve_profiles,
 )
@@ -357,6 +358,10 @@ class MainWindow(QMainWindow):
         act_pok.setShortcut(QKeySequence("P"))
         act_pok.triggered.connect(self._pocket)
         insert_m.addAction(act_pok)
+        act_cut = QAction(fa_icon("fa5s.cut", color=ACCENT), "Cut-Extrude…", self)
+        act_cut.setShortcut(QKeySequence("C"))
+        act_cut.triggered.connect(self._cut_extrude)
+        insert_m.addAction(act_cut)
 
     def _ribbon_button(self, act: QAction) -> QToolButton:
         """Compact command icon with label under — section strip style."""
@@ -457,6 +462,15 @@ class MainWindow(QMainWindow):
         self.act_pocket.setShortcut(QKeySequence("P"))
         self.act_pocket.triggered.connect(self._pocket)
 
+        self.act_cut_extrude = QAction(
+            fa_icon("fa5s.cut", color=ACCENT), "Cut", self
+        )
+        self.act_cut_extrude.setToolTip(
+            "Extruded Cut — remove material under a sketch on a solid (C)"
+        )
+        self.act_cut_extrude.setShortcut(QKeySequence("C"))
+        self.act_cut_extrude.triggered.connect(self._cut_extrude)
+
         group = QActionGroup(self)
         group.setExclusive(True)
         tool_defs = (
@@ -516,6 +530,7 @@ class MainWindow(QMainWindow):
                 [
                     self.act_sketch,
                     self.act_extrude,
+                    self.act_cut_extrude,
                     self.act_revolve,
                     self.act_fillet,
                     self.act_pocket,
@@ -649,9 +664,12 @@ class MainWindow(QMainWindow):
             return fa_icon("fa5s.circle-notch", color=ACCENT)
         if ftype is FeatureType.POCKET:
             return fa_icon("fa5s.dot-circle", color=ACCENT)
+        if ftype is FeatureType.CUT_EXTRUDE:
+            return fa_icon("fa5s.cut", color=ACCENT)
         return fa_icon("fa5s.cube", color=TEXT_SECONDARY)
 
     def _refresh_tree(self) -> None:
+        """SolidWorks-style tree: sketches absorbed under the feature that uses them."""
         self.tree.blockSignals(True)
         self.tree.clear()
 
@@ -668,18 +686,45 @@ class MainWindow(QMainWindow):
         features_root.setForeground(0, section_fg)
         self.tree.addTopLevelItem(features_root)
 
-        for f in self.doc.features:
+        absorbed = self.doc.absorbed_sketch_map()  # sketch_id -> consumer_id
+        # Reverse: consumer -> list of absorbed sketches (preserve feature order)
+        children: Dict[int, list] = {}
+        for sk_id, cons_id in absorbed.items():
+            children.setdefault(cons_id, []).append(sk_id)
+
+        def _make_item(f) -> QTreeWidgetItem:
             item = QTreeWidgetItem([f.name])
             item.setData(0, Qt.ItemDataRole.UserRole, f.id)
             item.setIcon(0, self._icon_for_feature(f.type))
             item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             )
+            return item
+
+        for f in self.doc.features:
             if is_reference_plane(f.type):
+                item = _make_item(f)
                 planes_root.addChild(item)
-            else:
-                features_root.addChild(item)
+                if f.id == self.doc.selected_id:
+                    item.setSelected(True)
+                    self.tree.setCurrentItem(item)
+                continue
+            # Absorbed sketches are not top-level — nested under their feature
+            if f.type is FeatureType.SKETCH and f.id in absorbed:
+                continue
+            item = _make_item(f)
+            features_root.addChild(item)
+            # Nest absorbed sketch(es) under consuming feature
+            for sk_id in children.get(f.id, ()):
+                skf = self.doc.find(sk_id)
+                if skf is None:
+                    continue
+                child = _make_item(skf)
+                item.addChild(child)
+                if sk_id == self.doc.selected_id:
+                    child.setSelected(True)
+                    self.tree.setCurrentItem(child)
+                    item.setExpanded(True)
             if f.id == self.doc.selected_id:
                 item.setSelected(True)
                 self.tree.setCurrentItem(item)
@@ -834,10 +879,6 @@ class MainWindow(QMainWindow):
                 if first_closed_profile(f.sketch) is not None:
                     return f.id
         return -1
-
-    def _resolve_extrude_sketch_id(self) -> int:
-        """Back-compat alias."""
-        return self._resolve_closed_sketch_id()
 
     def _get_length_mm(
         self,
@@ -1310,6 +1351,122 @@ class MainWindow(QMainWindow):
             3000,
         )
 
+    def _cut_extrude(self) -> None:
+        """SolidWorks Extruded Cut: remove material under a sketch on a solid."""
+        sid = self._resolve_closed_sketch_id()
+        skf = self.doc.find(sid) if sid >= 0 else None
+        if skf is None or skf.sketch is None:
+            QMessageBox.information(
+                self,
+                "Cut-Extrude",
+                "Sketch a closed profile on a solid face (or plane near a solid),\n"
+                "then Cut. The cut removes material from the target solid.",
+            )
+            return
+        if first_closed_profile(skf.sketch) is None:
+            QMessageBox.information(
+                self,
+                "Cut-Extrude",
+                "The sketch has no closed profile to cut with.",
+            )
+            return
+
+        # Target solid: sketch-on-face parent, else selected solid, else last solid
+        target_id = -1
+        if skf.plane_id >= 0:
+            parent = self.doc.find(skf.plane_id)
+            if parent is not None and is_solid_feature(parent.type):
+                target_id = parent.id
+        if target_id < 0:
+            sel = self.doc.find(self.doc.selected_id)
+            if sel is not None and is_solid_feature(sel.type):
+                target_id = sel.id
+        if target_id < 0:
+            for f in reversed(self.doc.features):
+                if is_solid_feature(f.type) and f.type is not FeatureType.SKETCH:
+                    target_id = f.id
+                    break
+        if target_id < 0:
+            QMessageBox.information(
+                self,
+                "Cut-Extrude",
+                "No solid to cut. Extrude a boss first, then sketch on its face and Cut.",
+            )
+            return
+
+        # Through-all vs blind depth
+        through, ok = QInputDialog.getItem(
+            self,
+            "Cut-Extrude",
+            "End condition:",
+            ["Blind (set depth)", "Through all"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        through_all = through.startswith("Through")
+        dist = 5.0
+        if not through_all:
+            d = self._get_length_mm("Cut-Extrude", "Depth", 5.0)
+            if d is None:
+                return
+            dist = float(d)
+
+        try:
+            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cut-Extrude", str(exc))
+            return
+        if profile_ids is None:
+            QMessageBox.information(
+                self,
+                "Cut-Extrude",
+                "Multiple closed regions — select one in the sketch, then Cut again.",
+            )
+            if not self.viewport.in_sketch_mode:
+                self.viewport.enter_sketch(sid)
+                self._set_sketch_ribbon_enabled(True)
+            return
+        if len(profile_ids) > 1:
+            QMessageBox.information(
+                self,
+                "Cut-Extrude",
+                "Cut uses one region at a time. Select a single region, then Cut.",
+            )
+            return
+
+        if self.viewport.in_sketch_mode:
+            self.viewport.exit_sketch()
+            self._set_sketch_ribbon_enabled(False)
+
+        try:
+            feat = self.doc.create_cut_extrude(
+                sid,
+                target_id,
+                float(dist),
+                profile_entity_id=int(profile_ids[0]),
+                through_all=through_all,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cut-Extrude", str(exc))
+            self.statusBar().showMessage(f"Cut failed: {exc}", 4000)
+            return
+
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(feat.id)
+        self._update_window_title()
+        tgt = self.doc.find(target_id)
+        tname = tgt.name if tgt else str(target_id)
+        msg = (
+            f"Created {feat.name} through {tname}"
+            if through_all
+            else f"Created {feat.name} depth={format_length(dist, self.doc.display_unit)} in {tname}"
+        )
+        self.statusBar().showMessage(msg, 4000)
+
     # ----- project file (Save / Open / New) -----
     def _update_window_title(self) -> None:
         if self._project_path is not None:
@@ -1320,10 +1477,6 @@ class MainWindow(QMainWindow):
                 name = "Untitled.gcad"
         dirty = " *" if self.doc.dirty else ""
         self.setWindowTitle(f"Grok CAD — {name}{dirty}")
-
-    def _mark_dirty_and_title(self) -> None:
-        self.doc.mark_dirty()
-        self._update_window_title()
 
     def _confirm_discard_if_dirty(self) -> bool:
         """Return True if it is safe to discard the current document."""

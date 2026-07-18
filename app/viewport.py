@@ -42,7 +42,12 @@ from app.theme import (
     VP_BG_TOP,
 )
 from app.workers import GeometryRebuildJob, snapshot_features
-from cadcore.document import Document, FeatureType, is_reference_plane, is_solid_feature
+from cadcore.document import (
+    Document,
+    FeatureType,
+    is_reference_plane,
+    is_solid_feature,
+)
 from cadcore.faces import plane_frame_from_face
 from cadcore.scale import (
     EMPTY_PLANE_HALF_MM,
@@ -1903,11 +1908,16 @@ class Viewport(QWidget):
             pass
 
     def refresh_sketches(self) -> None:
-        """Incremental redraw of closed sketches in 3D (when not editing)."""
+        """Incremental redraw of closed sketches in 3D (when not editing).
+
+        SolidWorks: once a sketch is absorbed by a feature it is not drawn in
+        the 3D view (only while editing that sketch).
+        """
         if not self.plotter or self._doc is None:
             return
         if self.in_sketch_mode:
             return
+        absorbed = self._doc.absorbed_sketch_map()
         # (c) batch all closed sketch geometry into one actor per sketch feature
         if _perf_enabled("c"):
             self._refresh_sketches_batched()
@@ -1916,6 +1926,8 @@ class Viewport(QWidget):
         for f in self._doc.features:
             if f.type is not FeatureType.SKETCH or f.sketch is None or not f.visible:
                 continue
+            if f.id in absorbed:
+                continue  # absorbed under Extrude/Cut/… — not drawn in 3D
             for ent in f.sketch.entities:
                 name = f"sk_closed_{f.id}_{ent.id}"
                 fp = _entity_fingerprint(ent, selected=False)
@@ -1962,8 +1974,16 @@ class Viewport(QWidget):
             if name.startswith("sk_closed_") and "_batch_" not in name:
                 self._remove_actor(name)
                 self._closed_sketch_fps.pop(name, None)
+        absorbed = self._doc.absorbed_sketch_map()
         for f in self._doc.features:
             if f.type is not FeatureType.SKETCH or f.sketch is None or not f.visible:
+                continue
+            if f.id in absorbed:
+                # Remove any leftover actors for absorbed sketches
+                name = f"sk_closed_batch_{f.id}"
+                if name in self._closed_sketch_fps:
+                    self._remove_actor(name)
+                    self._closed_sketch_fps.pop(name, None)
                 continue
             if not f.sketch.entities:
                 name = f"sk_closed_batch_{f.id}"
