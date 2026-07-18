@@ -22,11 +22,10 @@ if TYPE_CHECKING:
 
 
 class ViewCubeController(QObject):
-    # Top-right inset (normalized VTK viewport). Larger than the old ~19.5%
-    # (0.80…0.995) so the orientation cube is easy to read and click.
-    VIEWPORT = (0.74, 0.74, 0.995, 0.995)
-    # Orthographic half-height in cube units (cube half≈1): smaller → fills inset more
-    PARALLEL_SCALE = 1.62
+    # Top-right inset (normalized VTK viewport) — ~20% of the window.
+    VIEWPORT = (0.795, 0.795, 0.995, 0.995)
+    # Orthographic half-height in cube units (cube half≈1)
+    PARALLEL_SCALE = 1.70
     # Degrees per display pixel — low enough for fine control, high enough to feel direct
     ORBIT_DEG_PER_PX = 0.42
     # Click vs drag: once exceeded, every subsequent pixel moves the view
