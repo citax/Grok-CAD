@@ -50,10 +50,24 @@ def build_chamfered_cube(
     labels: List[str] = []
 
     def add_poly(pts: List[Tuple[float, float, float]], label: str) -> None:
+        """Add a polygon, flipping winding so the normal faces outward (from origin)."""
+        ring = [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
+        if len(ring) >= 3:
+            # Newell's method for a robust polygon normal
+            nrm = np.zeros(3, dtype=np.float64)
+            for i in range(len(ring)):
+                x0, y0, z0 = ring[i]
+                x1, y1, z1 = ring[(i + 1) % len(ring)]
+                nrm[0] += (y0 - y1) * (z0 + z1)
+                nrm[1] += (z0 - z1) * (x0 + x1)
+                nrm[2] += (x0 - x1) * (y0 + y1)
+            center = np.mean(np.asarray(ring, dtype=np.float64), axis=0)
+            if float(np.dot(nrm, center)) < 0.0:
+                ring = list(reversed(ring))
         base = len(points)
-        for p in pts:
-            points.append([float(p[0]), float(p[1]), float(p[2])])
-        n = len(pts)
+        for p in ring:
+            points.append([p[0], p[1], p[2]])
+        n = len(ring)
         faces.append([n] + [base + i for i in range(n)])
         labels.append(label)
 
@@ -68,31 +82,43 @@ def build_chamfered_cube(
     add_poly([(h, f, f), (h, -f, f), (h, -f, -f), (h, f, -f)], "face:+x")
     add_poly([(-h, f, f), (-h, f, -f), (-h, -f, -f), (-h, -f, f)], "face:-x")
 
-    # --- 12 edge bevels (rectangles linking adjacent face edges) ---
-    # Edge along Z at +X+Y
+    # --- 12 edge bevels: each links the shared edges of two face squares ---
+    # Face squares live on |axis|=h with half-extent f on the other axes.
+    # An edge between e.g. +X and +Y is the rectangle joining
+    # (h, ±f, …) on the X-face to (±f, h, …) on the Y-face — NOT a diagonal
+    # out to the cube corner (h,h,…), which left open gaps / protruding pieces.
     def edge_rect(axis: str, s1: int, s2: int) -> None:
-        """Edge between two axes (s1,s2 = ±1), extruded along the free axis."""
-        # free axis is the one not in {axis pair}
+        """Edge bevel: free axis is ``axis``; s1/s2 are signs of the two faces."""
         if axis == "z":
-            # edge parallel to Z between +X+Y etc.
-            x, y = s1 * h, s2 * h
-            xi, yi = s1 * f, s2 * f
+            # Between ±X (s1) and ±Y (s2); free along Z in [-f, f]
             add_poly(
-                [(xi, yi, f), (x, y, f), (x, y, -f), (xi, yi, -f)],
+                [
+                    (s1 * h, s2 * f, f),
+                    (s1 * f, s2 * h, f),
+                    (s1 * f, s2 * h, -f),
+                    (s1 * h, s2 * f, -f),
+                ],
                 f"edge:{_sign_tuple(s1, s2, 0)}",
             )
         elif axis == "y":
-            x, z = s1 * h, s2 * h
-            xi, zi = s1 * f, s2 * f
+            # Between ±X (s1) and ±Z (s2); free along Y in [-f, f]
             add_poly(
-                [(xi, f, zi), (xi, -f, zi), (x, -f, z), (x, f, z)],
+                [
+                    (s1 * h, f, s2 * f),
+                    (s1 * f, f, s2 * h),
+                    (s1 * f, -f, s2 * h),
+                    (s1 * h, -f, s2 * f),
+                ],
                 f"edge:{_sign_tuple(s1, 0, s2)}",
             )
-        else:  # axis == "x" free along X
-            y, z = s1 * h, s2 * h
-            yi, zi = s1 * f, s2 * f
+        else:  # free along X — between ±Y (s1) and ±Z (s2)
             add_poly(
-                [(f, yi, zi), (-f, yi, zi), (-f, y, z), (f, y, z)],
+                [
+                    (f, s1 * h, s2 * f),
+                    (f, s1 * f, s2 * h),
+                    (-f, s1 * f, s2 * h),
+                    (-f, s1 * h, s2 * f),
+                ],
                 f"edge:{_sign_tuple(0, s1, s2)}",
             )
 
@@ -106,33 +132,31 @@ def build_chamfered_cube(
         for sz in (-1, 1):
             edge_rect("x", sy, sz)
 
-    # --- 8 corner triangles ---
+    # --- 8 corner triangles: meet the three adjacent face-corner vertices ---
     for sx in (-1, 1):
         for sy in (-1, 1):
             for sz in (-1, 1):
-                # three points on the three adjacent face-edge intersections
-                p_xy = (sx * f, sy * f, sz * h)
-                p_xz = (sx * f, sy * h, sz * f)
-                p_yz = (sx * h, sy * f, sz * f)
-                # Winding so outward normal points away from origin
-                pts = [p_yz, p_xz, p_xy]
-                # Ensure outward
-                n = np.cross(
-                    np.subtract(pts[1], pts[0]),
-                    np.subtract(pts[2], pts[0]),
-                )
-                center = np.mean(pts, axis=0)
-                if np.dot(n, center) < 0:
-                    pts = [pts[0], pts[2], pts[1]]
-                add_poly(pts, f"corner:{_sign_tuple(sx, sy, sz)}")
+                # Vertices already present on the three face squares
+                p_xy = (sx * f, sy * f, sz * h)  # on ±Z face
+                p_xz = (sx * f, sy * h, sz * f)  # on ±Y face
+                p_yz = (sx * h, sy * f, sz * f)  # on ±X face
+                # add_poly flips winding if needed so normal is outward
+                add_poly([p_yz, p_xz, p_xy], f"corner:{_sign_tuple(sx, sy, sz)}")
 
-    # Build PolyData
+    # Weld coincident vertices so face/edge/corner patches share topology —
+    # separate duplicate verts made soft-GL draw open seams and "torn" corners.
     pts_arr = np.asarray(points, dtype=np.float64)
-    # flatten faces connectivity
+    if len(pts_arr) == 0:
+        return pv.PolyData(), labels
+    keys = np.round(pts_arr, decimals=9)
+    unique, inv = np.unique(keys, axis=0, return_inverse=True)
     conn: List[int] = []
     for fr in faces:
-        conn.extend(fr)
-    poly = pv.PolyData(pts_arr, faces=np.asarray(conn, dtype=np.int64))
+        n = fr[0]
+        conn.append(n)
+        for i in range(1, n + 1):
+            conn.append(int(inv[fr[i]]))
+    poly = pv.PolyData(unique.astype(np.float64), faces=np.asarray(conn, dtype=np.int64))
     # cell scalars for colouring: face=0 edge=1 corner=2
     kinds = np.zeros(len(labels), dtype=np.int32)
     for i, lab in enumerate(labels):
@@ -142,6 +166,8 @@ def build_chamfered_cube(
             kinds[i] = 2
     poly.cell_data["kind"] = kinds
     poly.cell_data["region_id"] = np.arange(len(labels), dtype=np.int32)
+    # Note: per-cell RGB is applied by the widget (one actor per region).
+    # Do not store unused color arrays here — they are never consumed.
     return poly, labels
 
 

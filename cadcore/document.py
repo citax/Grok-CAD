@@ -31,8 +31,12 @@ from cadcore.sketch import (
     SketchEntity,
     apply_entity_snapshot,
     offset_entity_data,
+    restore_dimension,
     restore_entity,
+    restore_sketch_contents,
+    snapshot_dimension,
     snapshot_entity,
+    snapshot_sketch_contents,
 )
 from cadcore.units import Unit
 
@@ -391,19 +395,34 @@ class EntityAddCommand(HistoryCommand):
 
 
 class EntityDeleteCommand(HistoryCommand):
-    def __init__(self, sketch_id: int, entity_data: dict, index: int) -> None:
+    def __init__(
+        self,
+        sketch_id: int,
+        entity_data: dict,
+        index: int,
+        dimensions: Optional[List[dict]] = None,
+    ) -> None:
         self.sketch_id = int(sketch_id)
         self.entity_data = dict(entity_data)
         self.index = int(index)
+        self.dimensions = [dict(d) for d in (dimensions or [])]
 
     def redo(self, doc: "Document") -> None:
         sk = _sketch_of(doc, self.sketch_id)
-        sk.remove_entity(int(self.entity_data["id"]))
+        eid = int(self.entity_data["id"])
+        sk.remove_entity(eid)
+        sk.remove_dimensions_for_entity(eid)
 
     def undo(self, doc: "Document") -> None:
         sk = _sketch_of(doc, self.sketch_id)
         ent = restore_entity(self.entity_data)
         sk.insert_entity(ent, self.index)
+        for dd in self.dimensions:
+            dim = restore_dimension(dd)
+            # Avoid duplicate if already present
+            if sk.find_dimension(dim.id) is None:
+                sk.dimensions.append(dim)
+                sk._next_dim_id = max(sk._next_dim_id, int(dim.id) + 1)
 
     def description(self) -> str:
         return f"Delete {self.entity_data.get('kind', 'entity')}"
@@ -413,26 +432,37 @@ class EntityMultiDeleteCommand(HistoryCommand):
     """Delete several sketch entities as ONE undo step.
 
     ``items`` is a list of (entity_data, index) captured before deletion, in
-    ascending original-index order. Redo removes by id; undo re-inserts at the
-    recorded indices (lowest index first so positions stay stable).
+    ascending original-index order. ``dimensions`` are all driving dims that
+    belonged to those entities (restored on undo).
     """
 
     def __init__(
-        self, sketch_id: int, items: List[Tuple[dict, int]]
+        self,
+        sketch_id: int,
+        items: List[Tuple[dict, int]],
+        dimensions: Optional[List[dict]] = None,
     ) -> None:
         self.sketch_id = int(sketch_id)
         self.items = [(dict(d), int(idx)) for d, idx in items]
+        self.dimensions = [dict(d) for d in (dimensions or [])]
 
     def redo(self, doc: "Document") -> None:
         sk = _sketch_of(doc, self.sketch_id)
+        eids = {int(data["id"]) for data, _idx in self.items}
         for data, _idx in self.items:
             sk.remove_entity(int(data["id"]))
+        sk.dimensions = [d for d in sk.dimensions if int(d.entity_id) not in eids]
 
     def undo(self, doc: "Document") -> None:
         sk = _sketch_of(doc, self.sketch_id)
         for data, idx in sorted(self.items, key=lambda t: t[1]):
             ent = restore_entity(data)
             sk.insert_entity(ent, idx)
+        for dd in self.dimensions:
+            dim = restore_dimension(dd)
+            if sk.find_dimension(dim.id) is None:
+                sk.dimensions.append(dim)
+                sk._next_dim_id = max(sk._next_dim_id, int(dim.id) + 1)
 
     def description(self) -> str:
         return f"Delete {len(self.items)} entities"
@@ -455,6 +485,129 @@ class EntityMoveCommand(HistoryCommand):
 
     def description(self) -> str:
         return "Move entity"
+
+
+class DimensionApplyCommand(HistoryCommand):
+    """Undoable driving-dimension apply: geometry + dimension record together."""
+
+    def __init__(
+        self,
+        sketch_id: int,
+        entity_before: dict,
+        entity_after: dict,
+        dim_before: Optional[dict],
+        dim_after: dict,
+    ) -> None:
+        self.sketch_id = int(sketch_id)
+        self.entity_before = dict(entity_before)
+        self.entity_after = dict(entity_after)
+        self.dim_before = dict(dim_before) if dim_before is not None else None
+        self.dim_after = dict(dim_after)
+
+    def _set_dim(self, sk: Sketch, data: Optional[dict], *, fallback_remove_id: int) -> None:
+        role = str(self.dim_after.get("role", "length"))
+        eid = int(self.entity_after["id"])
+        # Drop any current dim for this entity/role
+        sk.dimensions = [
+            d
+            for d in sk.dimensions
+            if not (int(d.entity_id) == eid and str(d.role) == role)
+        ]
+        if data is None:
+            return
+        dim = restore_dimension(data)
+        if sk.find_dimension(dim.id) is not None:
+            # replace by id
+            sk.dimensions = [d for d in sk.dimensions if d.id != dim.id]
+        sk.dimensions.append(dim)
+        sk._next_dim_id = max(sk._next_dim_id, int(dim.id) + 1)
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        ent = _entity_of(doc, self.sketch_id, int(self.entity_after["id"]))
+        apply_entity_snapshot(ent, self.entity_after)
+        self._set_dim(sk, self.dim_after, fallback_remove_id=int(self.dim_after["id"]))
+
+    def undo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        ent = _entity_of(doc, self.sketch_id, int(self.entity_before["id"]))
+        apply_entity_snapshot(ent, self.entity_before)
+        self._set_dim(
+            sk,
+            self.dim_before,
+            fallback_remove_id=int(self.dim_after["id"]),
+        )
+
+    def description(self) -> str:
+        return "Apply dimension"
+
+
+class FilletCreateCommand(HistoryCommand):
+    """Add fillet feature and sketch mutation as one undoable step."""
+
+    def __init__(
+        self,
+        feature: "Feature",
+        sketch_id: int,
+        sketch_before: dict,
+        sketch_after: dict,
+        index: Optional[int] = None,
+    ) -> None:
+        self.feature = feature
+        self.sketch_id = int(sketch_id)
+        self.sketch_before = dict(sketch_before)
+        self.sketch_after = dict(sketch_after)
+        self.index = index
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        restore_sketch_contents(sk, self.sketch_after)
+        if doc.find(self.feature.id) is None:
+            if self.index is None or self.index < 0 or self.index > len(doc.features):
+                doc.features.append(self.feature)
+            else:
+                doc.features.insert(self.index, self.feature)
+            doc.selected_id = self.feature.id
+            doc._next_id = max(doc._next_id, self.feature.id + 1)
+
+    def undo(self, doc: "Document") -> None:
+        doc.features = [x for x in doc.features if x.id != self.feature.id]
+        if doc.selected_id == self.feature.id:
+            doc.selected_id = doc.features[0].id if doc.features else -1
+        sk = _sketch_of(doc, self.sketch_id)
+        restore_sketch_contents(sk, self.sketch_before)
+
+    def description(self) -> str:
+        return f"Add fillet {self.feature.name}"
+
+
+class FeatureMultiDeleteCommand(HistoryCommand):
+    """Delete several features (e.g. sketch + dependents) as one undo step.
+
+    ``items`` is (feature, index) in ascending original-index order.
+    """
+
+    def __init__(self, items: List[Tuple["Feature", int]]) -> None:
+        self.items = list(items)
+
+    def redo(self, doc: "Document") -> None:
+        ids = {f.id for f, _ in self.items}
+        doc.features = [x for x in doc.features if x.id not in ids]
+        if doc.selected_id in ids:
+            doc.selected_id = doc.features[0].id if doc.features else -1
+
+    def undo(self, doc: "Document") -> None:
+        for f, idx in sorted(self.items, key=lambda t: t[1]):
+            if doc.find(f.id) is not None:
+                continue
+            i = max(0, min(idx, len(doc.features)))
+            doc.features.insert(i, f)
+            doc._next_id = max(doc._next_id, f.id + 1)
+        if self.items:
+            doc.selected_id = self.items[0][0].id
+
+    def description(self) -> str:
+        return f"Delete {len(self.items)} features"
 
 
 class FeatureAddCommand(HistoryCommand):
@@ -717,15 +870,16 @@ class Document:
         self.push_command(EntityAddCommand(sketch_id, snapshot_entity(ent), idx))
 
     def delete_entity(self, sketch_id: int, eid: int) -> bool:
-        """Delete sketch entity (undoable)."""
+        """Delete sketch entity (undoable), restoring its dimensions on undo."""
         sk = _sketch_of(self, sketch_id)
         idx = next((i for i, e in enumerate(sk.entities) if e.id == eid), -1)
         if idx < 0:
             return False
         data = snapshot_entity(sk.entities[idx])
+        dims = [snapshot_dimension(d) for d in sk.dimensions_for_entity(eid)]
         sk.remove_entity(eid)
         sk.remove_dimensions_for_entity(eid)
-        self.push_command(EntityDeleteCommand(sketch_id, data, idx))
+        self.push_command(EntityDeleteCommand(sketch_id, data, idx, dims))
         return True
 
     def delete_entities(self, sketch_id: int, eids: List[int]) -> int:
@@ -742,9 +896,15 @@ class Document:
                 items.append((snapshot_entity(e), i))
         if not items:
             return 0
+        dims = [
+            snapshot_dimension(d)
+            for d in sk.dimensions
+            if int(d.entity_id) in wanted
+        ]
         for data, _idx in items:
             sk.remove_entity(int(data["id"]))
-        self.push_command(EntityMultiDeleteCommand(sketch_id, items))
+        sk.dimensions = [d for d in sk.dimensions if int(d.entity_id) not in wanted]
+        self.push_command(EntityMultiDeleteCommand(sketch_id, items, dims))
         return len(items)
 
     def record_entity_move(self, sketch_id: int, before: dict, after: dict) -> None:
@@ -758,16 +918,63 @@ class Document:
         idx = next((i for i, x in enumerate(self.features) if x.id == f.id), len(self.features) - 1)
         self.push_command(FeatureAddCommand(f, idx))
 
+    def features_depending_on(self, fid: int) -> List[Feature]:
+        """Direct dependents: solids whose operand is ``fid``, or sketches on that solid/plane."""
+        fid = int(fid)
+        out: List[Feature] = []
+        for f in self.features:
+            if f.id == fid:
+                continue
+            if int(f.operand_a) == fid or int(f.operand_b) == fid:
+                out.append(f)
+                continue
+            # Sketch-on-face / sketch-on-plane parent link
+            if f.type is FeatureType.SKETCH and int(f.plane_id) == fid:
+                out.append(f)
+        return out
+
+    def collect_delete_set(self, fid: int) -> List[Feature]:
+        """Feature plus all recursive dependents (children first for safe order)."""
+        root = self.find(fid)
+        if root is None:
+            return []
+        # BFS to gather the full subtree of dependents
+        seen: Dict[int, Feature] = {root.id: root}
+        queue = [root.id]
+        while queue:
+            cur = queue.pop(0)
+            for dep in self.features_depending_on(cur):
+                if dep.id not in seen:
+                    seen[dep.id] = dep
+                    queue.append(dep.id)
+        # Order: dependents before their parents (deepest first) for redo delete
+        # Simple approach: sort by reverse feature list position (later features first)
+        order_idx = {f.id: i for i, f in enumerate(self.features)}
+        return sorted(seen.values(), key=lambda f: -order_idx.get(f.id, 0))
+
     def delete_feature_undoable(self, fid: int) -> bool:
-        """Delete non-plane feature and push undo command."""
+        """Delete non-plane feature and cascade dependents (one undo step)."""
         f = self.find(fid)
         if f is None or is_reference_plane(f.type):
             return False
-        idx = next(i for i, x in enumerate(self.features) if x.id == fid)
-        self.features = [x for x in self.features if x.id != fid]
-        if self.selected_id == fid:
+        to_delete = self.collect_delete_set(fid)
+        if not to_delete:
+            return False
+        # Capture original indices before mutation
+        idx_map = {x.id: i for i, x in enumerate(self.features)}
+        items: List[Tuple[Feature, int]] = [
+            (feat, idx_map[feat.id]) for feat in to_delete if feat.id in idx_map
+        ]
+        # Store in ascending index order for stable multi-delete undo
+        items.sort(key=lambda t: t[1])
+        drop_ids = {feat.id for feat, _ in items}
+        self.features = [x for x in self.features if x.id not in drop_ids]
+        if self.selected_id in drop_ids:
             self.selected_id = self.features[0].id if self.features else -1
-        self.push_command(FeatureDeleteCommand(f, idx))
+        if len(items) == 1:
+            self.push_command(FeatureDeleteCommand(items[0][0], items[0][1]))
+        else:
+            self.push_command(FeatureMultiDeleteCommand(items))
         return True
 
     # ----- clipboard -----
@@ -920,6 +1127,12 @@ class Document:
         sk = _sketch_of(self, sketch_id)
         ent = _entity_of(self, sketch_id, entity_id)
         before = snapshot_entity(ent)
+        # Capture existing dimension for this (entity, role) if any
+        dim_before: Optional[dict] = None
+        for d in sk.dimensions_for_entity(entity_id):
+            if str(d.role) == str(role):
+                dim_before = snapshot_dimension(d)
+                break
         apply_dimension_value(ent, role, value_mm)
         after = snapshot_entity(ent)
         # Store dimension at applied value (geometry is source of truth after apply)
@@ -928,7 +1141,10 @@ class Document:
         except ValueError:
             measured = float(value_mm)
         dim = sk.add_or_update_dimension(entity_id, role, measured)
-        self.push_command(EntityMoveCommand(sketch_id, before, after))
+        dim_after = snapshot_dimension(dim)
+        self.push_command(
+            DimensionApplyCommand(sketch_id, before, after, dim_before, dim_after)
+        )
         return dim
 
     def create_extrude(
@@ -1084,11 +1300,14 @@ class Document:
             rad,
             segments=int(segments),
         )
+        # Snapshot sketch so undo restores sharp geometry
+        sketch_before = snapshot_sketch_contents(sketch)
         # Sketch: delete sharp corners — replace profile with filleted polyline
         filleted_uv = fillet_closed_polygon(
             sharp, rad, arc_segments=max(6, int(segments) // 4)
         )
         _replace_sketch_profile_with_polyline(sketch, ent, filleted_uv)
+        sketch_after = snapshot_sketch_contents(sketch)
         self._fillet_count += 1
         f = Feature(
             type=FeatureType.FILLET,
@@ -1101,7 +1320,13 @@ class Document:
             source_profile_uv=[(float(p[0]), float(p[1])) for p in sharp],
         )
         self.add_feature(f)
-        self.record_feature_add(f)
+        idx = next(
+            (i for i, x in enumerate(self.features) if x.id == f.id),
+            len(self.features) - 1,
+        )
+        self.push_command(
+            FilletCreateCommand(f, sketch_id, sketch_before, sketch_after, idx)
+        )
         return f
 
     def update_feature_params(self, fid: int, **params) -> bool:

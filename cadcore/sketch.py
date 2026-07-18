@@ -593,6 +593,59 @@ def snapshot_entity(ent: SketchEntity) -> dict:
     raise TypeError(f"unsupported entity type {type(ent)!r}")
 
 
+def snapshot_dimension(dim: SketchDimension) -> dict:
+    """Serializable snapshot of a driving dimension."""
+    kind = dim.kind if isinstance(dim.kind, DimKind) else DimKind.LINEAR
+    return {
+        "id": int(dim.id),
+        "kind": kind.name if isinstance(kind, DimKind) else str(kind),
+        "entity_id": int(dim.entity_id),
+        "role": str(dim.role),
+        "value_mm": float(dim.value_mm),
+    }
+
+
+def restore_dimension(data: dict) -> SketchDimension:
+    """Rebuild a SketchDimension from snapshot_dimension() output."""
+    kind_raw = data.get("kind", "LINEAR")
+    if isinstance(kind_raw, DimKind):
+        kind = kind_raw
+    else:
+        try:
+            kind = DimKind[str(kind_raw)]
+        except KeyError:
+            kind = DimKind.DIAMETER if str(data.get("role")) == "diameter" else DimKind.LINEAR
+    return SketchDimension(
+        id=int(data["id"]),
+        kind=kind,
+        entity_id=int(data["entity_id"]),
+        role=str(data.get("role", "length")),
+        value_mm=float(data.get("value_mm", 0.0)),
+    )
+
+
+def snapshot_sketch_contents(sk: Sketch) -> dict:
+    """Full entity + dimension state for undo of bulk sketch mutations (e.g. fillet)."""
+    return {
+        "entities": [snapshot_entity(e) for e in sk.entities],
+        "dimensions": [snapshot_dimension(d) for d in sk.dimensions],
+        "_next_entity_id": int(sk._next_entity_id),
+        "_next_dim_id": int(sk._next_dim_id),
+    }
+
+
+def restore_sketch_contents(sk: Sketch, data: dict) -> None:
+    """Replace sketch entities/dimensions from snapshot_sketch_contents()."""
+    sk.entities.clear()
+    sk.dimensions.clear()
+    for ed in data.get("entities") or []:
+        sk.entities.append(restore_entity(ed))
+    for dd in data.get("dimensions") or []:
+        sk.dimensions.append(restore_dimension(dd))
+    sk._next_entity_id = int(data.get("_next_entity_id", sk._next_entity_id))
+    sk._next_dim_id = int(data.get("_next_dim_id", sk._next_dim_id))
+
+
 def restore_entity(data: dict) -> SketchEntity:
     """Rebuild an entity from snapshot_entity() output."""
     kind = data["kind"]

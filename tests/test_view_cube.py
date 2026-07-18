@@ -39,6 +39,52 @@ def test_cube_has_volume_extent():
     assert b[5] - b[4] > 1.5
 
 
+def test_cube_edge_bevels_meet_face_edges():
+    """Edge patches must join face corners (f,h) not stick out to (h,h)."""
+    poly, labels = build_chamfered_cube(half=1.0, chamfer=0.28)
+    # Every edge cell's points should lie on the outer envelope |x|,|y|,|z| <= h
+    # and no vertex should be at a cube-corner (h,h,h)-style tip (old bug).
+    pts = np.asarray(poly.points)
+    assert np.all(np.abs(pts) <= 1.0 + 1e-9)
+    # No point with two full-half coords on the free axis mid (old (h,h,z) tips)
+    for p in pts:
+        n_full = sum(1 for v in p if abs(abs(v) - 1.0) < 1e-9)
+        # Corner of outer cube has 3; valid geometry uses at most 1 full-half
+        # on edge midpoints… face corners have 1 full + 2×f. Outer cube
+        # corners (3 full) must not appear.
+        assert n_full < 3, p
+    # Welded mesh: fewer unique verts than naive 6*4+12*4+8*3
+    assert poly.n_points < 80
+    assert "region_id" in poly.cell_data
+
+
+def test_cube_all_cell_normals_point_outward():
+    """Every face/edge/corner polygon normal must face away from the origin.
+
+    Required for correct lighting if the cube is ever shaded (not flat).
+    """
+    poly, labels = build_chamfered_cube(half=1.0, chamfer=0.28)
+    pts = np.asarray(poly.points, dtype=np.float64)
+    faces = np.asarray(poly.faces)
+    i = 0
+    for lab in labels:
+        n = int(faces[i])
+        i += 1
+        ids = [int(faces[i + k]) for k in range(n)]
+        i += n
+        ring = pts[ids]
+        # Newell's method
+        nrm = np.zeros(3, dtype=np.float64)
+        for k in range(len(ring)):
+            x0, y0, z0 = ring[k]
+            x1, y1, z1 = ring[(k + 1) % len(ring)]
+            nrm[0] += (y0 - y1) * (z0 + z1)
+            nrm[1] += (z0 - z1) * (x0 + x1)
+            nrm[2] += (x0 - x1) * (y0 + y1)
+        center = ring.mean(axis=0)
+        assert float(np.dot(nrm, center)) > 0.0, (lab, nrm, center)
+
+
 def test_face_colors_are_pale_not_black():
     """Faces must be light enough to read (not a black blob)."""
     from app.view_cube import color_for_region, face_label_text

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence, QShortcut
@@ -800,6 +800,36 @@ class MainWindow(QMainWindow):
         """Back-compat alias."""
         return self._resolve_closed_sketch_id()
 
+    def _get_length_mm(
+        self,
+        title: str,
+        label: str,
+        default_mm: float,
+        *,
+        minimum_mm: float = 1e-6,
+        maximum_mm: float = 1e6,
+        decimals: int = 4,
+    ) -> Optional[float]:
+        """Length dialog in the active display unit; returns internal mm or None if cancelled."""
+        unit = self.doc.display_unit
+        lo = from_mm(minimum_mm, unit)
+        hi = from_mm(maximum_mm, unit)
+        default = from_mm(default_mm, unit)
+        # Keep spin range sane for the unit
+        lo = max(lo, 1e-9)
+        val, ok = QInputDialog.getDouble(
+            self,
+            title,
+            f"{label} ({unit.label}):",
+            float(default),
+            float(lo),
+            float(hi),
+            decimals,
+        )
+        if not ok:
+            return None
+        return to_mm(float(val), unit)
+
     @staticmethod
     def _profile_label(prof: object) -> str:
         """Human-readable picker label for a closed profile (entity or line-loop)."""
@@ -917,16 +947,8 @@ class MainWindow(QMainWindow):
                 self._set_sketch_ribbon_enabled(True)
             return
 
-        dist, ok = QInputDialog.getDouble(
-            self,
-            "Extrude (Pad)",
-            "Distance:",
-            1.0,
-            1e-6,
-            1e6,
-            4,
-        )
-        if not ok:
+        dist = self._get_length_mm("Extrude (Pad)", "Distance", 1.0)
+        if dist is None:
             return
 
         # Leave sketch mode so the solid rebuild is visible
@@ -952,8 +974,9 @@ class MainWindow(QMainWindow):
         if created:
             self._sync_selection(created[-1].id)
         names = ", ".join(f.name for f in created)
+        shown = format_length(dist, self.doc.display_unit)
         self.statusBar().showMessage(
-            f"Created {names} (distance={dist:g}) — Reverse direction in PropertyManager to flip",
+            f"Created {names} (distance={shown}) — Reverse direction in PropertyManager to flip",
             4000,
         )
 
@@ -1062,27 +1085,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No closed profile to fillet", 4000)
             return
 
-        radius, ok = QInputDialog.getDouble(
-            self,
-            "Fillet",
-            "Corner radius:",
-            0.25,
-            1e-6,
-            1e6,
-            4,
-        )
-        if not ok:
+        radius = self._get_length_mm("Fillet", "Corner radius", 0.25)
+        if radius is None:
             return
-        dist, ok = QInputDialog.getDouble(
-            self,
-            "Fillet",
-            "Extrude distance:",
-            1.0,
-            1e-6,
-            1e6,
-            4,
-        )
-        if not ok:
+        dist = self._get_length_mm("Fillet", "Extrude distance", 1.0)
+        if dist is None:
             return
         segs, ok = QInputDialog.getInt(
             self,
@@ -1141,9 +1148,10 @@ class MainWindow(QMainWindow):
         self.viewport.refresh_sketches()
         self._refresh_tree()
         self._sync_selection(feat.id)
+        unit = self.doc.display_unit
         self.statusBar().showMessage(
-            f"Created {feat.name} (r={radius:g}, segs={segs}, dist={dist:g}) "
-            f"— sketch corners rounded",
+            f"Created {feat.name} (r={format_length(radius, unit)}, "
+            f"segs={segs}, dist={format_length(dist, unit)}) — sketch corners rounded",
             4000,
         )
 
@@ -1169,17 +1177,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No closed profile for pocket", 4000)
             return
 
-        hr, ok = QInputDialog.getDouble(
-            self, "Pocket", "Hole radius:", 0.5, 1e-6, 1e6, 4
-        )
-        if not ok:
+        hr = self._get_length_mm("Pocket", "Hole radius", 0.5)
+        if hr is None:
             return
-        dist, ok = QInputDialog.getDouble(
-            self, "Pocket", "Extrude distance:", 1.0, 1e-6, 1e6, 4
-        )
-        if not ok:
+        dist = self._get_length_mm("Pocket", "Extrude distance", 1.0)
+        if dist is None:
             return
-        # Default hole center at profile centroid for rectangles
+        # Default hole center at profile centroid for rectangles (UV = mm)
         cx, cy = 0.0, 0.0
         ent = first_closed_profile(skf.sketch)
         if ent is not None:
@@ -1190,16 +1194,22 @@ class MainWindow(QMainWindow):
                 cy = 0.5 * (ent.c0[1] + ent.c1[1])
             elif isinstance(ent, CircleEntity):
                 cx, cy = ent.center[0], ent.center[1]
-        cx, ok = QInputDialog.getDouble(
-            self, "Pocket", "Hole center U:", cx, -1e6, 1e6, 4
+        unit = self.doc.display_unit
+        cx_disp = from_mm(cx, unit)
+        cy_disp = from_mm(cy, unit)
+        lo = from_mm(-1e6, unit)
+        hi = from_mm(1e6, unit)
+        cx_in, ok = QInputDialog.getDouble(
+            self, "Pocket", f"Hole center U ({unit.label}):", cx_disp, lo, hi, 4
         )
         if not ok:
             return
-        cy, ok = QInputDialog.getDouble(
-            self, "Pocket", "Hole center V:", cy, -1e6, 1e6, 4
+        cy_in, ok = QInputDialog.getDouble(
+            self, "Pocket", f"Hole center V ({unit.label}):", cy_disp, lo, hi, 4
         )
         if not ok:
             return
+        cx, cy = to_mm(float(cx_in), unit), to_mm(float(cy_in), unit)
         segs, ok = QInputDialog.getInt(self, "Pocket", "Hole segments:", 32, 3, 512)
         if not ok:
             return
@@ -1252,7 +1262,9 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
         self._sync_selection(feat.id)
         self.statusBar().showMessage(
-            f"Created {feat.name} (hole r={hr:g}, dist={dist:g})", 3000
+            f"Created {feat.name} (hole r={format_length(hr, unit)}, "
+            f"dist={format_length(dist, unit)})",
+            3000,
         )
 
     def _export_stl(self) -> None:

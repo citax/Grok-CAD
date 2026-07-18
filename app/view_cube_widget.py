@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 class ViewCubeController(QObject):
     VIEWPORT = (0.80, 0.80, 0.995, 0.995)
+    # Degrees per display pixel — low enough for fine control, high enough to feel direct
+    ORBIT_DEG_PER_PX = 0.42
+    # Click vs drag: once exceeded, every subsequent pixel moves the view
+    DRAG_START_PX = 2.0
 
     def __init__(
         self,
@@ -40,7 +44,9 @@ class ViewCubeController(QObject):
         self._label_actors: list = []
         self._labels: List[str] = []
         self._pick_actor = None
+        self._pick_poly = None  # mesh used for picking (has region_id)
         self._press: Optional[Tuple[float, float]] = None
+        self._last: Optional[Tuple[float, float]] = None
         self._dragged = False
         self._active = False
 
@@ -48,9 +54,8 @@ class ViewCubeController(QObject):
         plotter = self.vp.plotter
         if plotter is None:
             return
-        poly, labels = build_chamfered_cube(half=1.0, chamfer=0.30)
+        poly, labels = build_chamfered_cube(half=1.0, chamfer=0.28)
         self._labels = labels
-        full = pv.wrap(poly)
 
         from vtkmodules.vtkRenderingCore import (
             vtkActor,
@@ -71,22 +76,24 @@ class ViewCubeController(QObject):
         except Exception:
             pass
 
-        # One solid-colour actor per cell — lighting OFF so soft-GL stays pale.
-        # Face actors are NOT pickable; a separate full mesh carries cell IDs.
+        # Solid pale fills: one actor per region (reliable on soft-GL; cell RGB
+        # scalars often render black under llvmpipe). Geometry is welded so
+        # shared face/edge/corner verts meet — no torn gaps or protruding tips.
         self._actors = []
+        full = pv.wrap(poly)
         for i, lab in enumerate(labels):
-            cell = full.extract_cells([i])
             try:
-                surf = cell.extract_surface(algorithm="dataset_surface")
-            except TypeError:
-                try:
-                    surf = cell.extract_surface()
-                except Exception:
-                    surf = cell
+                cell = full.extract_cells([i])
+                # UnstructuredGrid → PolyData for the mapper (coords already correct)
+                if not isinstance(cell, pv.PolyData):
+                    try:
+                        cell = cell.extract_surface(algorithm="dataset_surface")
+                    except TypeError:
+                        cell = cell.extract_surface()
             except Exception:
-                surf = cell
+                continue
             mapper = vtkPolyDataMapper()
-            mapper.SetInputData(surf)
+            mapper.SetInputData(cell)
             mapper.ScalarVisibilityOff()
             actor = vtkActor()
             actor.SetMapper(mapper)
@@ -98,14 +105,19 @@ class ViewCubeController(QObject):
             prop.SetAmbient(1.0)
             prop.SetDiffuse(0.0)
             prop.SetSpecular(0.0)
+            # Subtle crease lines only — not thick double edges that look torn
             prop.SetEdgeVisibility(1)
-            prop.SetEdgeColor(0.35, 0.38, 0.42)
-            prop.SetLineWidth(1.0)
+            prop.SetEdgeColor(0.55, 0.58, 0.62)
+            prop.SetLineWidth(0.8)
             prop.SetOpacity(1.0)
+            try:
+                prop.SetInterpolationToFlat()
+            except Exception:
+                pass
             ren.AddActor(actor)
             self._actors.append(actor)
 
-        # Combined pick mesh: full topology, slight opacity so soft-GL still picks
+        # Invisible pick mesh: full welded topology with region_id for hits
         pmap = vtkPolyDataMapper()
         pmap.SetInputData(poly)
         pmap.ScalarVisibilityOff()
@@ -117,19 +129,19 @@ class ViewCubeController(QObject):
         pactor.PickableOn()
         ren.AddActor(pactor)
         self._pick_actor = pactor
+        self._pick_poly = poly
 
         # Face labels as real 3D vector text lying on each face (SW/Fusion style).
-        # Billboard text clipped to gibberish in the tiny overlay viewport.
         self._label_actors = []  # list of (face_label, actor)
         for lab in labels:
             text = face_label_text(lab)
             if text is None:
                 continue
-            actor = self._make_face_label_actor(lab, text)
-            if actor is None:
+            la = self._make_face_label_actor(lab, text)
+            if la is None:
                 continue
-            ren.AddActor(actor)
-            self._label_actors.append((lab, actor))
+            ren.AddActor(la)
+            self._label_actors.append((lab, la))
 
         ren.ResetCamera()
         cam = ren.GetActiveCamera()
@@ -165,6 +177,7 @@ class ViewCubeController(QObject):
         self._actors = []
         self._label_actors = []
         self._pick_actor = None
+        self._pick_poly = None
 
     @staticmethod
     def _face_normal(lab: str) -> Optional[np.ndarray]:
@@ -308,9 +321,19 @@ class ViewCubeController(QObject):
             if not ok:
                 return None
             cid = int(picker.GetCellId())
-            if cid < 0 or cid >= len(self._labels):
+            if cid < 0:
                 return None
-            return self._labels[cid]
+            # After triangulate, cell index ≠ region index — use region_id scalar
+            poly = self._pick_poly
+            if poly is not None and "region_id" in getattr(poly, "cell_data", {}):
+                rids = np.asarray(poly.cell_data["region_id"]).reshape(-1)
+                if cid < len(rids):
+                    rid = int(rids[cid])
+                    if 0 <= rid < len(self._labels):
+                        return self._labels[rid]
+            if cid < len(self._labels):
+                return self._labels[cid]
+            return None
         except Exception:
             return None
 
@@ -325,19 +348,32 @@ class ViewCubeController(QObject):
                 return False
             self._active = True
             self._press = (x, y)
+            self._last = (x, y)
             self._dragged = False
             return True
         if et == QEvent.Type.MouseMove and self._active and self._press is not None:
             x, y = float(event.position().x()), float(event.position().y())
-            dx = x - self._press[0]
-            dy = y - self._press[1]
-            if abs(dx) + abs(dy) > 3.0:
-                self._dragged = True
-                self.on_orbit(float(dx) * 0.35, float(-dy) * 0.35)
-                self._press = (x, y)
-                self.sync_orientation()
-                if self.vp.plotter:
-                    self.vp._request_render()
+            # Start drag after a tiny threshold (click vs drag), then follow
+            # *every* pixel — previous code required 3px per step, so small
+            # careful moves did nothing and the orbit felt jumpy.
+            if not self._dragged:
+                dist = float(np.hypot(x - self._press[0], y - self._press[1]))
+                if dist >= self.DRAG_START_PX:
+                    self._dragged = True
+                    self._last = self._press
+                else:
+                    return True
+            last = self._last if self._last is not None else self._press
+            dx = x - last[0]
+            dy = y - last[1]
+            self._last = (x, y)
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return True
+            # orbit_camera already syncs the cube and requests an interactive paint
+            self.on_orbit(
+                float(dx) * self.ORBIT_DEG_PER_PX,
+                float(-dy) * self.ORBIT_DEG_PER_PX,
+            )
             return True
         if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
             if not self._active:
@@ -346,6 +382,7 @@ class ViewCubeController(QObject):
             was_drag = self._dragged
             self._active = False
             self._press = None
+            self._last = None
             self._dragged = False
             if was_drag:
                 return True

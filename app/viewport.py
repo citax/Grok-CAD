@@ -1206,26 +1206,42 @@ class Viewport(QWidget):
         self._rebuild_reference_planes()
         self._request_render()
 
-    def _request_render(self) -> None:
+    def _request_render(self, *, interactive: bool = False) -> None:
+        """Schedule a VTK paint.
+
+        ``interactive=True`` (camera drag / view-cube orbit): paint immediately
+        when the frame budget allows (~60 Hz). Continuous mouse moves must not
+        keep pushing the paint into the future.
+
+        IMPORTANT: never call ``QTimer.setInterval`` on an *active* timer.
+        Qt restarts the countdown, so a stream of mouse moves deferred the
+        single-shot forever — the view only caught up after the mouse stopped.
+        """
         if not self._ok:
             return
-        # (e) aggressive coalesce during resize / interaction
+        now = time.perf_counter()
+        # Interactive camera: draw now if ≥16 ms since last paint
+        if interactive or getattr(self, "_interacting", False):
+            last = float(getattr(self, "_last_render_t", 0.0) or 0.0)
+            if (now - last) >= (1.0 / 60.0):
+                if self._render_timer.isActive():
+                    self._render_timer.stop()
+                self._do_render()
+                return
+            # Budget not free yet — one trailing frame, do not restart countdown
+            if not self._render_timer.isActive():
+                self._render_timer.setInterval(16)
+                self._render_timer.start()
+            return
+
+        # (e) aggressive coalesce during resize / idle paints
         if _perf_enabled("e"):
-            if self._resizing:
-                interval = 120
-            elif getattr(self, "_interacting", False):
-                interval = 64
-            else:
-                interval = 24
+            interval = 120 if self._resizing else 24
         else:
-            if self._resizing:
-                interval = 80
-            elif getattr(self, "_interacting", False):
-                interval = 48
-            else:
-                interval = 16
-        self._render_timer.setInterval(interval)
+            interval = 80 if self._resizing else 16
+        # Only setInterval when starting — never while active (restarts timer).
         if not self._render_timer.isActive():
+            self._render_timer.setInterval(interval)
             self._render_timer.start()
 
     def _do_render(self) -> None:
@@ -1234,8 +1250,9 @@ class Viewport(QWidget):
                 self._view_cube.sync_orientation()
             t0 = time.perf_counter()
             self.plotter.render()
+            self._last_render_t = time.perf_counter()
             self._render_count += 1
-            self._render_ms_sum += (time.perf_counter() - t0) * 1000.0
+            self._render_ms_sum += (self._last_render_t - t0) * 1000.0
 
     def reset_render_stats(self) -> None:
         self._render_count = 0
@@ -2799,7 +2816,192 @@ class Viewport(QWidget):
             "up": tuple(float(x) for x in cam.GetViewUp()),
         }
 
-    def set_view(self, name: str) -> None:
+    def _stop_camera_animation(self) -> None:
+        timer = getattr(self, "_cam_anim_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            self._cam_anim_timer = None
+        self._cam_anim = None
+
+    def _apply_camera_pose(
+        self,
+        pos: Sequence[float],
+        focus: Sequence[float],
+        up: Sequence[float],
+        *,
+        render: bool = True,
+    ) -> None:
+        if not self.plotter:
+            return
+        self.plotter.camera_position = [
+            tuple(float(x) for x in pos),
+            tuple(float(x) for x in focus),
+            tuple(float(x) for x in up),
+        ]
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
+        if self._view_cube is not None:
+            self._view_cube.sync_orientation()
+        if render:
+            self._request_render()
+
+    @staticmethod
+    def _ease_out_cubic(t: float) -> float:
+        t = max(0.0, min(1.0, float(t)))
+        return 1.0 - (1.0 - t) ** 3
+
+    @staticmethod
+    def _slerp_dir(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+        """Spherical lerp of unit direction vectors (stable for camera orbit)."""
+        a = np.asarray(a, dtype=np.float64).reshape(3)
+        b = np.asarray(b, dtype=np.float64).reshape(3)
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        if na < 1e-12 or nb < 1e-12:
+            return (1.0 - t) * a + t * b
+        a = a / na
+        b = b / nb
+        dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+        if dot > 0.9995:
+            v = (1.0 - t) * a + t * b
+            n = float(np.linalg.norm(v))
+            return v / n if n > 1e-12 else a
+        if dot < -0.9995:
+            # Opposite: pick an orthogonal axis and rotate through 180°
+            axis = np.cross(a, np.array([0.0, 1.0, 0.0]))
+            if float(np.linalg.norm(axis)) < 1e-8:
+                axis = np.cross(a, np.array([1.0, 0.0, 0.0]))
+            axis = axis / float(np.linalg.norm(axis))
+            # Rodrigues half-way path via intermediate
+            ang = math.pi * t
+            v = a * math.cos(ang) + np.cross(axis, a) * math.sin(ang)
+            n = float(np.linalg.norm(v))
+            return v / n if n > 1e-12 else b
+        omega = math.acos(dot)
+        so = math.sin(omega)
+        return (math.sin((1.0 - t) * omega) / so) * a + (math.sin(t * omega) / so) * b
+
+    def animate_camera_to(
+        self,
+        pos: Sequence[float],
+        focus: Sequence[float],
+        up: Sequence[float],
+        *,
+        duration_ms: int = 280,
+        view_key: str = "",
+    ) -> None:
+        """Smooth camera travel (Fusion/SW-style) instead of an instant snap."""
+        if not self.plotter:
+            return
+        end_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        end_foc = np.asarray(focus, dtype=np.float64).reshape(3)
+        end_up = np.asarray(up, dtype=np.float64).reshape(3)
+        nu = float(np.linalg.norm(end_up))
+        if nu > 1e-12:
+            end_up = end_up / nu
+        # Instant if duration is zero or headless/offscreen without event loop
+        if duration_ms <= 0:
+            self._stop_camera_animation()
+            self._apply_camera_pose(end_pos, end_foc, end_up)
+            if view_key:
+                self.view_changed.emit(view_key)
+            return
+
+        snap = self.camera_snapshot()
+        if not snap:
+            self._apply_camera_pose(end_pos, end_foc, end_up)
+            if view_key:
+                self.view_changed.emit(view_key)
+            return
+        start_pos = np.asarray(snap["position"], dtype=np.float64)
+        start_foc = np.asarray(snap["focal"], dtype=np.float64)
+        start_up = np.asarray(snap["up"], dtype=np.float64)
+        su = float(np.linalg.norm(start_up))
+        if su > 1e-12:
+            start_up = start_up / su
+
+        # Already there — skip animation
+        if (
+            float(np.linalg.norm(start_pos - end_pos)) < 1e-6
+            and float(np.linalg.norm(start_foc - end_foc)) < 1e-6
+            and float(np.dot(start_up, end_up)) > 0.9999
+        ):
+            self._apply_camera_pose(end_pos, end_foc, end_up)
+            if view_key:
+                self.view_changed.emit(view_key)
+            return
+
+        self._stop_camera_animation()
+        # Orbit-style: interpolate direction from focus + distance (less sliding)
+        start_dir = start_pos - start_foc
+        end_dir = end_pos - end_foc
+        start_dist = float(np.linalg.norm(start_dir))
+        end_dist = float(np.linalg.norm(end_dir))
+        if start_dist < 1e-9:
+            start_dist = end_dist if end_dist > 1e-9 else 1.0
+        if end_dist < 1e-9:
+            end_dist = start_dist
+
+        interval = 16  # ~60 fps
+        steps = max(1, int(round(float(duration_ms) / interval)))
+        state = {
+            "i": 0,
+            "steps": steps,
+            "start_foc": start_foc,
+            "end_foc": end_foc,
+            "start_dir": start_dir,
+            "end_dir": end_dir,
+            "start_dist": start_dist,
+            "end_dist": end_dist,
+            "start_up": start_up,
+            "end_up": end_up,
+            "end_pos": end_pos,
+            "view_key": view_key,
+        }
+        self._cam_anim = state
+        timer = QTimer(self)
+        timer.setInterval(interval)
+
+        def _tick() -> None:
+            st = self._cam_anim
+            if st is None:
+                timer.stop()
+                return
+            st["i"] += 1
+            t = self._ease_out_cubic(st["i"] / float(st["steps"]))
+            foc = (1.0 - t) * st["start_foc"] + t * st["end_foc"]
+            direction = self._slerp_dir(st["start_dir"], st["end_dir"], t)
+            dist = (1.0 - t) * st["start_dist"] + t * st["end_dist"]
+            pos_i = foc + direction * dist
+            # Up: slerp then re-orthogonalize against look direction
+            up_i = self._slerp_dir(st["start_up"], st["end_up"], t)
+            look = -direction
+            # Remove look component from up
+            up_i = up_i - look * float(np.dot(up_i, look))
+            un = float(np.linalg.norm(up_i))
+            if un < 1e-9:
+                up_i = st["end_up"]
+            else:
+                up_i = up_i / un
+            self._apply_camera_pose(pos_i, foc, up_i, render=True)
+            if st["i"] >= st["steps"]:
+                timer.stop()
+                self._cam_anim_timer = None
+                self._cam_anim = None
+                self._apply_camera_pose(st["end_pos"], st["end_foc"], st["end_up"])
+                if st["view_key"]:
+                    self.view_changed.emit(st["view_key"])
+
+        timer.timeout.connect(_tick)
+        self._cam_anim_timer = timer
+        timer.start()
+
+    def set_view(self, name: str, *, animate: bool = True) -> None:
         if not self.plotter or self.in_sketch_mode:
             if self.in_sketch_mode:
                 self.status_message.emit("Exit sketch to change standard views")
@@ -2832,16 +3034,13 @@ class Viewport(QWidget):
         else:
             pos = (fx + dist * 0.75, fy + dist * 0.55, fz + dist * 0.75)
             key = "iso"
-        self.plotter.camera_position = [pos, focus, up]
-        try:
-            self.plotter.reset_camera_clipping_range()
-        except Exception:
-            pass
-        if self._view_cube is not None:
-            self._view_cube.sync_orientation()
-        self._request_render()
+        if animate:
+            self.animate_camera_to(pos, focus, up, duration_ms=280, view_key=key)
+        else:
+            self._stop_camera_animation()
+            self._apply_camera_pose(pos, focus, up)
+            self.view_changed.emit(key)
         self.status_message.emit(f"View: {key.capitalize()}")
-        self.view_changed.emit(key)
 
     def view_along_axis(self, axis: str, *, reverse: bool = False) -> str:
         """Look straight down a world axis (perpendicular view).
@@ -2861,14 +3060,14 @@ class Viewport(QWidget):
         self.set_view(name)
         return name
 
-    def set_view_from_direction(self, direction) -> None:
+    def set_view_from_direction(self, direction, *, animate: bool = True) -> None:
         """Place camera along ``direction`` looking at scene focus (unit-ish)."""
         if not self.plotter:
             return
         d = np.asarray(direction, dtype=np.float64).reshape(3)
         n = float(np.linalg.norm(d))
         if n < 1e-12:
-            self.set_view("iso")
+            self.set_view("iso", animate=animate)
             return
         d = d / n
         dist = self._view_distance()
@@ -2878,21 +3077,22 @@ class Viewport(QWidget):
         up = np.array([0.0, 1.0, 0.0])
         if abs(float(np.dot(d, up))) > 0.9:
             up = np.array([0.0, 0.0, -1.0 if d[1] > 0 else 1.0])
-        self.plotter.camera_position = [pos, (fx, fy, fz), tuple(up)]
-        try:
-            self.plotter.reset_camera_clipping_range()
-        except Exception:
-            pass
-        if self._view_cube is not None:
-            self._view_cube.sync_orientation()
-        self._request_render()
-        self.view_changed.emit("direction")
+        if animate:
+            self.animate_camera_to(
+                pos, (fx, fy, fz), tuple(up), duration_ms=280, view_key="direction"
+            )
+        else:
+            self._stop_camera_animation()
+            self._apply_camera_pose(pos, (fx, fy, fz), tuple(up))
+            self.view_changed.emit("direction")
         self.status_message.emit("View: custom")
 
     def orbit_camera(self, azimuth_deg: float, elevation_deg: float) -> None:
         """Orbit main camera by degrees (used by view-cube drag)."""
         if not self.plotter:
             return
+        # Drag should interrupt a flying view transition
+        self._stop_camera_animation()
         try:
             cam = self.plotter.camera
             cam.Azimuth(float(azimuth_deg))
@@ -2904,7 +3104,8 @@ class Viewport(QWidget):
             return
         if self._view_cube is not None:
             self._view_cube.sync_orientation()
-        self._request_render()
+        # interactive=True: paint during the drag, not only after mouse-up
+        self._request_render(interactive=True)
 
     def fit_empty_workspace(self) -> None:
         """Public alias for opening-screen camera fit."""
