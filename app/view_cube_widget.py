@@ -22,7 +22,11 @@ if TYPE_CHECKING:
 
 
 class ViewCubeController(QObject):
-    VIEWPORT = (0.80, 0.80, 0.995, 0.995)
+    # Top-right inset (normalized VTK viewport). ~11% of the window —
+    # previous (0.80…0.995) was nearly 20% and dominated the opening scene.
+    VIEWPORT = (0.885, 0.885, 0.995, 0.995)
+    # Orthographic half-height in cube units (cube half≈1): larger → more margin
+    PARALLEL_SCALE = 1.95
     # Degrees per display pixel — low enough for fine control, high enough to feel direct
     ORBIT_DEG_PER_PX = 0.42
     # Click vs drag: once exceeded, every subsequent pixel moves the view
@@ -146,7 +150,7 @@ class ViewCubeController(QObject):
         ren.ResetCamera()
         cam = ren.GetActiveCamera()
         cam.SetParallelProjection(1)
-        cam.SetParallelScale(1.70)
+        cam.SetParallelScale(self.PARALLEL_SCALE)
         cam.SetPosition(2.5, 2.1, 2.5)
         cam.SetFocalPoint(0, 0, 0)
         cam.SetViewUp(0, 1, 0)
@@ -282,7 +286,7 @@ class ViewCubeController(QObject):
             cam.SetFocalPoint(0.0, 0.0, 0.0)
             cam.SetViewUp(*up)
             cam.SetParallelProjection(1)
-            cam.SetParallelScale(1.70)
+            cam.SetParallelScale(self.PARALLEL_SCALE)
             self._renderer.ResetCameraClippingRange()
             # Only show labels on faces pointing toward the camera (no back-face soup)
             for lab, ta in self._label_actors:
