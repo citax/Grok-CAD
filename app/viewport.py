@@ -907,7 +907,7 @@ class Viewport(QWidget):
             self._view_click_filter = None
 
     def _setup_interaction_lod(self) -> None:
-        """Throttle VTK during camera drag; optional LOD / scaled render (perf methods)."""
+        """Throttle VTK during camera drag; keep view cube locked to main camera."""
         assert self.plotter is not None
         self._interacting = False
         try:
@@ -923,6 +923,16 @@ class Viewport(QWidget):
         def on_end(_o=None, _e=None) -> None:
             self._end_interaction_lod()
 
+        def on_interact(_o=None, _e=None) -> None:
+            # Main trackball updates the camera then VTK re-renders without going
+            # through our _do_render — so the corner cube used to freeze until
+            # mouse-up. Sync orientation on every interaction tick.
+            if self.in_sketch_mode:
+                return
+            cube = getattr(self, "_view_cube", None)
+            if cube is not None:
+                cube.sync_orientation()
+
         for ev in ("StartInteractionEvent", "LeftButtonPressEvent"):
             try:
                 iren.AddObserver(ev, on_start)
@@ -933,6 +943,22 @@ class Viewport(QWidget):
                 iren.AddObserver(ev, on_end)
             except Exception:
                 pass
+        try:
+            iren.AddObserver("InteractionEvent", on_interact)
+        except Exception:
+            pass
+
+        # Belt-and-suspenders: any VTK Render() (wheel zoom, middle-drag, etc.)
+        # updates the cube before layers are drawn — not only our _do_render path.
+        def on_rw_start(_o=None, _e=None) -> None:
+            cube = getattr(self, "_view_cube", None)
+            if cube is not None:
+                cube.sync_orientation()
+
+        try:
+            self.plotter.render_window.AddObserver("StartEvent", on_rw_start)
+        except Exception:
+            pass
 
     def _begin_interaction_lod(self) -> None:
         """Camera-drag LOD — never SetSize on the Qt-embedded render window.
