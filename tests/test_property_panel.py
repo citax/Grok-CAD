@@ -49,8 +49,29 @@ def _doc_with_all_solids():
     return doc, extrude, fillet, revolve, pocket, sk_fil
 
 
+def test_empty_state_has_no_name_fields():
+    _app()
+    p = PropertyPanel()
+    p.show_empty()
+    assert p.prop_name.isHidden()
+    assert p.btn_apply.isHidden()
+
+
+def test_plane_is_not_editable():
+    _app()
+    doc = Document()
+    doc.seed_reference_planes()
+    plane = next(f for f in doc.features if f.type is FeatureType.PLANE_FRONT)
+    p = PropertyPanel()
+    p.set_document(doc)
+    p.show_feature(plane)
+    assert p.prop_name.isReadOnly()
+    assert not p.btn_apply.isEnabled()
+    assert p.btn_apply.isHidden()
+
+
 def test_show_feature_twice_no_crash():
-    """Second show_feature must not touch deleted C++ spin boxes."""
+    """Second show_feature must not touch deleted C++ widgets."""
     _app()
     doc, extrude, fillet, revolve, pocket, _ = _doc_with_all_solids()
     p = PropertyPanel()

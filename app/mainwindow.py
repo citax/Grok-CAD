@@ -188,8 +188,13 @@ class MainWindow(QMainWindow):
         self.props.set_document(self.doc)
         self.props.params_applied.connect(self._on_props_applied)
         self.props.status_message.connect(self._on_status)
+        self.props.command_ok.connect(self._on_command_ok)
+        self.props.command_cancel.connect(self._on_command_cancel)
         dock.setWidget(self.props)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        # Active feature command: {"kind": "extrude"|..., "sketch_id": int, "target_id": int}
+        self._feature_cmd: Optional[dict] = None
+        self._await_face_sketch: bool = False
 
     def _on_props_applied(self, fid: int) -> None:
         """Rebuild after PropertyManager Apply (feature params or sketch length)."""
@@ -736,18 +741,32 @@ class MainWindow(QMainWindow):
     def _sync_selection(self, fid: int) -> None:
         if self.viewport.in_sketch_mode:
             return  # don't fight sketch selection
+        # During an active feature command, selection feeds the command
+        if self._feature_cmd is not None:
+            self.doc.selected_id = fid
+            self.viewport.set_selected_id(fid)
+            self._update_command_from_selection(fid)
+            self._sync_tree_highlight(fid)
+            return
         self.doc.selected_id = fid
         self.viewport.set_selected_id(fid)
         f = self.doc.find(fid)
-        if f is None:
-            self.props.clear()
-            self.statusBar().showMessage(f"Selected: (none) · {self._status_env}")
-            return
         self.props.set_document(self.doc)
+        if f is None or fid < 0:
+            self.props.show_empty()
+            self.statusBar().showMessage(f"Selected: (none) · {self._status_env}")
+            self._sync_tree_highlight(-1)
+            return
         self.props.show_feature(f, unit=self.doc.display_unit)
         self.statusBar().showMessage(f"Selected: {f.name} · {self._status_env}")
+        self._sync_tree_highlight(fid)
+
+    def _sync_tree_highlight(self, fid: int) -> None:
         self.tree.blockSignals(True)
         self.tree.clearSelection()
+        if fid < 0:
+            self.tree.blockSignals(False)
+            return
         for i in range(self.tree.topLevelItemCount()):
             root = self.tree.topLevelItem(i)
             for j in range(root.childCount()):
@@ -755,6 +774,12 @@ class MainWindow(QMainWindow):
                 if item.data(0, Qt.ItemDataRole.UserRole) == fid:
                     item.setSelected(True)
                     self.tree.setCurrentItem(item)
+                for k in range(item.childCount()):
+                    ch = item.child(k)
+                    if ch.data(0, Qt.ItemDataRole.UserRole) == fid:
+                        item.setExpanded(True)
+                        ch.setSelected(True)
+                        self.tree.setCurrentItem(ch)
         self.tree.blockSignals(False)
 
     def _on_tree_sel(self) -> None:
@@ -762,6 +787,8 @@ class MainWindow(QMainWindow):
             return
         items = self.tree.selectedItems()
         if not items:
+            if self._feature_cmd is None:
+                self._sync_selection(-1)
             return
         data = items[0].data(0, Qt.ItemDataRole.UserRole)
         if data is None:
@@ -785,6 +812,29 @@ class MainWindow(QMainWindow):
     def _on_pick(self, fid: int) -> None:
         if self.viewport.in_sketch_mode:
             return
+        # Sketch-awaiting-face: solid face click starts a sketch
+        if getattr(self, "_await_face_sketch", False):
+            frame = self.viewport.face_pick_frame()
+            sid = self.viewport.face_pick_solid_id()
+            if frame is not None and sid == fid and is_solid_feature(
+                self.doc.find(fid).type if self.doc.find(fid) else FeatureType.SKETCH
+            ):
+                self._await_face_sketch = False
+                skf = self.doc.create_sketch_on_face(fid, frame)
+                if skf is not None:
+                    self._refresh_tree()
+                    self._sync_selection(skf.id)
+                    self._update_window_title()
+                    self.viewport.enter_sketch(skf.id)
+                    self._set_sketch_ribbon_enabled(True)
+                    self._sync_sketch_tool_ui(SketchTool.LINE)
+                    self.statusBar().showMessage(f"Editing {skf.name} on face")
+                    return
+            self.statusBar().showMessage(
+                "Click a face of the solid to start a sketch (Esc cancels)", 4000
+            )
+            self._sync_selection(fid)
+            return
         self._sync_selection(fid)
 
     def _on_status(self, msg: str) -> None:
@@ -799,31 +849,53 @@ class MainWindow(QMainWindow):
     def _enter_sketch(self) -> None:
         if self.viewport.in_sketch_mode:
             return
+        if self._feature_cmd is not None:
+            self._cancel_feature_cmd()
         f = self.doc.find(self.doc.selected_id)
-        # If a sketch is selected, re-open it
+        # Re-open existing sketch
         if f is not None and f.type is FeatureType.SKETCH and f.sketch is not None:
             self.viewport.enter_sketch(f.id)
             self._set_sketch_ribbon_enabled(True)
             self._sync_sketch_tool_ui(SketchTool.LINE)
             self.statusBar().showMessage(f"Editing {f.name}")
             return
-        # Solid face: pick a face then Sketch
+        # SolidWorks: select face of solid → Sketch sits on that face
         if f is not None and is_solid_feature(f.type):
             frame = self.viewport.face_pick_frame()
             sid = self.viewport.face_pick_solid_id()
-            if frame is None or sid != f.id:
-                QMessageBox.information(
-                    self,
-                    "Sketch on Face",
-                    "Click a face of the solid first (so the face highlights), "
-                    "then click Sketch.\n\n"
-                    "The sketch will sit on that face and extrude along its normal.",
-                )
-                self.statusBar().showMessage(
-                    "Click a solid face, then Sketch", 4000
-                )
-                return
-            skf = self.doc.create_sketch_on_face(f.id, frame)
+            # Accept face pick on this solid, or any displayed body that maps to it
+            if frame is not None and (sid == f.id or sid >= 0):
+                solid_id = sid if sid >= 0 else f.id
+                if self.doc.find(solid_id) is not None and is_solid_feature(
+                    self.doc.find(solid_id).type
+                ):
+                    skf = self.doc.create_sketch_on_face(solid_id, frame)
+                    if skf is not None:
+                        self._await_face_sketch = False
+                        self._refresh_tree()
+                        self._sync_selection(skf.id)
+                        self._update_window_title()
+                        self.viewport.enter_sketch(skf.id)
+                        self._set_sketch_ribbon_enabled(True)
+                        self._sync_sketch_tool_ui(SketchTool.LINE)
+                        self.statusBar().showMessage(
+                            f"Editing {skf.name} on face of {self.doc.find(solid_id).name}"
+                        )
+                        return
+            # No face yet — wait for the next face click (SolidWorks-like)
+            self._await_face_sketch = True
+            self.props.show_empty()
+            self.props._hint.setText(
+                "Sketch on Face\n\n"
+                "Click a flat face of the selected solid in the graphics area.\n"
+                "Esc cancels."
+            )
+            self.statusBar().showMessage(
+                "Click a face of the solid to place the sketch (Esc cancels)", 6000
+            )
+            return
+        if f is not None and is_reference_plane(f.type):
+            skf = self.doc.create_sketch_on_plane(f.id)
             if skf is None or skf.sketch is None:
                 return
             self._refresh_tree()
@@ -832,28 +904,11 @@ class MainWindow(QMainWindow):
             self.viewport.enter_sketch(skf.id)
             self._set_sketch_ribbon_enabled(True)
             self._sync_sketch_tool_ui(SketchTool.LINE)
-            self.statusBar().showMessage(f"Editing {skf.name} on face of {f.name}")
+            self.statusBar().showMessage(f"Editing {skf.name} on {f.name}")
             return
-        if f is None or not is_reference_plane(f.type):
-            QMessageBox.information(
-                self,
-                "Sketch",
-                "Select a reference plane or a solid face, then click Sketch.",
-            )
-            self.statusBar().showMessage(
-                "Select a plane or solid face to start a sketch", 4000
-            )
-            return
-        skf = self.doc.create_sketch_on_plane(f.id)
-        if skf is None or skf.sketch is None:
-            return
-        self._refresh_tree()
-        self._sync_selection(skf.id)
-        self._update_window_title()
-        self.viewport.enter_sketch(skf.id)
-        self._set_sketch_ribbon_enabled(True)
-        self._sync_sketch_tool_ui(SketchTool.LINE)
-        self.statusBar().showMessage(f"Editing {skf.name} on {f.name}")
+        self.statusBar().showMessage(
+            "Select a reference plane or a solid face, then Sketch", 4000
+        )
 
     def _exit_sketch(self) -> None:
         self.viewport.exit_sketch()
@@ -976,496 +1031,240 @@ class MainWindow(QMainWindow):
                 out.append(pid)
         return out
 
-    def _extrude(self) -> None:
-        """Extrude (pad) closed sketch region(s) via distance dialog + rebuild worker."""
-        sid = self._resolve_closed_sketch_id()
-        skf = self.doc.find(sid) if sid >= 0 else None
-        if skf is None or skf.sketch is None:
-            QMessageBox.information(
-                self,
-                "Extrude",
-                "Create or select a sketch with a closed rectangle, circle, "
-                "or closed line-loop first.",
-            )
-            self.statusBar().showMessage(
-                "Extrude needs a closed sketch profile", 4000
-            )
-            return
-        if first_closed_profile(skf.sketch) is None:
-            QMessageBox.information(
-                self,
-                "Extrude",
-                "The sketch has no closed profile.\n"
-                "Draw a rectangle, circle, or closed line loop, then Extrude.",
-            )
-            self.statusBar().showMessage("No closed profile to extrude", 4000)
-            return
-
-        try:
-            profile_ids = self._resolve_profile_ids_for_command(
-                skf.sketch, title="Select Profile to Extrude"
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Extrude", str(exc))
-            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
-            return
-        if profile_ids is None:
-            QMessageBox.information(
-                self,
-                "Extrude",
-                "This sketch has more than one closed region.\n\n"
-                "Click inside a region to select it (filled highlight),\n"
-                "Ctrl+click to select more, then Extrude again.\n"
-                "Click empty space to clear the selection.",
-            )
-            self.statusBar().showMessage(
-                "Click a closed region in the sketch, then Extrude", 5000
-            )
-            # Stay in / enter sketch so the user can pick
-            if not self.viewport.in_sketch_mode:
-                self.viewport.enter_sketch(sid)
-                self._set_sketch_ribbon_enabled(True)
-            return
-
-        dist = self._get_length_mm("Extrude (Pad)", "Distance", 1.0)
-        if dist is None:
-            return
-
-        # Leave sketch mode so the solid rebuild is visible
+    def _start_feature_cmd(self, kind: str) -> None:
+        """SolidWorks-style: command → select → PropertyManager → OK/Cancel."""
         if self.viewport.in_sketch_mode:
             self.viewport.exit_sketch()
             self._set_sketch_ribbon_enabled(False)
+        self._await_face_sketch = False
+        self._feature_cmd = {
+            "kind": kind,
+            "sketch_id": -1,
+            "target_id": -1,
+            "profile_id": -1,
+        }
+        titles = {
+            "extrude": "Extrude (Boss/Base)",
+            "cut": "Cut-Extrude",
+            "fillet": "Fillet",
+            "revolve": "Revolve",
+            "pocket": "Pocket",
+        }
+        self.props.show_command(
+            kind,
+            title=titles.get(kind, kind.title()),
+            selection_text="Select a sketch with a closed profile…",
+            unit=self.doc.display_unit,
+            defaults={
+                "depth": 10.0,
+                "radius": 2.0,
+                "angle": 360.0,
+                "segments": 32,
+                "through_all": False,
+                "reversed": False,
+            },
+            ready=False,
+        )
+        # Prefer current selection
+        self._update_command_from_selection(self.doc.selected_id)
+        self.statusBar().showMessage(
+            f"{titles.get(kind, kind)}: select a sketch, set parameters, OK — Esc cancels",
+            6000,
+        )
 
-        created = []
-        try:
-            for pid in profile_ids:
-                feat = self.doc.create_extrude(
-                    sid, float(dist), profile_entity_id=int(pid)
+    def _cancel_feature_cmd(self) -> None:
+        self._feature_cmd = None
+        self._await_face_sketch = False
+        # Restore PM for current selection
+        self._sync_selection(self.doc.selected_id)
+        self.statusBar().showMessage("Command cancelled", 2000)
+
+    def _on_command_cancel(self) -> None:
+        self._cancel_feature_cmd()
+
+    def _update_command_from_selection(self, fid: int) -> None:
+        cmd = self._feature_cmd
+        if cmd is None:
+            return
+        kind = cmd["kind"]
+        f = self.doc.find(fid)
+        # Sketch selection
+        if f is not None and f.type is FeatureType.SKETCH and f.sketch is not None:
+            cmd["sketch_id"] = f.id
+            # Target solid for cut: sketch-on-face parent
+            if kind == "cut" and f.plane_id >= 0:
+                parent = self.doc.find(f.plane_id)
+                if parent is not None and is_solid_feature(parent.type):
+                    cmd["target_id"] = parent.id
+            try:
+                profiles = list_closed_profiles(f.sketch)
+            except ValueError:
+                profiles = []
+            if not profiles:
+                self.props.update_command_selection(
+                    f"{f.name}: no closed profile yet", ready=False
                 )
-                created.append(feat)
+                return
+            # Default first profile / resolve if unambiguous
+            try:
+                resolved = resolve_profiles(f.sketch)
+                cmd["profile_id"] = int(getattr(resolved.outer, "id", -1))
+            except ValueError:
+                cmd["profile_id"] = int(getattr(profiles[0], "id", -1))
+            if kind == "cut":
+                if cmd["target_id"] < 0:
+                    # last solid before this sketch
+                    for g in reversed(self.doc.features):
+                        if is_solid_feature(g.type) and g.id != f.id:
+                            cmd["target_id"] = g.id
+                            break
+                tgt = self.doc.find(cmd["target_id"])
+                if tgt is None:
+                    self.props.update_command_selection(
+                        f"{f.name} selected — also select a solid to cut",
+                        ready=False,
+                    )
+                    return
+                self.props.update_command_selection(
+                    f"Sketch: {f.name}\nSolid: {tgt.name}", ready=True
+                )
+            else:
+                self.props.update_command_selection(
+                    f"Sketch: {f.name} (closed profile ready)", ready=True
+                )
+            return
+        # Solid selection for cut target
+        if f is not None and is_solid_feature(f.type) and kind == "cut":
+            cmd["target_id"] = f.id
+            sk = self.doc.find(cmd["sketch_id"])
+            if sk is not None and sk.sketch is not None:
+                self.props.update_command_selection(
+                    f"Sketch: {sk.name}\nSolid: {f.name}", ready=True
+                )
+            else:
+                self.props.update_command_selection(
+                    f"Solid: {f.name} — select a closed sketch to cut with",
+                    ready=False,
+                )
+            return
+        self.props.update_command_selection(
+            "Select a sketch with a closed profile…", ready=False
+        )
+
+    def _on_command_ok(self) -> None:
+        cmd = self._feature_cmd
+        if cmd is None:
+            return
+        try:
+            params = self.props.read_command_params()
         except ValueError as exc:
-            QMessageBox.warning(self, "Extrude", str(exc))
-            self.statusBar().showMessage(f"Extrude failed: {exc}", 4000)
+            QMessageBox.warning(self, "Command", f"Invalid parameter:\n{exc}")
+            return
+        kind = cmd["kind"]
+        sid = int(cmd.get("sketch_id", -1))
+        skf = self.doc.find(sid)
+        if skf is None or skf.sketch is None:
+            QMessageBox.warning(
+                self,
+                "Command",
+                "Select a sketch with a closed profile before pressing OK.",
+            )
+            return
+        # Validate closed profile without mutating the document
+        try:
+            resolve_profiles(skf.sketch, preferred_outer_id=int(cmd.get("profile_id", -1)))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Command", f"Cannot apply to this selection:\n{exc}")
             return
 
+        created = None
+        try:
+            if kind == "extrude":
+                created = self.doc.create_extrude(
+                    sid,
+                    float(params["depth"]),
+                    profile_entity_id=int(cmd.get("profile_id", -1)),
+                    reversed=bool(params.get("reversed", False)),
+                )
+            elif kind == "cut":
+                tid = int(cmd.get("target_id", -1))
+                if tid < 0 or self.doc.find(tid) is None:
+                    QMessageBox.warning(
+                        self,
+                        "Cut-Extrude",
+                        "Select a solid to cut into (click the solid, then OK).",
+                    )
+                    return
+                created = self.doc.create_cut_extrude(
+                    sid,
+                    tid,
+                    float(params["depth"]),
+                    profile_entity_id=int(cmd.get("profile_id", -1)),
+                    reversed=bool(params.get("reversed", False)),
+                    through_all=bool(params.get("through_all", False)),
+                )
+            elif kind == "fillet":
+                created = self.doc.create_fillet(
+                    sid,
+                    float(params["depth"]),
+                    float(params["radius"]),
+                    segments=int(params.get("segments", 32)),
+                    profile_entity_id=int(cmd.get("profile_id", -1)),
+                )
+            elif kind == "revolve":
+                created = self.doc.create_revolve(
+                    sid,
+                    angle_degrees=float(params["angle"]),
+                    profile_entity_id=int(cmd.get("profile_id", -1)),
+                )
+            elif kind == "pocket":
+                created = self.doc.create_pocket(
+                    sid,
+                    float(params["depth"]),
+                    float(params["radius"]),
+                    (float(params["hole_u"]), float(params["hole_v"])),
+                    profile_entity_id=int(cmd.get("profile_id", -1)),
+                )
+        except ValueError as exc:
+            # Part must be untouched — create_* validates before committing
+            QMessageBox.warning(
+                self,
+                "Command failed",
+                f"Could not create the feature:\n\n{exc}\n\n"
+                "The part was not changed. Fix the selection or parameters and try again.",
+            )
+            self.statusBar().showMessage(f"Failed: {exc}", 5000)
+            return
+
+        self._feature_cmd = None
         self.viewport.schedule_rebuild()
         self.viewport.refresh_sketches()
         self._refresh_tree()
-        if created:
-            self._sync_selection(created[-1].id)
+        if created is not None:
+            self._sync_selection(created.id)
         self._update_window_title()
-        names = ", ".join(f.name for f in created)
-        shown = format_length(dist, self.doc.display_unit)
         self.statusBar().showMessage(
-            f"Created {names} (distance={shown}) — Reverse direction in PropertyManager to flip",
-            4000,
+            f"Created {created.name}" if created else "Done", 3000
         )
+
+    def _extrude(self) -> None:
+        self._start_feature_cmd("extrude")
 
     def _revolve(self) -> None:
-        """Revolve a closed sketch profile about the V-axis via angle dialog + rebuild."""
-        sid = self._resolve_closed_sketch_id()
-        skf = self.doc.find(sid) if sid >= 0 else None
-        if skf is None or skf.sketch is None:
-            QMessageBox.information(
-                self,
-                "Revolve",
-                "Create or select a sketch with a closed rectangle or circle first.\n"
-                "The profile must lie entirely on one side of the V-axis (u=0).",
-            )
-            self.statusBar().showMessage(
-                "Revolve needs a closed sketch profile", 4000
-            )
-            return
-        if first_closed_profile(skf.sketch) is None:
-            QMessageBox.information(
-                self,
-                "Revolve",
-                "The sketch has no closed profile.\n"
-                "Draw a rectangle or circle offset from the V-axis, then Revolve.",
-            )
-            self.statusBar().showMessage("No closed profile to revolve", 4000)
-            return
+        self._start_feature_cmd("revolve")
 
-        ang, ok = QInputDialog.getDouble(
-            self,
-            "Revolve",
-            "Angle (degrees):",
-            360.0,
-            1e-3,
-            360.0,
-            2,
-        )
-        if not ok:
-            return
-
-        try:
-            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Revolve", str(exc))
-            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
-            return
-        if profile_ids is None:
-            QMessageBox.information(
-                self,
-                "Revolve",
-                "Multiple closed regions — click the one to revolve in the sketch "
-                "(filled highlight), then Revolve again.",
-            )
-            if not self.viewport.in_sketch_mode:
-                self.viewport.enter_sketch(sid)
-                self._set_sketch_ribbon_enabled(True)
-            return
-        if len(profile_ids) > 1:
-            QMessageBox.information(
-                self,
-                "Revolve",
-                "Revolve uses one region at a time. Select a single region, then Revolve.",
-            )
-            return
-
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
-        try:
-            feat = self.doc.create_revolve(
-                sid, angle_degrees=float(ang), profile_entity_id=int(profile_ids[0])
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Revolve", str(exc))
-            self.statusBar().showMessage(f"Revolve failed: {exc}", 4000)
-            return
-
-        self.viewport.schedule_rebuild()
-        self.viewport.refresh_sketches()
-        self._refresh_tree()
-        self._sync_selection(feat.id)
-        self._update_window_title()
-        self.statusBar().showMessage(
-            f"Created {feat.name} (angle={ang:g}°)", 3000
-        )
 
     def _fillet(self) -> None:
-        """Fillet closed profile corners, then extrude via dialogs + rebuild worker."""
-        sid = self._resolve_closed_sketch_id()
-        skf = self.doc.find(sid) if sid >= 0 else None
-        if skf is None or skf.sketch is None:
-            QMessageBox.information(
-                self,
-                "Fillet",
-                "Create or select a sketch with a closed rectangle or circle first.",
-            )
-            self.statusBar().showMessage("Fillet needs a closed sketch profile", 4000)
-            return
-        if first_closed_profile(skf.sketch) is None:
-            QMessageBox.information(
-                self,
-                "Fillet",
-                "The sketch has no closed profile.\n"
-                "Draw a rectangle or circle, then Fillet.",
-            )
-            self.statusBar().showMessage("No closed profile to fillet", 4000)
-            return
+        self._start_feature_cmd("fillet")
 
-        radius = self._get_length_mm("Fillet", "Corner radius", 0.25)
-        if radius is None:
-            return
-        dist = self._get_length_mm("Fillet", "Extrude distance", 1.0)
-        if dist is None:
-            return
-        segs, ok = QInputDialog.getInt(
-            self,
-            "Fillet",
-            "Arc segments:",
-            32,
-            3,
-            512,
-        )
-        if not ok:
-            return
-
-        try:
-            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Fillet", str(exc))
-            self.statusBar().showMessage(f"Fillet failed: {exc}", 4000)
-            return
-        if profile_ids is None:
-            QMessageBox.information(
-                self,
-                "Fillet",
-                "Multiple closed regions — click the one to fillet in the sketch, "
-                "then Fillet again.",
-            )
-            if not self.viewport.in_sketch_mode:
-                self.viewport.enter_sketch(sid)
-                self._set_sketch_ribbon_enabled(True)
-            return
-        if len(profile_ids) > 1:
-            QMessageBox.information(
-                self,
-                "Fillet",
-                "Fillet uses one region at a time. Select a single region, then Fillet.",
-            )
-            return
-
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
-        try:
-            feat = self.doc.create_fillet(
-                sid,
-                float(dist),
-                float(radius),
-                segments=int(segs),
-                profile_entity_id=int(profile_ids[0]),
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Fillet", str(exc))
-            self.statusBar().showMessage(f"Fillet failed: {exc}", 4000)
-            return
-
-        self.viewport.schedule_rebuild()
-        self.viewport.refresh_sketches()
-        self._refresh_tree()
-        self._sync_selection(feat.id)
-        self._update_window_title()
-        unit = self.doc.display_unit
-        self.statusBar().showMessage(
-            f"Created {feat.name} (r={format_length(radius, unit)}, "
-            f"segs={segs}, dist={format_length(dist, unit)}) — sketch corners rounded",
-            4000,
-        )
 
     def _pocket(self) -> None:
-        """Circular through-hole pocket + extrude via dialogs and worker rebuild."""
-        sid = self._resolve_closed_sketch_id()
-        skf = self.doc.find(sid) if sid >= 0 else None
-        if skf is None or skf.sketch is None:
-            QMessageBox.information(
-                self,
-                "Pocket",
-                "Create or select a sketch with a closed rectangle or circle first.",
-            )
-            self.statusBar().showMessage("Pocket needs a closed sketch profile", 4000)
-            return
-        if first_closed_profile(skf.sketch) is None:
-            QMessageBox.information(
-                self,
-                "Pocket",
-                "The sketch has no closed profile.\n"
-                "Draw a rectangle or circle, then Pocket.",
-            )
-            self.statusBar().showMessage("No closed profile for pocket", 4000)
-            return
+        self._start_feature_cmd("pocket")
 
-        hr = self._get_length_mm("Pocket", "Hole radius", 0.5)
-        if hr is None:
-            return
-        dist = self._get_length_mm("Pocket", "Extrude distance", 1.0)
-        if dist is None:
-            return
-        # Default hole center at profile centroid for rectangles (UV = mm)
-        cx, cy = 0.0, 0.0
-        ent = first_closed_profile(skf.sketch)
-        if ent is not None:
-            from cadcore.sketch import RectEntity, CircleEntity
-
-            if isinstance(ent, RectEntity):
-                cx = 0.5 * (ent.c0[0] + ent.c1[0])
-                cy = 0.5 * (ent.c0[1] + ent.c1[1])
-            elif isinstance(ent, CircleEntity):
-                cx, cy = ent.center[0], ent.center[1]
-        unit = self.doc.display_unit
-        cx_disp = from_mm(cx, unit)
-        cy_disp = from_mm(cy, unit)
-        lo = from_mm(-1e6, unit)
-        hi = from_mm(1e6, unit)
-        cx_in, ok = QInputDialog.getDouble(
-            self, "Pocket", f"Hole center U ({unit.label}):", cx_disp, lo, hi, 4
-        )
-        if not ok:
-            return
-        cy_in, ok = QInputDialog.getDouble(
-            self, "Pocket", f"Hole center V ({unit.label}):", cy_disp, lo, hi, 4
-        )
-        if not ok:
-            return
-        cx, cy = to_mm(float(cx_in), unit), to_mm(float(cy_in), unit)
-        segs, ok = QInputDialog.getInt(self, "Pocket", "Hole segments:", 32, 3, 512)
-        if not ok:
-            return
-
-        try:
-            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Pocket", str(exc))
-            self.statusBar().showMessage(f"Pocket failed: {exc}", 4000)
-            return
-        if profile_ids is None:
-            QMessageBox.information(
-                self,
-                "Pocket",
-                "Multiple closed regions — click the outer region in the sketch, "
-                "then Pocket again.",
-            )
-            if not self.viewport.in_sketch_mode:
-                self.viewport.enter_sketch(sid)
-                self._set_sketch_ribbon_enabled(True)
-            return
-        if len(profile_ids) > 1:
-            QMessageBox.information(
-                self,
-                "Pocket",
-                "Pocket uses one outer region. Select a single region, then Pocket.",
-            )
-            return
-
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
-        try:
-            feat = self.doc.create_pocket(
-                sid,
-                float(dist),
-                float(hr),
-                (float(cx), float(cy)),
-                segments=int(segs),
-                profile_entity_id=int(profile_ids[0]),
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Pocket", str(exc))
-            self.statusBar().showMessage(f"Pocket failed: {exc}", 4000)
-            return
-
-        self.viewport.schedule_rebuild()
-        self.viewport.refresh_sketches()
-        self._refresh_tree()
-        self._sync_selection(feat.id)
-        self._update_window_title()
-        self.statusBar().showMessage(
-            f"Created {feat.name} (hole r={format_length(hr, unit)}, "
-            f"dist={format_length(dist, unit)})",
-            3000,
-        )
 
     def _cut_extrude(self) -> None:
-        """SolidWorks Extruded Cut: remove material under a sketch on a solid."""
-        sid = self._resolve_closed_sketch_id()
-        skf = self.doc.find(sid) if sid >= 0 else None
-        if skf is None or skf.sketch is None:
-            QMessageBox.information(
-                self,
-                "Cut-Extrude",
-                "Sketch a closed profile on a solid face (or plane near a solid),\n"
-                "then Cut. The cut removes material from the target solid.",
-            )
-            return
-        if first_closed_profile(skf.sketch) is None:
-            QMessageBox.information(
-                self,
-                "Cut-Extrude",
-                "The sketch has no closed profile to cut with.",
-            )
-            return
+        self._start_feature_cmd("cut")
 
-        # Target solid: sketch-on-face parent, else selected solid, else last solid
-        target_id = -1
-        if skf.plane_id >= 0:
-            parent = self.doc.find(skf.plane_id)
-            if parent is not None and is_solid_feature(parent.type):
-                target_id = parent.id
-        if target_id < 0:
-            sel = self.doc.find(self.doc.selected_id)
-            if sel is not None and is_solid_feature(sel.type):
-                target_id = sel.id
-        if target_id < 0:
-            for f in reversed(self.doc.features):
-                if is_solid_feature(f.type) and f.type is not FeatureType.SKETCH:
-                    target_id = f.id
-                    break
-        if target_id < 0:
-            QMessageBox.information(
-                self,
-                "Cut-Extrude",
-                "No solid to cut. Extrude a boss first, then sketch on its face and Cut.",
-            )
-            return
-
-        # Through-all vs blind depth
-        through, ok = QInputDialog.getItem(
-            self,
-            "Cut-Extrude",
-            "End condition:",
-            ["Blind (set depth)", "Through all"],
-            0,
-            False,
-        )
-        if not ok:
-            return
-        through_all = through.startswith("Through")
-        dist = 5.0
-        if not through_all:
-            d = self._get_length_mm("Cut-Extrude", "Depth", 5.0)
-            if d is None:
-                return
-            dist = float(d)
-
-        try:
-            profile_ids = self._resolve_profile_ids_for_command(skf.sketch)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Cut-Extrude", str(exc))
-            return
-        if profile_ids is None:
-            QMessageBox.information(
-                self,
-                "Cut-Extrude",
-                "Multiple closed regions — select one in the sketch, then Cut again.",
-            )
-            if not self.viewport.in_sketch_mode:
-                self.viewport.enter_sketch(sid)
-                self._set_sketch_ribbon_enabled(True)
-            return
-        if len(profile_ids) > 1:
-            QMessageBox.information(
-                self,
-                "Cut-Extrude",
-                "Cut uses one region at a time. Select a single region, then Cut.",
-            )
-            return
-
-        if self.viewport.in_sketch_mode:
-            self.viewport.exit_sketch()
-            self._set_sketch_ribbon_enabled(False)
-
-        try:
-            feat = self.doc.create_cut_extrude(
-                sid,
-                target_id,
-                float(dist),
-                profile_entity_id=int(profile_ids[0]),
-                through_all=through_all,
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Cut-Extrude", str(exc))
-            self.statusBar().showMessage(f"Cut failed: {exc}", 4000)
-            return
-
-        self.viewport.schedule_rebuild()
-        self.viewport.refresh_sketches()
-        self._refresh_tree()
-        self._sync_selection(feat.id)
-        self._update_window_title()
-        tgt = self.doc.find(target_id)
-        tname = tgt.name if tgt else str(target_id)
-        msg = (
-            f"Created {feat.name} through {tname}"
-            if through_all
-            else f"Created {feat.name} depth={format_length(dist, self.doc.display_unit)} in {tname}"
-        )
-        self.statusBar().showMessage(msg, 4000)
 
     # ----- project file (Save / Open / New) -----
     def _update_window_title(self) -> None:
@@ -1945,6 +1744,15 @@ class MainWindow(QMainWindow):
         )
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            if self._feature_cmd is not None:
+                self._cancel_feature_cmd()
+                return
+            if getattr(self, "_await_face_sketch", False):
+                self._await_face_sketch = False
+                self._sync_selection(self.doc.selected_id)
+                self.statusBar().showMessage("Sketch cancelled", 2000)
+                return
         if self.viewport.in_sketch_mode:
             if event.key() == Qt.Key.Key_Escape:
                 # Two-stage: cancel draw → Select, or exit sketch if idle
