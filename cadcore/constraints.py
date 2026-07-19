@@ -516,11 +516,20 @@ def _project_dimensions(
             ent_b = sk.find_entity(int(getattr(dim, "entity_b_id", -1)))
             if not isinstance(ent_b, LineEntity):
                 continue
-            # set_line_pair_angle(a, b) rotates b; keep the dragged line if possible
+            ph0 = str(getattr(dim, "pivot_h0", "") or "")
+            ph1 = str(getattr(dim, "pivot_h1", "") or "")
+            pivot = (ph0, ph1) if ph0 and ph1 else None
+            # Prefer rotating the dragged line when possible; always about pivot
             if prefer_entity is not None and int(prefer_entity) == int(ent.id):
-                set_line_pair_angle(ent_b, ent, float(dim.value_mm))
+                # move a: set_line_pair_angle(b, a) with pivot swapped
+                piv = (ph1, ph0) if pivot else None
+                set_line_pair_angle(
+                    ent_b, ent, float(dim.value_mm), move="b", pivot=piv
+                )
             else:
-                set_line_pair_angle(ent, ent_b, float(dim.value_mm))
+                set_line_pair_angle(
+                    ent, ent_b, float(dim.value_mm), move="b", pivot=pivot
+                )
 
 
 def _project_one(

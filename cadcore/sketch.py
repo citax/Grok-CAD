@@ -235,6 +235,9 @@ class SketchDimension:
     role: str = "length"
     value_mm: float = 0.0
     entity_b_id: int = -1
+    # Angle: which endpoints form the corner (empty if lines do not share a vertex)
+    pivot_h0: str = ""  # handle on entity_id
+    pivot_h1: str = ""  # handle on entity_b_id
 
 
 @dataclass
@@ -386,6 +389,8 @@ class Sketch:
         *,
         kind: Optional[DimKind] = None,
         entity_b_id: int = -1,
+        pivot_h0: str = "",
+        pivot_h1: str = "",
     ) -> SketchDimension:
         """Create or replace a driving dimension for (entity, role[, entity_b])."""
         eid = int(entity_id)
@@ -399,6 +404,8 @@ class Sketch:
                 kind = DimKind.ANGULAR
             else:
                 kind = DimKind.LINEAR
+        pivot_h0 = str(pivot_h0 or "")
+        pivot_h1 = str(pivot_h1 or "")
         for d in self.dimensions:
             if (
                 int(d.entity_id) == eid
@@ -408,6 +415,9 @@ class Sketch:
                 d.value_mm = val
                 d.kind = kind
                 d.entity_b_id = ebid
+                if pivot_h0 or pivot_h1:
+                    d.pivot_h0 = str(pivot_h0)
+                    d.pivot_h1 = str(pivot_h1)
                 return d
             # Angle is unordered pair
             if (
@@ -418,6 +428,14 @@ class Sketch:
             ):
                 d.value_mm = val
                 d.kind = kind
+                if pivot_h0 or pivot_h1:
+                    # Map pivots if entity order matches stored order
+                    if int(d.entity_id) == eid:
+                        d.pivot_h0 = str(pivot_h0)
+                        d.pivot_h1 = str(pivot_h1)
+                    else:
+                        d.pivot_h0 = str(pivot_h1)
+                        d.pivot_h1 = str(pivot_h0)
                 return d
         d = SketchDimension(
             id=self._next_dim_id,
@@ -426,6 +444,8 @@ class Sketch:
             role=role,
             value_mm=val,
             entity_b_id=ebid,
+            pivot_h0=str(pivot_h0 or ""),
+            pivot_h1=str(pivot_h1 or ""),
         )
         self._next_dim_id += 1
         self.dimensions.append(d)
@@ -576,28 +596,35 @@ def apply_dimension_value(
     raise ValueError(f"cannot apply role={role!r} on {type(ent).__name__}")
 
 
-def set_line_pair_angle(
-    a: LineEntity, b: LineEntity, degrees: float, *, move: str = "b"
-) -> None:
-    """Rotate line ``b`` (default) so the angle with ``a`` is ``degrees`` (0–180)."""
+def find_shared_line_endpoints(
+    a: LineEntity, b: LineEntity, *, tol: float = 1e-6
+) -> Optional[Tuple[str, str]]:
+    """If the lines meet at a corner, return (handle_on_a, handle_on_b), else None."""
+    for ha, pa in (("p0", a.p0), ("p1", a.p1)):
+        for hb, pb in (("p0", b.p0), ("p1", b.p1)):
+            if abs(pa[0] - pb[0]) <= tol and abs(pa[1] - pb[1]) <= tol:
+                return ha, hb
+    return None
+
+
+def _pick_direction_for_angle(
+    ref_dir: np.ndarray, current_dir: np.ndarray, degrees: float
+) -> np.ndarray:
+    """Unit direction at ``degrees`` from ``ref_dir``, closest to ``current_dir``."""
+    n0 = float(np.linalg.norm(ref_dir))
+    if n0 < 1e-12:
+        u0 = np.array([1.0, 0.0])
+    else:
+        u0 = ref_dir / n0
     target = float(degrees) % 180.0
     if target < 0:
         target += 180.0
-    d0 = line_direction(a)
-    n0 = float(np.linalg.norm(d0))
-    if n0 < 1e-12:
-        d0 = np.array([1.0, 0.0])
-        n0 = 1.0
-    u0 = d0 / n0
-    # Two candidate directions for b: rotate u0 by ±target
     rad = np.radians(target)
     c, s = float(np.cos(rad)), float(np.sin(rad))
     cand1 = np.array([u0[0] * c - u0[1] * s, u0[0] * s + u0[1] * c])
     cand2 = np.array([u0[0] * c + u0[1] * s, -u0[0] * s + u0[1] * c])
-    # Also 180-target gives same undirected angle with opposite sense — use closest to current b
-    d1 = line_direction(b)
-    n1 = float(np.linalg.norm(d1))
-    cur = d1 / n1 if n1 > 1e-12 else cand1
+    n1 = float(np.linalg.norm(current_dir))
+    cur = current_dir / n1 if n1 > 1e-12 else cand1
     best = cand1
     best_score = -1e9
     for cand in (cand1, cand2, -cand1, -cand2):
@@ -605,13 +632,98 @@ def set_line_pair_angle(
         if score > best_score:
             best_score = score
             best = cand
-    L = line_length(b)
+    return best
+
+
+def set_line_pair_angle(
+    a: LineEntity,
+    b: LineEntity,
+    degrees: float,
+    *,
+    move: str = "b",
+    pivot: Optional[Tuple[str, str]] = None,
+) -> None:
+    """Set the angle between lines ``a`` and ``b`` to ``degrees`` (0–180).
+
+    Rotates the line named by ``move`` (``'a'`` or ``'b'``).
+
+    If the lines share a corner (or ``pivot=(handle_a, handle_b)`` is given),
+    the moved line rotates about that shared endpoint so the corner stays put.
+    Only if there is no shared corner does it fall back to rotating about the
+    midpoint of the moved line.
+    """
+    if move not in ("a", "b"):
+        move = "b"
+    fixed_line, moved = (a, b) if move == "b" else (b, a)
+    shared = pivot if pivot is not None else find_shared_line_endpoints(a, b)
+    # Map shared handles onto moved/fixed
+    pivot_handle_moved: Optional[str] = None
+    if shared is not None:
+        ha, hb = shared
+        if move == "b":
+            pivot_handle_moved = hb
+            # Snap moved pivot to fixed line's shared end (preserve corner)
+            fixed_pt = a.p0 if ha == "p0" else a.p1
+            if hb == "p0":
+                moved.p0 = (float(fixed_pt[0]), float(fixed_pt[1]))
+            else:
+                moved.p1 = (float(fixed_pt[0]), float(fixed_pt[1]))
+        else:
+            pivot_handle_moved = ha
+            fixed_pt = b.p0 if hb == "p0" else b.p1
+            if ha == "p0":
+                moved.p0 = (float(fixed_pt[0]), float(fixed_pt[1]))
+            else:
+                moved.p1 = (float(fixed_pt[0]), float(fixed_pt[1]))
+
+    ref = line_direction(fixed_line)
+    cur = line_direction(moved)
+    best = _pick_direction_for_angle(ref, cur, degrees)
+    L = line_length(moved)
     if L < 1e-12:
         L = 1.0
-    mid = b.midpoint()
-    half = 0.5 * L
-    b.p0 = (mid[0] - best[0] * half, mid[1] - best[1] * half)
-    b.p1 = (mid[0] + best[0] * half, mid[1] + best[1] * half)
+
+    if pivot_handle_moved is not None:
+        # Rotate about shared corner only — free end swings, pivot stays.
+        # Line direction is always p1 - p0; pick sense of ``best`` that matches
+        # the previous free-end side of the moved line.
+        if pivot_handle_moved == "p0":
+            pivot_pt = np.array(
+                [moved.p0[0], moved.p0[1]], dtype=np.float64
+            )
+            free_cur = np.array(
+                [moved.p1[0] - pivot_pt[0], moved.p1[1] - pivot_pt[1]],
+                dtype=np.float64,
+            )
+            if float(np.dot(free_cur, best)) < 0:
+                best = -best
+            moved.p0 = (float(pivot_pt[0]), float(pivot_pt[1]))
+            moved.p1 = (
+                float(pivot_pt[0] + best[0] * L),
+                float(pivot_pt[1] + best[1] * L),
+            )
+        else:
+            pivot_pt = np.array(
+                [moved.p1[0], moved.p1[1]], dtype=np.float64
+            )
+            free_cur = np.array(
+                [moved.p0[0] - pivot_pt[0], moved.p0[1] - pivot_pt[1]],
+                dtype=np.float64,
+            )
+            # p1 fixed, p0 = p1 - best*L  ⇒ direction p1-p0 = best
+            if float(np.dot(free_cur, -best)) < 0:
+                best = -best
+            moved.p1 = (float(pivot_pt[0]), float(pivot_pt[1]))
+            moved.p0 = (
+                float(pivot_pt[0] - best[0] * L),
+                float(pivot_pt[1] - best[1] * L),
+            )
+    else:
+        # No shared corner: rotate about midpoint (disjoint lines only)
+        mid = moved.midpoint()
+        half = 0.5 * L
+        moved.p0 = (mid[0] - best[0] * half, mid[1] - best[1] * half)
+        moved.p1 = (mid[0] + best[0] * half, mid[1] + best[1] * half)
 
 
 def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -> str:
@@ -746,6 +858,8 @@ def snapshot_dimension(dim: SketchDimension) -> dict:
         "role": str(dim.role),
         "value_mm": float(dim.value_mm),
         "entity_b_id": int(getattr(dim, "entity_b_id", -1)),
+        "pivot_h0": str(getattr(dim, "pivot_h0", "") or ""),
+        "pivot_h1": str(getattr(dim, "pivot_h1", "") or ""),
     }
 
 
@@ -772,6 +886,8 @@ def restore_dimension(data: dict) -> SketchDimension:
         role=role,
         value_mm=float(data.get("value_mm", 0.0)),
         entity_b_id=int(data.get("entity_b_id", -1)),
+        pivot_h0=str(data.get("pivot_h0", "") or ""),
+        pivot_h1=str(data.get("pivot_h1", "") or ""),
     )
 
 

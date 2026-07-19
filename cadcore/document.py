@@ -310,6 +310,8 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
                 role=str(d.role),
                 value_mm=float(d.value_mm),
                 entity_b_id=int(getattr(d, "entity_b_id", -1)),
+                pivot_h0=str(getattr(d, "pivot_h0", "") or ""),
+                pivot_h1=str(getattr(d, "pivot_h1", "") or ""),
             )
         )
     from cadcore.constraints import restore_constraint, snapshot_constraint
@@ -1218,6 +1220,8 @@ class Document:
         role = str(role)
         ebid = int(entity_b_id)
         ent_b = None
+        pivot_h0 = ""
+        pivot_h1 = ""
         if role == "angle":
             if ebid < 0:
                 raise ValueError("angle dimension requires two lines")
@@ -1228,12 +1232,46 @@ class Document:
                 raise ValueError("angle dimension requires two lines")
             if int(entity_id) == ebid:
                 raise ValueError("angle dimension needs two different lines")
+            from cadcore.sketch import find_shared_line_endpoints
+
+            shared = find_shared_line_endpoints(ent, ent_b)
+            if shared is not None:
+                pivot_h0, pivot_h1 = shared
 
         before = snapshot_sketch_contents(sk)
+        # If lines already met at a corner, keep that corner (coincident + pivot)
+        if role == "angle" and pivot_h0 and pivot_h1:
+            from cadcore.constraints import (
+                ConstraintKind,
+                SketchConstraint,
+                add_constraint,
+            )
+
+            try:
+                add_constraint(
+                    sk,
+                    SketchConstraint(
+                        id=-1,
+                        kind=ConstraintKind.COINCIDENT,
+                        e0=int(entity_id),
+                        h0=str(pivot_h0),
+                        e1=int(ebid),
+                        h1=str(pivot_h1),
+                    ),
+                )
+            except ValueError:
+                # Already coincident or soft conflict — still use geometric pivot
+                pass
+
         # Seed geometry toward the target
         try:
             if role == "angle":
-                apply_dimension_value(ent, role, value_mm, ent_b=ent_b)
+                from cadcore.sketch import set_line_pair_angle
+
+                pivot = (pivot_h0, pivot_h1) if pivot_h0 and pivot_h1 else None
+                set_line_pair_angle(
+                    ent, ent_b, float(value_mm), move="b", pivot=pivot
+                )
             else:
                 apply_dimension_value(ent, role, value_mm)
         except ValueError as exc:
@@ -1245,6 +1283,8 @@ class Document:
             role,
             float(value_mm),
             entity_b_id=ebid,
+            pivot_h0=pivot_h0,
+            pivot_h1=pivot_h1,
         )
         residual = solve_sketch(sk, max_iters=80)
         # Angle residual is in degrees; length residual in mm
@@ -1256,6 +1296,22 @@ class Document:
                 f"conflicts with existing constraints/dimensions "
                 f"(residual {residual:.4g}). Sketch left unchanged."
             )
+        # Corner integrity: if we promised a pivot, endpoints must still meet
+        if role == "angle" and pivot_h0 and pivot_h1:
+            from cadcore.sketch import find_shared_line_endpoints
+
+            ent2 = sk.find_entity(int(entity_id))
+            ent_b2 = sk.find_entity(int(ebid))
+            if (
+                isinstance(ent2, LineEntity)
+                and isinstance(ent_b2, LineEntity)
+                and find_shared_line_endpoints(ent2, ent_b2) is None
+            ):
+                restore_sketch_contents(sk, before)
+                raise ValueError(
+                    "cannot apply angle dimension: the shared corner would open. "
+                    "Sketch left unchanged."
+                )
         after = snapshot_sketch_contents(sk)
         self.push_command(SketchContentsCommand(sketch_id, before, after))
         return dim
