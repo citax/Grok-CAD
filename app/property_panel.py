@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -81,6 +82,13 @@ class PropertyPanel(QWidget):
         self._selection_label = QLabel("")
         self._selection_label.setObjectName("fieldValue")
         self._selection_label.setWordWrap(True)
+        self._selection_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self._selection_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
+        self._selection_label.setMinimumHeight(0)
         self._selection_label.hide()
         self._form.addRow(self._lbl("Selection"), self._selection_label)
 
@@ -94,6 +102,13 @@ class PropertyPanel(QWidget):
         self._hint = QLabel("Nothing selected.")
         self._hint.setObjectName("secondaryLabel")
         self._hint.setWordWrap(True)
+        self._hint.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self._hint.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
+        self._hint.setMinimumHeight(0)
         self._form.addRow(self._hint)
 
         btn_row = QHBoxLayout()
@@ -122,6 +137,28 @@ class PropertyPanel(QWidget):
         l = QLabel(text)
         l.setObjectName("fieldLabel")
         return l
+
+    def _fit_wrapped_label(self, label: QLabel, *, min_lines: int = 1) -> None:
+        """Ensure wrapped labels are tall enough that text is never vertically clipped.
+
+        QFormLayout often sizes multi-line QLabels before the final width is known,
+        which clips the bottom of the glyphs. heightForWidth fixes that.
+        """
+        label.setWordWrap(True)
+        # Prefer the label's current width; fall back to a typical PropertyManager width
+        w = int(label.width())
+        if w < 40:
+            # Dock panel body is typically ~220–280px; leave room for the form label
+            host_w = int(self.width()) if self.width() > 80 else 260
+            w = max(160, host_w - 100)
+        # Qt heightForWidth includes the text layout; add padding for the styled box
+        h = int(label.heightForWidth(w))
+        fm = label.fontMetrics()
+        line_h = max(fm.height() + fm.leading(), 16)
+        pad = 16  # matches fieldValue vertical padding (≈8 top + 8 bottom)
+        floor = min_lines * line_h + pad
+        label.setMinimumHeight(max(h + 4, floor))
+        label.updateGeometry()
 
     def set_document(self, doc: Document) -> None:
         self._doc = doc
@@ -161,6 +198,7 @@ class PropertyPanel(QWidget):
             "Select a feature in the tree or viewport, or start a command "
             "(Sketch, Extrude, Cut, Fillet…)."
         )
+        self._fit_wrapped_label(self._hint, min_lines=3)
         self._set_mode_buttons(apply=False, ok=False)
         self._building = False
 
@@ -181,6 +219,7 @@ class PropertyPanel(QWidget):
             "Reference plane — fixed document geometry.\n"
             "Not renameable or editable. Select a plane and click Sketch to draw on it."
         )
+        self._fit_wrapped_label(self._hint, min_lines=2)
         self._set_mode_buttons(apply=False, ok=False)
         self._building = False
 
@@ -265,6 +304,14 @@ class PropertyPanel(QWidget):
             self._add_checkbox("through_all", "Through all", bool(f.through_all))
             self._add_checkbox("reversed", "Reverse direction", bool(f.reversed))
             self._hint.setText("Edit cut depth / through-all, then Apply.")
+        elif f.type is FeatureType.EDGE_FILLET:
+            n = len(getattr(f, "edge_keys", None) or [])
+            self._add_length("radius", "Radius", f.radius, unit)
+            self._add_number("segments", "Arc segments", int(f.segments))
+            self._hint.setText(
+                f"Solid edge fillet — {n} edge{'s' if n != 1 else ''}. "
+                "Edit radius, then Apply."
+            )
         elif f.type is FeatureType.FILLET:
             self._add_length("radius", "Radius", f.radius, unit)
             self._add_length("depth", "Depth", f.depth, unit)
@@ -289,6 +336,7 @@ class PropertyPanel(QWidget):
         else:
             self._hint.setText("—")
             self.btn_apply.setEnabled(False)
+        self._fit_wrapped_label(self._hint, min_lines=2)
         self._building = False
 
     def show_sketch_line(
@@ -308,6 +356,7 @@ class PropertyPanel(QWidget):
         self._clear_dyn()
         self._add_length("line_len", "Length", line_length(ent), unit)
         self._hint.setText("Type exact length, then Apply.")
+        self._fit_wrapped_label(self._hint, min_lines=1)
         self._set_mode_buttons(apply=True, ok=False)
         self._building = False
 
@@ -335,6 +384,7 @@ class PropertyPanel(QWidget):
         self.prop_type.setText("Command")
         self._selection_label.setText(selection_text or "Nothing selected yet.")
         self._selection_label.show()
+        self._fit_wrapped_label(self._selection_label, min_lines=2)
         self._clear_dyn()
 
         if command in ("extrude", "cut"):
@@ -347,8 +397,8 @@ class PropertyPanel(QWidget):
                 "reversed", "Reverse direction", bool(defaults.get("reversed", False))
             )
         elif command == "fillet":
+            # Solid edge fillet — radius only (no sketch depth)
             self._add_length("radius", "Radius", float(defaults.get("radius", 2.0)), unit)
-            self._add_length("depth", "Depth", float(defaults.get("depth", 10.0)), unit)
             self._add_number("segments", "Arc segments", int(defaults.get("segments", 32)))
         elif command == "revolve":
             self._add_number("angle", "Angle (°)", float(defaults.get("angle", 360.0)))
@@ -365,10 +415,17 @@ class PropertyPanel(QWidget):
         if ready:
             self._hint.setText("Adjust settings, then OK to apply — or Cancel.")
         else:
-            self._hint.setText(
-                "Select what this feature acts on (sketch / solid), "
-                "then adjust settings and press OK. Cancel exits the command."
-            )
+            if command == "fillet":
+                self._hint.setText(
+                    "Click edges on a solid to fillet, set the radius, "
+                    "then press OK. Cancel exits the command."
+                )
+            else:
+                self._hint.setText(
+                    "Select what this feature acts on (sketch / solid), "
+                    "then adjust settings and press OK. Cancel exits the command."
+                )
+        self._fit_wrapped_label(self._hint, min_lines=2)
         self._set_mode_buttons(apply=False, ok=ready)
         # Allow OK only when selection is ready; user can still cancel
         self.btn_ok.setEnabled(ready)
@@ -380,13 +437,20 @@ class PropertyPanel(QWidget):
         if self._mode != "command":
             return
         self._selection_label.setText(selection_text)
+        self._fit_wrapped_label(self._selection_label, min_lines=2)
         self.btn_ok.setEnabled(ready)
         if ready:
             self._hint.setText("Selection ready. Adjust settings, then OK — or Cancel.")
         else:
-            self._hint.setText(
-                "Select what this feature acts on, then OK. Cancel exits."
-            )
+            if self._command == "fillet":
+                self._hint.setText(
+                    "Click edges on a solid to fillet, then OK. Cancel exits."
+                )
+            else:
+                self._hint.setText(
+                    "Select what this feature acts on, then OK. Cancel exits."
+                )
+        self._fit_wrapped_label(self._hint, min_lines=2)
 
     def read_command_params(self) -> dict:
         """Read typed values for the active command. Raises ValueError if invalid."""
@@ -402,7 +466,6 @@ class PropertyPanel(QWidget):
                 out["through_all"] = self._read_bool("through_all")
         elif cmd == "fillet":
             out["radius"] = self._read_length_mm("radius", unit)
-            out["depth"] = self._read_length_mm("depth", unit)
             out["segments"] = self._read_int("segments")
         elif cmd == "revolve":
             out["angle"] = self._read_float("angle")
@@ -464,6 +527,9 @@ class PropertyPanel(QWidget):
                 params["depth"] = self._read_length_mm("depth", unit)
                 params["through_all"] = self._read_bool("through_all")
                 params["reversed"] = self._read_bool("reversed")
+            elif f.type is FeatureType.EDGE_FILLET:
+                params["radius"] = self._read_length_mm("radius", unit)
+                params["segments"] = self._read_int("segments")
             elif f.type is FeatureType.FILLET:
                 params["radius"] = self._read_length_mm("radius", unit)
                 params["depth"] = self._read_length_mm("depth", unit)

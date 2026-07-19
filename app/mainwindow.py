@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -453,7 +454,7 @@ class MainWindow(QMainWindow):
             fa_icon("fa5s.circle-notch", color=ACCENT), "Fillet", self
         )
         self.act_fillet.setToolTip(
-            "Fillet closed profile corners, then extrude into a solid (F)"
+            "Round edges on a solid — select edges, set radius, OK (F)"
         )
         self.act_fillet.setShortcut(QKeySequence("F"))
         self.act_fillet.triggered.connect(self._fillet)
@@ -1042,6 +1043,8 @@ class MainWindow(QMainWindow):
             "sketch_id": -1,
             "target_id": -1,
             "profile_id": -1,
+            "edge_keys": [],  # solid edge fillet multi-select
+            "solid_id": -1,
         }
         titles = {
             "extrude": "Extrude (Boss/Base)",
@@ -1050,10 +1053,21 @@ class MainWindow(QMainWindow):
             "revolve": "Revolve",
             "pocket": "Pocket",
         }
+        if kind == "fillet":
+            sel_text = "Click edges on a solid to fillet…"
+            status = (
+                "Fillet: click solid edges, set radius, OK — Esc cancels"
+            )
+        else:
+            sel_text = "Select a sketch with a closed profile…"
+            status = (
+                f"{titles.get(kind, kind)}: select a sketch, set parameters, "
+                "OK — Esc cancels"
+            )
         self.props.show_command(
             kind,
             title=titles.get(kind, kind.title()),
-            selection_text="Select a sketch with a closed profile…",
+            selection_text=sel_text,
             unit=self.doc.display_unit,
             defaults={
                 "depth": 10.0,
@@ -1067,10 +1081,7 @@ class MainWindow(QMainWindow):
         )
         # Prefer current selection
         self._update_command_from_selection(self.doc.selected_id)
-        self.statusBar().showMessage(
-            f"{titles.get(kind, kind)}: select a sketch, set parameters, OK — Esc cancels",
-            6000,
-        )
+        self.statusBar().showMessage(status, 6000)
 
     def _cancel_feature_cmd(self) -> None:
         self._feature_cmd = None
@@ -1088,6 +1099,12 @@ class MainWindow(QMainWindow):
             return
         kind = cmd["kind"]
         f = self.doc.find(fid)
+
+        # ----- Solid edge fillet: pick edges on a solid -----
+        if kind == "fillet":
+            self._try_add_fillet_edge(fid)
+            return
+
         # Sketch selection
         if f is not None and f.type is FeatureType.SKETCH and f.sketch is not None:
             cmd["sketch_id"] = f.id
@@ -1151,6 +1168,125 @@ class MainWindow(QMainWindow):
             "Select a sketch with a closed profile…", ready=False
         )
 
+    def _try_add_fillet_edge(self, fid: int) -> None:
+        """During Fillet command: resolve nearest convex edge at the last pick point."""
+        cmd = self._feature_cmd
+        if cmd is None or cmd.get("kind") != "fillet":
+            return
+        from cadcore.edge_fillet import extract_convex_edges, pick_edge_near_point
+
+        f = self.doc.find(fid)
+        if f is None or not is_solid_feature(f.type):
+            n = len(cmd.get("edge_keys") or [])
+            if n:
+                solid = self.doc.find(int(cmd.get("solid_id", -1)))
+                sname = solid.name if solid else "solid"
+                self.props.update_command_selection(
+                    f"Solid: {sname}\n{n} edge{'s' if n != 1 else ''} selected",
+                    ready=True,
+                )
+            else:
+                self.props.update_command_selection(
+                    "Click edges on a solid to fillet…", ready=False
+                )
+            return
+
+        # Fillet the solid as selected (including a prior Edge Fillet result)
+        solid_id = int(fid)
+
+        pick_pt = None
+        try:
+            pick_pt = self.viewport.last_pick_point()
+        except Exception:
+            pick_pt = None
+        if pick_pt is None:
+            # No 3D pick (e.g. tree click) — just bind the solid
+            cmd["solid_id"] = solid_id
+            n = len(cmd.get("edge_keys") or [])
+            solid = self.doc.find(solid_id)
+            sname = solid.name if solid else f"id {solid_id}"
+            if n:
+                self.props.update_command_selection(
+                    f"Solid: {sname}\n{n} edge{'s' if n != 1 else ''} selected",
+                    ready=True,
+                )
+            else:
+                self.props.update_command_selection(
+                    f"Solid: {sname}\nClick near an edge to add it",
+                    ready=False,
+                )
+            return
+
+        # Mesh for edge extraction: evaluate the solid being filleted
+        body = self.doc.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            cache = getattr(self.viewport, "_solid_mesh_cache", {}).get(fid)
+            if cache is None:
+                self.props.update_command_selection(
+                    "Selected solid has no mesh yet", ready=False
+                )
+                return
+            import numpy as np
+            from cadcore.mesh import Mesh
+
+            body = Mesh(np.asarray(cache[0]), np.asarray(cache[1]))
+
+        edges = extract_convex_edges(body.vertices, body.faces)
+        if not edges:
+            self.props.update_command_selection(
+                "No sharp convex edges found on this solid", ready=False
+            )
+            return
+        # Pick tolerance: fraction of model size
+        import numpy as np
+
+        bb = body.vertices.max(axis=0) - body.vertices.min(axis=0)
+        diag = float(np.linalg.norm(bb)) if np.any(bb > 0) else 10.0
+        max_dist = max(0.5, 0.04 * diag)
+        edge = pick_edge_near_point(edges, pick_pt, max_dist=max_dist)
+        if edge is None:
+            solid = self.doc.find(solid_id)
+            sname = solid.name if solid else f"id {solid_id}"
+            n = len(cmd.get("edge_keys") or [])
+            self.props.update_command_selection(
+                f"Solid: {sname}\n"
+                f"No edge near click ({n} selected). Click closer to an edge.",
+                ready=n > 0,
+            )
+            cmd["solid_id"] = solid_id
+            return
+
+        # Switching solids clears prior edge picks
+        if int(cmd.get("solid_id", -1)) not in (-1, solid_id):
+            cmd["edge_keys"] = []
+        cmd["solid_id"] = solid_id
+        key = edge.key()
+        keys: list = list(cmd.get("edge_keys") or [])
+        if key in keys:
+            keys.remove(key)
+        else:
+            keys.append(key)
+        cmd["edge_keys"] = keys
+        solid = self.doc.find(solid_id)
+        sname = solid.name if solid else f"id {solid_id}"
+        n = len(keys)
+        L = edge.length()
+        if n:
+            self.props.update_command_selection(
+                f"Solid: {sname}\n"
+                f"{n} edge{'s' if n != 1 else ''} selected "
+                f"(last L={L:.3g} mm)",
+                ready=True,
+            )
+            self.statusBar().showMessage(
+                f"Fillet: {n} edge(s) on {sname} — set radius and OK", 4000
+            )
+        else:
+            self.props.update_command_selection(
+                f"Solid: {sname}\nClick near an edge to add it",
+                ready=False,
+            )
+
     def _on_command_ok(self) -> None:
         cmd = self._feature_cmd
         if cmd is None:
@@ -1161,6 +1297,54 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Command", f"Invalid parameter:\n{exc}")
             return
         kind = cmd["kind"]
+
+        # ----- Solid edge fillet (no sketch) -----
+        if kind == "fillet":
+            solid_id = int(cmd.get("solid_id", -1))
+            edge_keys = list(cmd.get("edge_keys") or [])
+            if solid_id < 0 or self.doc.find(solid_id) is None:
+                QMessageBox.warning(
+                    self,
+                    "Fillet",
+                    "Select a solid and click at least one edge before pressing OK.",
+                )
+                return
+            if not edge_keys:
+                QMessageBox.warning(
+                    self,
+                    "Fillet",
+                    "Click one or more edges on the solid, then press OK.",
+                )
+                return
+            created = None
+            try:
+                created = self.doc.create_edge_fillet(
+                    solid_id,
+                    edge_keys,
+                    float(params["radius"]),
+                    segments=int(params.get("segments", 32)),
+                )
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Fillet failed",
+                    f"Could not apply the fillet:\n\n{exc}\n\n"
+                    "The part was not changed. Try a smaller radius or different edges.",
+                )
+                self.statusBar().showMessage(f"Fillet failed: {exc}", 5000)
+                return
+            self._feature_cmd = None
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+            self._refresh_tree()
+            if created is not None:
+                self._sync_selection(created.id)
+            self._update_window_title()
+            self.statusBar().showMessage(
+                f"Created {created.name}" if created else "Done", 3000
+            )
+            return
+
         sid = int(cmd.get("sketch_id", -1))
         skf = self.doc.find(sid)
         if skf is None or skf.sketch is None:
@@ -1202,14 +1386,6 @@ class MainWindow(QMainWindow):
                     profile_entity_id=int(cmd.get("profile_id", -1)),
                     reversed=bool(params.get("reversed", False)),
                     through_all=bool(params.get("through_all", False)),
-                )
-            elif kind == "fillet":
-                created = self.doc.create_fillet(
-                    sid,
-                    float(params["depth"]),
-                    float(params["radius"]),
-                    segments=int(params.get("segments", 32)),
-                    profile_entity_id=int(cmd.get("profile_id", -1)),
                 )
             elif kind == "revolve":
                 created = self.doc.create_revolve(
@@ -1277,9 +1453,31 @@ class MainWindow(QMainWindow):
         dirty = " *" if self.doc.dirty else ""
         self.setWindowTitle(f"Grok CAD — {name}{dirty}")
 
+    @staticmethod
+    def _is_unattended() -> bool:
+        """True when no human can answer modal dialogs (CI / automated runs).
+
+        Humans still get the unsaved-changes prompt. Automated runs must always
+        be able to exit — set GROK_CAD_UNATTENDED=1, or use the offscreen Qt
+        platform (typical for headless verification).
+        """
+        flag = os.environ.get("GROK_CAD_UNATTENDED", "").strip().lower()
+        if flag in ("1", "true", "yes", "on"):
+            return True
+        if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() == "offscreen":
+            return True
+        return False
+
     def _confirm_discard_if_dirty(self) -> bool:
         """Return True if it is safe to discard the current document."""
         if not self.doc.dirty:
+            return True
+        # Automated / headless: discard without blocking (never leave a dialog up).
+        if self._is_unattended():
+            print(
+                "[mainwindow] unattended: discarding unsaved changes (no dialog)",
+                file=sys.stderr,
+            )
             return True
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)

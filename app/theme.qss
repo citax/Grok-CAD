@@ -267,8 +267,16 @@ QLabel#fieldValue {
     background-color: @BG_ELEVATED;
     border: 1px solid @BORDER;
     border-radius: 6px;
-    padding: 6px 10px;
-    min-height: 18px;
+    /* Padding + min-height must leave room for a full line of glyphs;
+       previously min-height:18 with padding:6 clipped descenders. */
+    padding: 8px 10px;
+    min-height: 22px;
+}
+QLabel#secondaryLabel {
+    /* Multi-line command hints must not clip the last line */
+    padding-top: 2px;
+    padding-bottom: 4px;
+    min-height: 1.3em;
 }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: @BG_ELEVATED;

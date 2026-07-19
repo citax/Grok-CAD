@@ -125,6 +125,7 @@ def serialize_feature(f: Feature) -> dict:
         "hole_center_u": float(f.hole_center_u),
         "hole_center_v": float(f.hole_center_v),
         "source_profile_uv": [[float(p[0]), float(p[1])] for p in (f.source_profile_uv or [])],
+        "edge_keys": [str(k) for k in (getattr(f, "edge_keys", None) or [])],
         "visible": bool(f.visible),
         "suppressed": bool(f.suppressed),
         "sketch": serialize_sketch(f.sketch) if f.sketch is not None else None,
@@ -168,6 +169,7 @@ def deserialize_feature(data: dict) -> Feature:
         hole_center_u=float(data.get("hole_center_u", 0.0)),
         hole_center_v=float(data.get("hole_center_v", 0.0)),
         source_profile_uv=[(float(p[0]), float(p[1])) for p in src],
+        edge_keys=[str(k) for k in (data.get("edge_keys") or [])],
         visible=bool(data.get("visible", True)),
         suppressed=bool(data.get("suppressed", False)),
     )

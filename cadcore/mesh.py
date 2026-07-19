@@ -290,10 +290,11 @@ def make_sphere(radius: float, segments: int = 32, rings: int = 16) -> Mesh:
 
 
 def make_cylinder(radius: float, height: float, segments: int = 32) -> Mesh:
-    """Cylinder along +Y, centered at origin."""
+    """Cylinder along +Z, centered at origin (manifold3d convention)."""
     if Manifold is None:
         raise RuntimeError("manifold3d is not installed")
     # cylinder(height, radius_low, radius_high, circular_segments, center)
+    # Axis is +Z; center=True → symmetric about origin along Z.
     man = Manifold.cylinder(
         float(height), float(radius), float(radius), max(3, int(segments)), True
     )

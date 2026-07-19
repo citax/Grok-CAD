@@ -52,6 +52,9 @@ def feature_fingerprint(f: Feature) -> str:
         parts.append(
             ";".join(f"{p[0]:.6g},{p[1]:.6g}" for p in f.source_profile_uv)
         )
+    # Solid edge fillet keys
+    if getattr(f, "edge_keys", None):
+        parts.append("ek:" + ";".join(str(k) for k in f.edge_keys))
     if f.type in (
         FeatureType.EXTRUDE,
         FeatureType.REVOLVE,
@@ -64,12 +67,31 @@ def feature_fingerprint(f: Feature) -> str:
     return "|".join(parts)
 
 
+def feature_fingerprint_with_deps(f: Feature, by_id: Dict[int, Feature]) -> str:
+    """Fingerprint including parent solid fingerprints (for EDGE_FILLET / CUT)."""
+    base = feature_fingerprint(f)
+    deps: list[str] = []
+    if f.type is FeatureType.EDGE_FILLET and int(f.operand_a) >= 0:
+        parent = by_id.get(int(f.operand_a))
+        if parent is not None:
+            deps.append("pa:" + feature_fingerprint(parent))
+    if f.type is FeatureType.CUT_EXTRUDE and int(f.operand_b) >= 0:
+        parent = by_id.get(int(f.operand_b))
+        if parent is not None:
+            deps.append("pb:" + feature_fingerprint(parent))
+    if not deps:
+        return base
+    return base + "|" + "|".join(deps)
+
+
 def _clone_feature_value(name: str, val: Any) -> Any:
     """Clone one Feature field for a worker-safe snapshot."""
     if name == "sketch":
         return copy_sketch(val)
     if name == "source_profile_uv":
         return [(float(p[0]), float(p[1])) for p in (val or [])]
+    if name == "edge_keys":
+        return [str(k) for k in (val or [])]
     if isinstance(val, tuple):
         return tuple(val)
     if isinstance(val, list):
@@ -180,6 +202,29 @@ def evaluate_solids_snapshot(
                     f.radius,
                     segments=max(3, int(f.segments)),
                 )
+        elif f.type is FeatureType.EDGE_FILLET:
+            from cadcore.edge_fillet import (
+                edges_from_keys,
+                extract_convex_edges,
+                fillet_edges,
+            )
+
+            body = eval_one(f.operand_a)
+            if body is None or body.empty:
+                cache[fid] = None
+                return None
+            try:
+                all_edges = extract_convex_edges(body.vertices, body.faces)
+                edges = edges_from_keys(all_edges, getattr(f, "edge_keys", None) or [])
+                mesh = fillet_edges(
+                    body,
+                    edges,
+                    float(f.radius),
+                    segments=max(8, int(f.segments)),
+                )
+            except Exception:
+                cache[fid] = None
+                return None
         elif f.type is FeatureType.POCKET:
             skf = by_id.get(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -294,6 +339,8 @@ def evaluate_solids_snapshot(
                 used.add(f.operand_b)
         if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
             used.add(f.operand_b)
+        if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:
+            used.add(f.operand_a)
 
     results: Dict[int, Tuple[np.ndarray, np.ndarray, str]] = {}
     for f in features:
@@ -319,7 +366,7 @@ def evaluate_solids_snapshot(
         results[f.id] = (
             np.ascontiguousarray(m.vertices, dtype=np.float64),
             np.ascontiguousarray(m.faces, dtype=np.int32),
-            feature_fingerprint(fp_feature),
+            feature_fingerprint_with_deps(fp_feature, by_id),
         )
     return results
 

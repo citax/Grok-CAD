@@ -2234,6 +2234,12 @@ class Viewport(QWidget):
     def face_pick_solid_id(self) -> int:
         return int(self._face_pick_solid_id)
 
+    def last_pick_point(self) -> Optional[np.ndarray]:
+        """World-space point from the last solid pick (for edge/face tools)."""
+        if self._face_pick_point is None:
+            return None
+        return np.asarray(self._face_pick_point, dtype=np.float64).reshape(3).copy()
+
     def clear_face_pick(self) -> None:
         self._face_pick_solid_id = -1
         self._face_pick_frame = None

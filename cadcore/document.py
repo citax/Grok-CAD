@@ -48,7 +48,8 @@ class FeatureType(Enum):
     SKETCH = auto()
     EXTRUDE = auto()  # pad closed sketch profile along plane normal
     REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
-    FILLET = auto()  # fillet closed profile corners, then extrude
+    FILLET = auto()  # legacy: fillet closed profile corners, then extrude
+    EDGE_FILLET = auto()  # SolidWorks-style: round edges on a solid
     POCKET = auto()  # circular through-hole pocket then extrude
     CUT_EXTRUDE = auto()  # SolidWorks Extruded Cut: remove material from a solid
     # Kernel primitives (not primary UI path)
@@ -68,7 +69,8 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.SKETCH: "Sketch",
         FeatureType.EXTRUDE: "Extrude",
         FeatureType.REVOLVE: "Revolve",
-        FeatureType.FILLET: "Fillet",
+        FeatureType.FILLET: "Fillet (sketch)",
+        FeatureType.EDGE_FILLET: "Fillet",
         FeatureType.POCKET: "Pocket",
         FeatureType.CUT_EXTRUDE: "Cut-Extrude",
         FeatureType.BOX: "Box",
@@ -113,6 +115,7 @@ def is_solid_feature(t: FeatureType) -> bool:
         FeatureType.EXTRUDE,
         FeatureType.REVOLVE,
         FeatureType.FILLET,
+        FeatureType.EDGE_FILLET,
         FeatureType.POCKET,
         FeatureType.CUT_EXTRUDE,
         FeatureType.BOX,
@@ -365,9 +368,11 @@ class Feature:
     # Cut-Extrude: operand_a = sketch, operand_b = solid being cut;
     # through_all = extend tool through the whole solid (ignores depth for tool size)
     through_all: bool = False
-    # Fillet: sharp source polygon in sketch UV (parametric radius edits)
+    # Fillet (sketch): sharp source polygon in sketch UV (parametric radius edits)
     # List of (u, v); not closed (first != last). Empty = resolve from sketch.
     source_profile_uv: List[Tuple[float, float]] = field(default_factory=list)
+    # Edge fillet (solid): stable edge keys on the parent solid (operand_a)
+    edge_keys: List[str] = field(default_factory=list)
     visible: bool = True
     suppressed: bool = False
 
@@ -1363,6 +1368,61 @@ class Document:
         )
         return f
 
+    def create_edge_fillet(
+        self,
+        solid_id: int,
+        edge_keys: List[str],
+        radius: float,
+        *,
+        segments: int = 32,
+    ) -> Feature:
+        """Round one or more edges on a solid (SolidWorks-style Fillet).
+
+        Validates the boolean fillet fully before committing the feature so a
+        failed radius / edge selection leaves the document unchanged.
+        """
+        from cadcore.edge_fillet import (
+            edges_from_keys,
+            extract_convex_edges,
+            fillet_edges,
+        )
+
+        parent = self.find(solid_id)
+        if parent is None or not is_solid_feature(parent.type):
+            raise ValueError("fillet requires a valid solid feature")
+        keys = [str(k) for k in (edge_keys or []) if str(k).strip()]
+        if not keys:
+            raise ValueError("select at least one edge on the solid to fillet")
+        rad = float(radius)
+        if not np.isfinite(rad) or rad <= 1e-12:
+            raise ValueError("fillet radius must be positive")
+        segs = max(8, int(segments))
+        body = self.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            raise ValueError("the selected solid has no mesh to fillet")
+        try:
+            all_edges = extract_convex_edges(body.vertices, body.faces)
+            edges = edges_from_keys(all_edges, keys)
+            # Full validate before history commit
+            _ = fillet_edges(body, edges, rad, segments=segs)
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"could not apply fillet: {exc}") from exc
+
+        self._fillet_count += 1
+        f = Feature(
+            type=FeatureType.EDGE_FILLET,
+            name=f"Fillet{self._fillet_count}",
+            radius=rad,
+            segments=segs,
+            operand_a=int(solid_id),
+            edge_keys=list(keys),
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
     def update_feature_params(self, fid: int, **params) -> bool:
         """Apply editable parameters on a solid feature (undoable) and re-sync sketch.
 
@@ -1415,6 +1475,20 @@ class Document:
                             setattr(f, k, v)
                     f.source_profile_uv = list(before["source_profile_uv"])
                     raise
+        # Edge fillet: re-validate radius/edges before committing the change
+        if f.type is FeatureType.EDGE_FILLET and (
+            "radius" in params or "segments" in params
+        ):
+            mesh = self.evaluate_feature(fid)
+            if mesh is None or mesh.empty:
+                for k, v in before.items():
+                    if k != "source_profile_uv":
+                        setattr(f, k, v)
+                f.source_profile_uv = list(before["source_profile_uv"])
+                raise ValueError(
+                    "fillet radius cannot be applied to the selected edges "
+                    "(geometry invalid for this radius)"
+                )
         after = {k: getattr(f, k) for k in keys if hasattr(f, k)}
         after["source_profile_uv"] = list(f.source_profile_uv)
         self.push_command(FeatureParamCommand(fid, before, after))
@@ -1645,6 +1719,27 @@ class Document:
                     f.radius,
                     segments=max(3, int(f.segments)),
                 )
+        elif f.type is FeatureType.EDGE_FILLET:
+            from cadcore.edge_fillet import (
+                edges_from_keys,
+                extract_convex_edges,
+                fillet_edges,
+            )
+
+            body = self.evaluate_feature(f.operand_a)
+            if body is None or body.empty:
+                return None
+            try:
+                all_edges = extract_convex_edges(body.vertices, body.faces)
+                edges = edges_from_keys(all_edges, f.edge_keys or [])
+                mesh = fillet_edges(
+                    body,
+                    edges,
+                    float(f.radius),
+                    segments=max(8, int(f.segments)),
+                )
+            except Exception:
+                return None
         elif f.type is FeatureType.POCKET:
             skf = self.find(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -1755,6 +1850,9 @@ class Document:
             # Cut consumes its target solid (like boolean difference operand)
             if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
                 used.add(f.operand_b)
+            # Edge fillet replaces its parent solid in the display
+            if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:
+                used.add(f.operand_a)
         out: Dict[int, Mesh] = {}
         for f in self.features:
             if not f.visible or f.suppressed or is_reference_plane(f.type):
