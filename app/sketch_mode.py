@@ -11,6 +11,7 @@ from typing import List, Optional, Set, Tuple
 import numpy as np
 
 from cadcore.sketch import (
+    ArcEntity,
     CircleEntity,
     EntityKind,
     Handle,
@@ -39,6 +40,7 @@ class SketchTool(Enum):
     LINE = auto()
     RECTANGLE = auto()
     CIRCLE = auto()
+    ARC = auto()
     DIMENSION = auto()  # Smart Dimension — click entity, value drives geometry
 
 
@@ -367,6 +369,34 @@ class SketchController:
             return _dist_point_segment(uv, e.p0, e.p1)
         if isinstance(e, CircleEntity):
             return abs(float(np.hypot(u - e.center[0], v - e.center[1]) - e.radius))
+        if isinstance(e, ArcEntity):
+            # Distance to arc curve: radial residual if angle on sweep, else to nearer end
+            dx, dy = u - e.center[0], v - e.center[1]
+            r = float(np.hypot(dx, dy))
+            ang = float(np.atan2(dy, dx))
+            # Is angle on arc?
+            def on_sweep(a: float) -> bool:
+                d0 = a - e.a0
+                de = e.sweep()
+                if e.ccw:
+                    while d0 < 0:
+                        d0 += 2 * np.pi
+                    while d0 >= 2 * np.pi:
+                        d0 -= 2 * np.pi
+                    return 0 <= d0 <= de + 1e-9
+                while d0 > 0:
+                    d0 -= 2 * np.pi
+                while d0 <= -2 * np.pi:
+                    d0 += 2 * np.pi
+                return de - 1e-9 <= d0 <= 0
+
+            if on_sweep(ang):
+                return abs(r - e.radius)
+            p0, p1 = e.p0(), e.p1()
+            return min(
+                float(np.hypot(u - p0[0], v - p0[1])),
+                float(np.hypot(u - p1[0], v - p1[1])),
+            )
         if isinstance(e, RectEntity):
             cs = e.corners()
             edges = [(cs[0], cs[1]), (cs[1], cs[2]), (cs[2], cs[3]), (cs[3], cs[0])]
@@ -575,7 +605,7 @@ class SketchController:
         ent = self.sketch.find_entity(self.drag.entity_id)
         if ent is None:
             return
-        if isinstance(ent, (LineEntity, RectEntity, CircleEntity)):
+        if isinstance(ent, (LineEntity, RectEntity, CircleEntity, ArcEntity)):
             ent.set_handle(self.drag.handle_name, uv)
             # Keep geometric relationships + driving dimensions after the drag
             if getattr(self.sketch, "constraints", None) or getattr(
@@ -639,7 +669,86 @@ class SketchController:
             self.sketch.add_circle(pts[0], max(r, 1e-6))
             self.draw = None
             return "Circle"
+        if tool is SketchTool.ARC and len(pts) >= 3:
+            p0 = (float(pts[0][0]), float(pts[0][1]))
+            mid = (float(pts[1][0]), float(pts[1][1]))
+            p1 = (float(pts[2][0]), float(pts[2][1]))
+            try:
+                arc = self.sketch.add_arc(p0, mid, p1)
+            except ValueError:
+                self.draw.points.pop()
+                return None
+            # If start lies on a line endpoint, auto coincident + tangent
+            self._maybe_auto_tangent_at_line(arc, end="p0")
+            self._maybe_auto_tangent_at_line(arc, end="p1")
+            self.draw = None
+            return "Arc"
         return None
+
+    def _maybe_auto_tangent_at_line(self, arc: ArcEntity, *, end: str) -> None:
+        """If arc end coincides with a line end, add coincident + tangent."""
+        from cadcore.constraints import (
+            ConstraintKind,
+            SketchConstraint,
+            add_constraint,
+        )
+
+        pt = arc.p0() if end == "p0" else arc.p1()
+        tol = max(self.snap_point_tol, 1e-6)
+        for e in self.sketch.entities:
+            if not isinstance(e, LineEntity) or e.id == arc.id:
+                continue
+            for lh, lp in (("p0", e.p0), ("p1", e.p1)):
+                if abs(lp[0] - pt[0]) > tol or abs(lp[1] - pt[1]) > tol:
+                    continue
+                # Snap exactly
+                if end == "p0":
+                    # keep arc end on line point via angle update
+                    v = np.array(
+                        [lp[0] - arc.center[0], lp[1] - arc.center[1]],
+                        dtype=np.float64,
+                    )
+                    n = float(np.linalg.norm(v))
+                    if n > 1e-12:
+                        arc.radius = n
+                        arc.a0 = float(np.atan2(v[1], v[0]))
+                else:
+                    v = np.array(
+                        [lp[0] - arc.center[0], lp[1] - arc.center[1]],
+                        dtype=np.float64,
+                    )
+                    n = float(np.linalg.norm(v))
+                    if n > 1e-12:
+                        arc.radius = n
+                        arc.a1 = float(np.atan2(v[1], v[0]))
+                try:
+                    add_constraint(
+                        self.sketch,
+                        SketchConstraint(
+                            id=-1,
+                            kind=ConstraintKind.COINCIDENT,
+                            e0=e.id,
+                            h0=lh,
+                            e1=arc.id,
+                            h1=end,
+                        ),
+                    )
+                except ValueError:
+                    pass
+                try:
+                    add_constraint(
+                        self.sketch,
+                        SketchConstraint(
+                            id=-1,
+                            kind=ConstraintKind.TANGENT,
+                            e0=e.id,
+                            e1=arc.id,
+                            h1=end,
+                        ),
+                    )
+                except ValueError:
+                    pass
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +814,8 @@ def _entity_sample_points(e: SketchEntity) -> List[Vec2]:
             (cx, cy - r),
             (cx, cy),
         ]
+    if isinstance(e, ArcEntity):
+        return e.sample_uv(12)
     return []
 
 
@@ -714,6 +825,9 @@ def _entity_segments(e: SketchEntity) -> List[Tuple[Vec2, Vec2]]:
     if isinstance(e, RectEntity):
         cs = e.corners()
         return [(cs[0], cs[1]), (cs[1], cs[2]), (cs[2], cs[3]), (cs[3], cs[0])]
+    if isinstance(e, ArcEntity):
+        pts = e.sample_uv(12)
+        return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
     return []
 
 
@@ -735,6 +849,8 @@ def _entity_fully_inside(
             and v0 <= cy - r
             and cy + r <= v1
         )
+    if isinstance(e, ArcEntity):
+        return all(_pt_in_rect(p, u0, v0, u1, v1) for p in e.sample_uv(16))
     return False
 
 

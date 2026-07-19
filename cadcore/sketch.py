@@ -68,6 +68,7 @@ class EntityKind(Enum):
     LINE = auto()
     RECTANGLE = auto()
     CIRCLE = auto()
+    ARC = auto()
 
 
 class DimKind(Enum):
@@ -76,6 +77,7 @@ class DimKind(Enum):
     LINEAR = auto()  # line length, or rect width/height
     DIAMETER = auto()  # circle diameter
     ANGULAR = auto()  # angle between two lines (degrees in value_mm)
+    RADIUS = auto()  # arc radius
 
 
 class HandleKind(Enum):
@@ -216,6 +218,187 @@ class CircleEntity(SketchEntity):
 
 
 @dataclass
+class ArcEntity(SketchEntity):
+    """Circular arc in sketch UV.
+
+    Stored as center, radius, start/end angles (radians from +U, CCW positive),
+    and ``ccw`` sense from start→end. Endpoints and mid-arc point are derived.
+    """
+
+    center: Vec2 = (0.0, 0.0)
+    radius: float = 1.0
+    a0: float = 0.0  # start angle (rad)
+    a1: float = np.pi / 2  # end angle (rad)
+    ccw: bool = True
+
+    def __post_init__(self) -> None:
+        self.kind = EntityKind.ARC
+        self.center = (float(self.center[0]), float(self.center[1]))
+        self.radius = max(1e-9, float(self.radius))
+        self.a0 = float(self.a0)
+        self.a1 = float(self.a1)
+        self.ccw = bool(self.ccw)
+
+    def p0(self) -> Vec2:
+        return (
+            self.center[0] + self.radius * float(np.cos(self.a0)),
+            self.center[1] + self.radius * float(np.sin(self.a0)),
+        )
+
+    def p1(self) -> Vec2:
+        return (
+            self.center[0] + self.radius * float(np.cos(self.a1)),
+            self.center[1] + self.radius * float(np.sin(self.a1)),
+        )
+
+    def sweep(self) -> float:
+        """Signed sweep angle from a0 to a1 in (−2π, 2π], nonzero."""
+        d = self.a1 - self.a0
+        if self.ccw:
+            while d <= 0:
+                d += 2 * np.pi
+            while d > 2 * np.pi:
+                d -= 2 * np.pi
+            if d < 1e-12:
+                d = 2 * np.pi
+            return d
+        while d >= 0:
+            d -= 2 * np.pi
+        while d < -2 * np.pi:
+            d += 2 * np.pi
+        if abs(d) < 1e-12:
+            d = -2 * np.pi
+        return d
+
+    def mid_uv(self) -> Vec2:
+        mid_a = self.a0 + 0.5 * self.sweep()
+        return (
+            self.center[0] + self.radius * float(np.cos(mid_a)),
+            self.center[1] + self.radius * float(np.sin(mid_a)),
+        )
+
+    def sample_uv(self, n: int = 24) -> List[Vec2]:
+        """Polyline samples from p0 to p1 along the arc (inclusive)."""
+        n = max(2, int(n))
+        sw = self.sweep()
+        pts: List[Vec2] = []
+        for i in range(n + 1):
+            t = i / n
+            a = self.a0 + t * sw
+            pts.append(
+                (
+                    self.center[0] + self.radius * float(np.cos(a)),
+                    self.center[1] + self.radius * float(np.sin(a)),
+                )
+            )
+        return pts
+
+    def tangent_at_start(self) -> np.ndarray:
+        """Unit tangent at p0 pointing into the arc (toward the curve)."""
+        # Radial out: (cos a0, sin a0); CCW tangent (-sin, cos); CW (sin, -cos)
+        c, s = float(np.cos(self.a0)), float(np.sin(self.a0))
+        if self.ccw:
+            t = np.array([-s, c], dtype=np.float64)
+        else:
+            t = np.array([s, -c], dtype=np.float64)
+        n = float(np.linalg.norm(t))
+        return t / n if n > 1e-15 else t
+
+    def tangent_at_end(self) -> np.ndarray:
+        """Unit tangent at p1 pointing out of the arc (along travel)."""
+        c, s = float(np.cos(self.a1)), float(np.sin(self.a1))
+        if self.ccw:
+            t = np.array([-s, c], dtype=np.float64)
+        else:
+            t = np.array([s, -c], dtype=np.float64)
+        n = float(np.linalg.norm(t))
+        return t / n if n > 1e-15 else t
+
+    def handles(self) -> List[Handle]:
+        return [
+            Handle(self.id, "p0", HandleKind.ENDPOINT, self.p0()),
+            Handle(self.id, "p1", HandleKind.ENDPOINT, self.p1()),
+            Handle(self.id, "mid", HandleKind.MIDPOINT, self.mid_uv()),
+            Handle(self.id, "center", HandleKind.CENTER, self.center),
+        ]
+
+    def set_handle(self, name: str, uv: Vec2) -> None:
+        u, v = float(uv[0]), float(uv[1])
+        if name == "center":
+            self.center = (u, v)
+            return
+        if name == "p0":
+            # Keep center fixed; set a0 from new direction, keep radius from new point
+            dx, dy = u - self.center[0], v - self.center[1]
+            r = float(np.hypot(dx, dy))
+            if r < 1e-12:
+                return
+            self.radius = r
+            self.a0 = float(np.atan2(dy, dx))
+            return
+        if name == "p1":
+            dx, dy = u - self.center[0], v - self.center[1]
+            r = float(np.hypot(dx, dy))
+            if r < 1e-12:
+                return
+            self.radius = r
+            self.a1 = float(np.atan2(dy, dx))
+            return
+        if name == "mid":
+            # Rebuild arc through current p0, new mid, current p1
+            rebuilt = arc_from_three_points(self.p0(), (u, v), self.p1())
+            if rebuilt is not None:
+                self.center, self.radius, self.a0, self.a1, self.ccw = rebuilt
+
+    def translate(self, du: float, dv: float) -> None:
+        self.center = (self.center[0] + du, self.center[1] + dv)
+
+
+def arc_from_three_points(
+    p0: Vec2, mid: Vec2, p1: Vec2
+) -> Optional[Tuple[Vec2, float, float, float, bool]]:
+    """Build (center, radius, a0, a1, ccw) through three non-collinear points.
+
+    ``mid`` is a point on the arc between the endpoints (not necessarily midpoint).
+    Returns None if points are collinear or degenerate.
+    """
+    ax, ay = float(p0[0]), float(p0[1])
+    bx, by = float(mid[0]), float(mid[1])
+    cx, cy = float(p1[0]), float(p1[1])
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-14:
+        return None
+    a2 = ax * ax + ay * ay
+    b2 = bx * bx + by * by
+    c2 = cx * cx + cy * cy
+    ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
+    uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
+    center = (float(ux), float(uy))
+    radius = float(np.hypot(ax - ux, ay - uy))
+    if radius < 1e-12:
+        return None
+    a0 = float(np.atan2(ay - uy, ax - ux))
+    am = float(np.atan2(by - uy, bx - ux))
+    a1 = float(np.atan2(cy - uy, cx - ux))
+
+    def _delta_ccw(from_a: float, to_a: float) -> float:
+        d = to_a - from_a
+        while d < 0:
+            d += 2 * np.pi
+        while d >= 2 * np.pi:
+            d -= 2 * np.pi
+        return d
+
+    dm = _delta_ccw(a0, am)
+    de = _delta_ccw(a0, a1)
+    if de < 1e-12:
+        de = 2 * np.pi
+    # Mid lies on the CCW arc from a0 to a1 iff 0 < dm < de
+    ccw = 1e-12 < dm < de - 1e-12
+    return center, radius, a0, a1, ccw
+
+
+@dataclass
 class SketchDimension:
     """Driving dimension: stored value owns geometry when applied.
 
@@ -273,6 +456,25 @@ class Sketch:
         self.entities.append(e)
         return e
 
+    def add_arc(self, p0: Vec2, mid: Vec2, p1: Vec2) -> ArcEntity:
+        """Add a circular arc through three points (start, on-arc, end)."""
+        built = arc_from_three_points(p0, mid, p1)
+        if built is None:
+            raise ValueError("cannot build arc: points are collinear or coincident")
+        center, radius, a0, a1, ccw = built
+        e = ArcEntity(
+            id=self._next_entity_id,
+            kind=EntityKind.ARC,
+            center=center,
+            radius=radius,
+            a0=a0,
+            a1=a1,
+            ccw=ccw,
+        )
+        self._next_entity_id += 1
+        self.entities.append(e)
+        return e
+
     def find_entity(self, eid: int) -> Optional[SketchEntity]:
         for e in self.entities:
             if e.id == eid:
@@ -311,6 +513,8 @@ class Sketch:
                 pts.extend(e.corners())
             elif isinstance(e, CircleEntity):
                 pts.append(e.center)
+            elif isinstance(e, ArcEntity):
+                pts.extend([e.p0(), e.p1(), e.mid_uv()])
         return pts
 
     def unique_endpoints(self, *, tol: float = 1e-9) -> List[Vec2]:
@@ -323,6 +527,8 @@ class Sketch:
                 raw.extend(e.corners())
             elif isinstance(e, CircleEntity):
                 raw.append(e.center)
+            elif isinstance(e, ArcEntity):
+                raw.extend([e.p0(), e.p1()])
         out: List[Vec2] = []
         for p in raw:
             if any(abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol for q in out):
@@ -340,6 +546,8 @@ class Sketch:
                 raw.extend(e.corners())
             elif isinstance(e, CircleEntity):
                 raw.append(e.center)
+            elif isinstance(e, ArcEntity):
+                raw.extend([e.p0(), e.p1()])
         clusters: List[List[Vec2]] = []
         for p in raw:
             placed = False
@@ -400,6 +608,8 @@ class Sketch:
         if kind is None:
             if role == "diameter":
                 kind = DimKind.DIAMETER
+            elif role == "radius":
+                kind = DimKind.RADIUS
             elif role == "angle":
                 kind = DimKind.ANGULAR
             else:
@@ -560,6 +770,8 @@ def measure_dimension_value(
         return rect_height(ent)
     if isinstance(ent, CircleEntity) and role == "diameter":
         return float(ent.radius) * 2.0
+    if isinstance(ent, ArcEntity) and role == "radius":
+        return float(ent.radius)
     if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
         return line_angle_degrees_oriented(ent, ent_b)
     raise ValueError(f"cannot measure role={role!r} on {type(ent).__name__}")
@@ -589,6 +801,9 @@ def apply_dimension_value(
         return
     if isinstance(ent, CircleEntity) and role == "diameter":
         set_circle_diameter(ent, val)
+        return
+    if isinstance(ent, ArcEntity) and role == "radius":
+        ent.radius = max(1e-9, float(val))
         return
     if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
         set_line_pair_angle(ent, ent_b, val)
@@ -740,6 +955,8 @@ def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -
         return "length"
     if isinstance(ent, CircleEntity):
         return "diameter"
+    if isinstance(ent, ArcEntity):
+        return "radius"
     if isinstance(ent, RectEntity):
         if uv_hint is None:
             return "width"
@@ -787,6 +1004,8 @@ def dimension_anchor_uv(
         return (cu, v0 - 0.05 * max(v1 - v0, 1.0))
     if isinstance(ent, CircleEntity):
         return (ent.center[0] + ent.radius, ent.center[1])
+    if isinstance(ent, ArcEntity):
+        return ent.mid_uv()
     return (0.0, 0.0)
 
 
@@ -845,6 +1064,16 @@ def snapshot_entity(ent: SketchEntity) -> dict:
             "center": (float(ent.center[0]), float(ent.center[1])),
             "radius": float(ent.radius),
         }
+    if isinstance(ent, ArcEntity):
+        return {
+            "kind": "arc",
+            "id": int(ent.id),
+            "center": (float(ent.center[0]), float(ent.center[1])),
+            "radius": float(ent.radius),
+            "a0": float(ent.a0),
+            "a1": float(ent.a1),
+            "ccw": bool(ent.ccw),
+        }
     raise TypeError(f"unsupported entity type {type(ent)!r}")
 
 
@@ -875,6 +1104,8 @@ def restore_dimension(data: dict) -> SketchDimension:
         except KeyError:
             if role == "diameter":
                 kind = DimKind.DIAMETER
+            elif role == "radius":
+                kind = DimKind.RADIUS
             elif role == "angle":
                 kind = DimKind.ANGULAR
             else:
@@ -948,6 +1179,16 @@ def restore_entity(data: dict) -> SketchEntity:
             center=tuple(data["center"]),  # type: ignore[arg-type]
             radius=float(data["radius"]),
         )
+    if kind == "arc":
+        return ArcEntity(
+            id=eid,
+            kind=EntityKind.ARC,
+            center=tuple(data["center"]),  # type: ignore[arg-type]
+            radius=float(data["radius"]),
+            a0=float(data.get("a0", 0.0)),
+            a1=float(data.get("a1", np.pi / 2)),
+            ccw=bool(data.get("ccw", True)),
+        )
     raise ValueError(f"unknown entity kind {kind!r}")
 
 
@@ -965,6 +1206,9 @@ def offset_entity_data(data: dict, du: float, dv: float) -> dict:
     elif out["kind"] == "circle":
         c = out["center"]
         out["center"] = (c[0] + du, c[1] + dv)
+    elif out["kind"] == "arc":
+        c = out["center"]
+        out["center"] = (c[0] + du, c[1] + dv)
     return out
 
 
@@ -979,5 +1223,11 @@ def apply_entity_snapshot(ent: SketchEntity, data: dict) -> None:
     elif isinstance(ent, CircleEntity) and data["kind"] == "circle":
         ent.center = (float(data["center"][0]), float(data["center"][1]))
         ent.radius = max(1e-9, float(data["radius"]))
+    elif isinstance(ent, ArcEntity) and data["kind"] == "arc":
+        ent.center = (float(data["center"][0]), float(data["center"][1]))
+        ent.radius = max(1e-9, float(data["radius"]))
+        ent.a0 = float(data.get("a0", ent.a0))
+        ent.a1 = float(data.get("a1", ent.a1))
+        ent.ccw = bool(data.get("ccw", ent.ccw))
     else:
         raise ValueError("snapshot kind mismatch")

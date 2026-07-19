@@ -21,6 +21,7 @@ from cadcore.mesh import (
     revolve_profile,
 )
 from cadcore.sketch import (
+    ArcEntity,
     CircleEntity,
     DimKind,
     LineEntity,
@@ -301,6 +302,18 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
                     id=e.id, kind=e.kind, center=tuple(e.center), radius=float(e.radius)  # type: ignore[arg-type]
                 )
             )
+        elif isinstance(e, ArcEntity):
+            out.entities.append(
+                ArcEntity(
+                    id=e.id,
+                    kind=e.kind,
+                    center=tuple(e.center),  # type: ignore[arg-type]
+                    radius=float(e.radius),
+                    a0=float(e.a0),
+                    a1=float(e.a1),
+                    ccw=bool(e.ccw),
+                )
+            )
     for d in getattr(sk, "dimensions", None) or []:
         out.dimensions.append(
             SketchDimension(
@@ -338,6 +351,11 @@ def sketch_fingerprint(sk: Optional[Sketch]) -> str:
         elif isinstance(e, CircleEntity):
             parts.append(
                 f"C{e.id}:{e.center[0]:.6g},{e.center[1]:.6g},{e.radius:.6g}"
+            )
+        elif isinstance(e, ArcEntity):
+            parts.append(
+                f"A{e.id}:{e.center[0]:.6g},{e.center[1]:.6g},{e.radius:.6g},"
+                f"{e.a0:.6g},{e.a1:.6g},{int(e.ccw)}"
             )
     for c in getattr(sk, "constraints", None) or []:
         parts.append(

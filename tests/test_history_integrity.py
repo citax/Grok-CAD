@@ -49,21 +49,26 @@ def test_dimension_apply_undo_restores_value_and_geometry():
     doc, skf = _front_sketch()
     sk = skf.sketch
     line = sk.add_line((0, 0), (10, 0))
+    lid = line.id
     doc.record_entity_add(skf.id, line)
-    doc.apply_sketch_dimension(skf.id, line.id, "length", 20.0)
+    doc.apply_sketch_dimension(skf.id, lid, "length", 20.0)
+    line = sk.find_entity(lid)
     assert abs(line.p1[0] - line.p0[0]) == 20.0
     assert sk.dimensions[0].value_mm == 20.0
     doc.undo()
+    line = sk.find_entity(lid)
     assert abs(line.p1[0] - line.p0[0]) == 10.0
     # First apply created the dim — undo removes it (no prior dim)
     assert len(sk.dimensions) == 0
     doc.redo()
+    line = sk.find_entity(lid)
     assert abs(line.p1[0] - line.p0[0]) == 20.0
     assert sk.dimensions[0].value_mm == 20.0
     # Second apply then undo restores previous dim value
-    doc.apply_sketch_dimension(skf.id, line.id, "length", 30.0)
+    doc.apply_sketch_dimension(skf.id, lid, "length", 30.0)
     assert sk.dimensions[0].value_mm == 30.0
     doc.undo()
+    line = sk.find_entity(lid)
     assert abs(line.p1[0] - line.p0[0]) == 20.0
     assert sk.dimensions[0].value_mm == 20.0
 

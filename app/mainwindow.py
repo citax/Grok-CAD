@@ -495,6 +495,12 @@ class MainWindow(QMainWindow):
             (SketchTool.RECTANGLE, "Rectangle", "fa5s.vector-square", "Draw a rectangle"),
             (SketchTool.CIRCLE, "Circle", "fa5s.circle", "Draw a circle"),
             (
+                SketchTool.ARC,
+                "Arc",
+                "fa5s.circle-notch",
+                "Draw an arc (start → on-arc → end)",
+            ),
+            (
                 SketchTool.DIMENSION,
                 "Smart Dim",
                 "fa5s.ruler-combined",
@@ -697,6 +703,7 @@ class MainWindow(QMainWindow):
                 SketchTool.LINE: "fa5s.minus",
                 SketchTool.RECTANGLE: "fa5s.vector-square",
                 SketchTool.CIRCLE: "fa5s.circle",
+                SketchTool.ARC: "fa5s.circle-notch",
                 SketchTool.DIMENSION: "fa5s.ruler-combined",
             }[t]
             col = "#ffffff" if a.isChecked() else TEXT_PRIMARY
@@ -1935,6 +1942,7 @@ class MainWindow(QMainWindow):
             "width": "Width",
             "height": "Height",
             "diameter": "Diameter",
+            "radius": "Radius",
             "angle": "Angle",
         }.get(role, role.title())
         if role == "angle":
@@ -1984,6 +1992,8 @@ class MainWindow(QMainWindow):
             shown = format_length(store_val, unit)
             if role == "diameter":
                 shown = "⌀" + shown
+            elif role == "radius":
+                shown = "R" + shown
         self.statusBar().showMessage(
             f"{role_label} → {shown}" + (f"  (dim #{dim.id})" if dim else ""),
             3000,

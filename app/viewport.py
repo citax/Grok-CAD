@@ -64,6 +64,7 @@ from cadcore.scale import (
     sketch_parallel_scale,
 )
 from cadcore.sketch import (
+    ArcEntity,
     CircleEntity,
     LineEntity,
     PlaneFrame,
@@ -176,6 +177,9 @@ def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
                 ent.center[1] + ent.radius * np.sin(a),
             )
             pts.append(fr.to_world(uv))
+        return pv.lines_from_points(np.array(pts, float), close=False)
+    if isinstance(ent, ArcEntity):
+        pts = [fr.to_world(uv) for uv in ent.sample_uv(32)]
         return pv.lines_from_points(np.array(pts, float), close=False)
     return pv.PolyData()
 
@@ -305,6 +309,11 @@ def _entity_fingerprint(ent: SketchEntity, *, selected: bool = False) -> str:
         g = f"R:{ent.c0[0]:.6g},{ent.c0[1]:.6g},{ent.c1[0]:.6g},{ent.c1[1]:.6g}"
     elif isinstance(ent, CircleEntity):
         g = f"C:{ent.center[0]:.6g},{ent.center[1]:.6g},{ent.radius:.6g}"
+    elif isinstance(ent, ArcEntity):
+        g = (
+            f"A:{ent.center[0]:.6g},{ent.center[1]:.6g},{ent.radius:.6g},"
+            f"{ent.a0:.6g},{ent.a1:.6g},{int(ent.ccw)}"
+        )
     else:
         g = f"?{ent.id}"
     return f"{g}|sel={int(selected)}"
@@ -2147,6 +2156,8 @@ class Viewport(QWidget):
                 labels.append(f"{val:g}°")
             elif role == "diameter":
                 labels.append("⌀" + format_length(val, unit))
+            elif role == "radius":
+                labels.append("R" + format_length(val, unit))
             else:
                 labels.append(format_length(val, unit))
         # 2) Ephemeral selected/hovered line lengths (when no driving dim yet)
@@ -2205,6 +2216,8 @@ class Viewport(QWidget):
                 out.append(f"{val:g}°")
             elif role == "diameter":
                 out.append("⌀" + format_length(val, unit))
+            elif role == "radius":
+                out.append("R" + format_length(val, unit))
             else:
                 out.append(format_length(val, unit))
         show_ids = set(ctrl.selected_ids)
@@ -2438,6 +2451,29 @@ class Viewport(QWidget):
 
             r = RectEntity(id=-1, kind=EntityKind.RECTANGLE, c0=p0, c1=p1)
             pdata = _entity_polydata(r, ctrl.sketch)
+        elif ctrl.tool is SketchTool.ARC:
+            from cadcore.sketch import EntityKind, ArcEntity as AE, arc_from_three_points
+
+            pts = list(ctrl.draw.points)
+            if len(pts) == 1:
+                pdata = pv.Line(fr.to_world(p0), fr.to_world(p1))
+            else:
+                # pts[0]=start, pts[1]=on-arc, cursor=p1 as end
+                built = arc_from_three_points(pts[0], pts[1], p1)
+                if built is None:
+                    pdata = pv.Line(fr.to_world(pts[0]), fr.to_world(p1))
+                else:
+                    c, r, a0, a1, ccw = built
+                    arc = AE(
+                        id=-1,
+                        kind=EntityKind.ARC,
+                        center=c,
+                        radius=r,
+                        a0=a0,
+                        a1=a1,
+                        ccw=ccw,
+                    )
+                    pdata = _entity_polydata(arc, ctrl.sketch)
         else:
             from cadcore.sketch import EntityKind
 
@@ -2620,7 +2656,7 @@ class Viewport(QWidget):
                 "Smart Dimension: click a line, rectangle, or circle"
             )
             return
-        if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
+        if msg in ("Line", "LineClosed", "Rectangle", "Circle", "Arc"):
             if len(sk.entities) > n_before:
                 ent = sk.entities[-1]
                 if self._doc is not None and self._sketch_feature_id >= 0:

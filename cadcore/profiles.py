@@ -7,21 +7,24 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from cadcore.sketch import CircleEntity, LineEntity, RectEntity, Sketch, Vec2
+from cadcore.sketch import ArcEntity, CircleEntity, LineEntity, RectEntity, Sketch, Vec2
 
 ENDPOINT_TOL = 1e-6
+# Samples per arc when building a closed polygon for area / extrude
+ARC_POLY_SAMPLES = 24
 
 
 @dataclass(frozen=True)
 class ClosedLineLoop:
-    """Virtual closed profile from ordered, connected LineEntity segments.
+    """Virtual closed profile from ordered, connected line/arc segments.
 
     ``id`` is synthetic (negative) so it never collides with real entity ids.
     ``vertices`` are UV polygon corners in order (first != last; loop is implicit).
+    Arcs are tessellated into polyline samples in ``vertices``.
     """
 
     vertices: Tuple[Vec2, ...]
-    line_ids: Tuple[int, ...]
+    line_ids: Tuple[int, ...]  # entity ids of edges (lines and arcs)
     id: int = -1
 
     def __post_init__(self) -> None:
@@ -75,34 +78,68 @@ def _orient_ccw(verts: List[Vec2]) -> List[Vec2]:
     return verts
 
 
+def _edge_endpoints(e) -> Optional[Tuple[Vec2, Vec2]]:
+    if isinstance(e, LineEntity):
+        return e.p0, e.p1
+    if isinstance(e, ArcEntity):
+        return e.p0(), e.p1()
+    return None
+
+
+def _edge_polyline(e, *, from_uv: Vec2, to_uv: Vec2, n: int = ARC_POLY_SAMPLES) -> List[Vec2]:
+    """Polyline for an edge traveled from ``from_uv`` to ``to_uv`` (exclude start)."""
+    if isinstance(e, LineEntity):
+        return [(float(to_uv[0]), float(to_uv[1]))]
+    if isinstance(e, ArcEntity):
+        samples = e.sample_uv(n)
+        # sample_uv goes p0→p1; reverse if we travel p1→p0
+        if _qkey(from_uv) == _qkey(e.p1()) and _qkey(to_uv) == _qkey(e.p0()):
+            samples = list(reversed(samples))
+        # drop first (already at from_uv)
+        return [(float(p[0]), float(p[1])) for p in samples[1:]]
+    return [(float(to_uv[0]), float(to_uv[1]))]
+
+
 def find_closed_line_loops(
     sketch: Sketch,
     *,
     tol: float = ENDPOINT_TOL,
 ) -> List[ClosedLineLoop]:
-    """Detect closed polyline loops from LineEntity segments.
+    """Detect closed loops from LineEntity and ArcEntity edges.
 
     Raises:
         ValueError: branching (vertex degree > 2) or self-intersecting loop.
     Open chains are not returned (callers may raise via ``list_closed_profiles``).
     """
-    lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
-    if not lines:
+    edges = [
+        e
+        for e in sketch.entities
+        if isinstance(e, (LineEntity, ArcEntity))
+    ]
+    if not edges:
         return []
 
-    # adj[key] -> list of (other_key, line_id, from_uv, to_uv)
-    adj: Dict[Tuple[float, float], List[Tuple[Tuple[float, float], int, Vec2, Vec2]]] = {}
-    for ln in lines:
-        k0, k1 = _qkey(ln.p0, tol), _qkey(ln.p1, tol)
+    # adj[key] -> list of (other_key, edge_id, from_uv, to_uv, entity)
+    adj: Dict[
+        Tuple[float, float],
+        List[Tuple[Tuple[float, float], int, Vec2, Vec2, object]],
+    ] = {}
+    by_id = {e.id: e for e in edges}
+    for e in edges:
+        ends = _edge_endpoints(e)
+        if ends is None:
+            continue
+        p0, p1 = ends
+        k0, k1 = _qkey(p0, tol), _qkey(p1, tol)
         if k0 == k1:
             continue
-        adj.setdefault(k0, []).append((k1, ln.id, ln.p0, ln.p1))
-        adj.setdefault(k1, []).append((k0, ln.id, ln.p1, ln.p0))
+        adj.setdefault(k0, []).append((k1, e.id, p0, p1, e))
+        adj.setdefault(k1, []).append((k0, e.id, p1, p0, e))
 
     for k, nbrs in adj.items():
         if len(nbrs) > 2:
             raise ValueError(
-                "branching: a vertex is shared by more than 2 line segments "
+                "branching: a vertex is shared by more than 2 segments "
                 f"(degree={len(nbrs)} at {k})"
             )
 
@@ -115,36 +152,32 @@ def find_closed_line_loops(
         if all(n[1] in used for n in adj[start]):
             continue
 
-        # Start along one unused edge
         start_edge = next(n for n in adj[start] if n[1] not in used)
         verts: List[Vec2] = []
         lids: List[int] = []
-        cur = start
-        prev_lid: Optional[int] = None
-        nkey, lid, from_uv, to_uv = start_edge
+        nkey, lid, from_uv, to_uv, ent = start_edge
         verts.append((float(from_uv[0]), float(from_uv[1])))
-        verts.append((float(to_uv[0]), float(to_uv[1])))
+        verts.extend(_edge_polyline(ent, from_uv=from_uv, to_uv=to_uv))
         lids.append(lid)
         used.add(lid)
         prev_lid = lid
         cur = nkey
 
         closed = False
-        for _ in range(len(lines) + 1):
-            if cur == start and len(lids) >= 3:
-                closed = True
-                break
-            # next edge: not reverse of previous line
+        for _ in range(len(edges) + 1):
+            if cur == start and len(lids) >= 2:
+                # Need at least 2 edges for line+arc slot, 3 for pure lines
+                if len(lids) >= 2:
+                    closed = True
+                    break
             options = [n for n in adj[cur] if n[1] != prev_lid]
             if not options:
                 break
-            # prefer unused
             options_u = [n for n in options if n[1] not in used]
             if not options_u:
-                # only way is reverse or already used — fail unless at start
                 break
-            nkey, lid, from_uv, to_uv = options_u[0]
-            verts.append((float(to_uv[0]), float(to_uv[1])))
+            nkey, lid, from_uv, to_uv, ent = options_u[0]
+            verts.extend(_edge_polyline(ent, from_uv=from_uv, to_uv=to_uv))
             lids.append(lid)
             used.add(lid)
             prev_lid = lid
@@ -155,7 +188,6 @@ def find_closed_line_loops(
                 used.discard(lid)
             continue
 
-        # Drop closing duplicate
         if len(verts) >= 2 and _qkey(verts[0], tol) == _qkey(verts[-1], tol):
             verts = verts[:-1]
         if len(verts) < 3:
@@ -167,13 +199,12 @@ def find_closed_line_loops(
             for j in range(i + 1, n):
                 if j == i or j == (i + 1) % n or i == (j + 1) % n:
                     continue
-                # adjacent edges share a vertex — skip
                 if abs(i - j) % n == 1 or abs(i - j) % n == n - 1:
                     continue
                 c, d = verts[j], verts[(j + 1) % n]
                 if _seg_intersect(a, b, c, d):
                     raise ValueError(
-                        "self-intersecting loop: line segments cross each other"
+                        "self-intersecting loop: segments cross each other"
                     )
 
         if abs(_shoelace(verts)) <= 1e-12:
@@ -185,12 +216,17 @@ def find_closed_line_loops(
 
 
 def has_open_line_chain(sketch: Sketch, *, tol: float = ENDPOINT_TOL) -> bool:
-    lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
-    if not lines:
+    edges = [
+        e for e in sketch.entities if isinstance(e, (LineEntity, ArcEntity))
+    ]
+    if not edges:
         return False
     deg: Dict[Tuple[float, float], int] = {}
-    for ln in lines:
-        for p in (ln.p0, ln.p1):
+    for e in edges:
+        ends = _edge_endpoints(e)
+        if ends is None:
+            continue
+        for p in ends:
             k = _qkey(p, tol)
             deg[k] = deg.get(k, 0) + 1
     return any(d == 1 for d in deg.values())
@@ -217,11 +253,13 @@ def list_closed_profiles(sketch: Sketch) -> List[object]:
     closed.extend(loops)
     if closed:
         return closed
-    lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
-    if lines:
-        raise ValueError("open chain: line segments do not form a closed loop")
+    edges = [
+        e for e in sketch.entities if isinstance(e, (LineEntity, ArcEntity))
+    ]
+    if edges:
+        raise ValueError("open chain: segments do not form a closed loop")
     raise ValueError(
-        "sketch has no closed profile (rectangle, circle, or closed line loop)"
+        "sketch has no closed profile (rectangle, circle, or closed line/arc loop)"
     )
 
 

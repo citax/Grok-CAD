@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from cadcore.sketch import (
+    ArcEntity,
     CircleEntity,
     LineEntity,
     RectEntity,
@@ -37,6 +38,7 @@ class ConstraintKind(Enum):
     PERPENDICULAR = auto()  # two lines stay perpendicular
     EQUAL = auto()  # two lines keep equal length
     FIX = auto()  # point locked in place
+    TANGENT = auto()  # line and arc meet smoothly (h0 = arc end "p0"/"p1")
 
 
 @dataclass
@@ -60,6 +62,7 @@ class SketchConstraint:
             ConstraintKind.PERPENDICULAR: "Perpendicular",
             ConstraintKind.EQUAL: "Equal",
             ConstraintKind.FIX: "Fix",
+            ConstraintKind.TANGENT: "Tangent",
         }[self.kind]
 
 
@@ -112,6 +115,15 @@ def _get_point(sk: Sketch, eid: int, handle: str) -> Optional[np.ndarray]:
             return np.array(ent.midpoint(), dtype=np.float64)
     if isinstance(ent, CircleEntity) and handle == "center":
         return np.array(ent.center, dtype=np.float64)
+    if isinstance(ent, ArcEntity):
+        if handle == "p0":
+            return np.array(ent.p0(), dtype=np.float64)
+        if handle == "p1":
+            return np.array(ent.p1(), dtype=np.float64)
+        if handle == "mid":
+            return np.array(ent.mid_uv(), dtype=np.float64)
+        if handle == "center":
+            return np.array(ent.center, dtype=np.float64)
     if isinstance(ent, RectEntity) and handle.startswith("c") and handle[1:].isdigit():
         corners = ent.corners()
         idx = int(handle[1])
@@ -132,6 +144,8 @@ def _set_point(sk: Sketch, eid: int, handle: str, uv: Sequence[float]) -> None:
             ent.set_handle("mid", p)
     elif isinstance(ent, CircleEntity) and handle == "center":
         ent.set_handle("center", p)
+    elif isinstance(ent, ArcEntity):
+        ent.set_handle(handle, p)
     elif isinstance(ent, RectEntity) and handle.startswith("c"):
         ent.set_handle(handle, p)
 
@@ -211,7 +225,35 @@ def constraint_residual(sk: Sketch, c: SketchConstraint) -> float:
         if p is None:
             return 1e9
         return float(np.hypot(p[0] - c.u, p[1] - c.v))
+    if c.kind is ConstraintKind.TANGENT:
+        return _tangent_residual(sk, c)
     return 1e9
+
+
+def _tangent_residual(sk: Sketch, c: SketchConstraint) -> float:
+    """|sin| of angle between line direction and arc tangent at join (0 = smooth)."""
+    ln = sk.find_entity(int(c.e0))
+    arc = sk.find_entity(int(c.e1))
+    if not isinstance(ln, LineEntity) or not isinstance(arc, ArcEntity):
+        # allow reversed storage
+        ln = sk.find_entity(int(c.e1))
+        arc = sk.find_entity(int(c.e0))
+        h = str(c.h0) if c.h0 else str(c.h1)
+    else:
+        h = str(c.h1) if c.h1 else str(c.h0)
+    if not isinstance(ln, LineEntity) or not isinstance(arc, ArcEntity):
+        return 1e9
+    d = np.array([ln.p1[0] - ln.p0[0], ln.p1[1] - ln.p0[1]], dtype=np.float64)
+    nd = float(np.linalg.norm(d))
+    if nd < 1e-12:
+        return 0.0
+    d = d / nd
+    if h == "p0":
+        t = arc.tangent_at_start()
+    else:
+        t = arc.tangent_at_end()
+    # Parallel (either sense): |cross| small
+    return abs(float(d[0] * t[1] - d[1] * t[0]))
 
 
 def dimension_residual(sk: Sketch, dim) -> float:
@@ -508,6 +550,8 @@ def _project_dimensions(
                 _scale_line_to_length(ent, float(dim.value_mm), fixed)
         elif role == "diameter" and isinstance(ent, CircleEntity):
             set_circle_diameter(ent, float(dim.value_mm))
+        elif role == "radius" and isinstance(ent, ArcEntity):
+            ent.radius = max(1e-9, float(dim.value_mm))
         elif role == "width" and isinstance(ent, RectEntity):
             set_rect_width(ent, float(dim.value_mm), free_side="max")
         elif role == "height" and isinstance(ent, RectEntity):
@@ -553,6 +597,89 @@ def _project_one(
         _project_perpendicular(sk, c, fixed)
     elif c.kind is ConstraintKind.EQUAL:
         _project_equal(sk, c, fixed, prefer_entity=prefer_entity)
+    elif c.kind is ConstraintKind.TANGENT:
+        _project_tangent(sk, c, fixed)
+
+
+def _project_tangent(
+    sk: Sketch, c: SketchConstraint, fixed: Dict[PointRef, np.ndarray]
+) -> None:
+    """Place the arc center so the arc is tangent to the line at the join.
+
+    Convention: ``e0`` = line, ``e1`` = arc, ``h1`` = arc end ``p0``/``p1``.
+    """
+    ln = sk.find_entity(int(c.e0))
+    arc = sk.find_entity(int(c.e1))
+    h_arc = str(c.h1 or "p0")
+    if not isinstance(ln, LineEntity) or not isinstance(arc, ArcEntity):
+        ln2 = sk.find_entity(int(c.e1))
+        arc2 = sk.find_entity(int(c.e0))
+        if isinstance(ln2, LineEntity) and isinstance(arc2, ArcEntity):
+            ln, arc = ln2, arc2
+            h_arc = str(c.h0 or "p0")
+        else:
+            return
+    d = np.array([ln.p1[0] - ln.p0[0], ln.p1[1] - ln.p0[1]], dtype=np.float64)
+    nd = float(np.linalg.norm(d))
+    if nd < 1e-12:
+        return
+    dhat = d / nd
+    # Capture ends before mutating the arc
+    free_pt = arc.p1() if h_arc == "p0" else arc.p0()
+    join = arc.p0() if h_arc == "p0" else arc.p1()
+    lp0 = np.array(ln.p0, dtype=np.float64)
+    lp1 = np.array(ln.p1, dtype=np.float64)
+    jp = np.array(join, dtype=np.float64)
+    # Snap join to nearest line endpoint (usual coincident case)
+    if float(np.linalg.norm(jp - lp0)) <= float(np.linalg.norm(jp - lp1)):
+        jp = lp0.copy()
+    else:
+        jp = lp1.copy()
+    r = float(arc.radius)
+    n1 = np.array([-dhat[1], dhat[0]], dtype=np.float64)
+    cur_c = np.array(arc.center, dtype=np.float64)
+    cand1 = jp + n1 * r
+    cand2 = jp - n1 * r
+    new_c = (
+        cand1
+        if float(np.linalg.norm(cand1 - cur_c))
+        <= float(np.linalg.norm(cand2 - cur_c))
+        else cand2
+    )
+    # Free end on circle about new center
+    vo = np.array([free_pt[0] - new_c[0], free_pt[1] - new_c[1]], dtype=np.float64)
+    no = float(np.linalg.norm(vo))
+    if no < 1e-12:
+        vo = dhat.copy()
+        no = 1.0
+    free_on = (
+        float(new_c[0] + vo[0] / no * r),
+        float(new_c[1] + vo[1] / no * r),
+    )
+    join_pt = (float(jp[0]), float(jp[1]))
+    # Mid sample on the preferred side of the chord
+    mid = (
+        float(0.5 * (join_pt[0] + free_on[0]) + n1[0] * r * 0.25),
+        float(0.5 * (join_pt[1] + free_on[1]) + n1[1] * r * 0.25),
+    )
+    vm = np.array([mid[0] - new_c[0], mid[1] - new_c[1]], dtype=np.float64)
+    nm = float(np.linalg.norm(vm))
+    if nm > 1e-12:
+        mid = (float(new_c[0] + vm[0] / nm * r), float(new_c[1] + vm[1] / nm * r))
+    from cadcore.sketch import arc_from_three_points
+
+    if h_arc == "p0":
+        built = arc_from_three_points(join_pt, mid, free_on)
+    else:
+        built = arc_from_three_points(free_on, mid, join_pt)
+    if built is None:
+        arc.center = (float(new_c[0]), float(new_c[1]))
+        return
+    _c, _r, a0, a1, ccw = built
+    arc.center = (float(new_c[0]), float(new_c[1]))
+    arc.radius = r
+    arc.a0, arc.a1, arc.ccw = a0, a1, ccw
+
 
 
 def solve_sketch(
@@ -714,6 +841,14 @@ def _validate_refs(sk: Sketch, c: SketchConstraint) -> None:
     if c.kind is ConstraintKind.FIX:
         if _get_point(sk, c.e0, c.h0) is None:
             raise ValueError("Fix requires a valid point")
+        return
+    if c.kind is ConstraintKind.TANGENT:
+        ln = sk.find_entity(c.e0)
+        arc = sk.find_entity(c.e1)
+        if not isinstance(ln, LineEntity) or not isinstance(arc, ArcEntity):
+            raise ValueError("Tangent requires a line and an arc")
+        if str(c.h1) not in ("p0", "p1"):
+            raise ValueError("Tangent requires the arc end (p0 or p1)")
         return
     raise ValueError("unknown constraint kind")
 
