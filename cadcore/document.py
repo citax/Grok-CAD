@@ -309,6 +309,7 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
                 entity_id=int(d.entity_id),
                 role=str(d.role),
                 value_mm=float(d.value_mm),
+                entity_b_id=int(getattr(d, "entity_b_id", -1)),
             )
         )
     from cadcore.constraints import restore_constraint, snapshot_constraint
@@ -1202,31 +1203,61 @@ class Document:
         entity_id: int,
         role: str,
         value_mm: float,
+        *,
+        entity_b_id: int = -1,
     ) -> Optional[SketchDimension]:
-        """Create/update a driving dimension and apply it to geometry (undoable)."""
+        """Create/update a driving dimension; refuses conflicts (sketch unchanged).
+
+        Length/diameter values are mm; angle values are degrees (stored in value_mm).
+        """
+        from cadcore.constraints import max_residual, solve_sketch
         from cadcore.sketch import apply_dimension_value, measure_dimension_value
 
         sk = _sketch_of(self, sketch_id)
         ent = _entity_of(self, sketch_id, entity_id)
-        before = snapshot_entity(ent)
-        # Capture existing dimension for this (entity, role) if any
-        dim_before: Optional[dict] = None
-        for d in sk.dimensions_for_entity(entity_id):
-            if str(d.role) == str(role):
-                dim_before = snapshot_dimension(d)
-                break
-        apply_dimension_value(ent, role, value_mm)
-        after = snapshot_entity(ent)
-        # Store dimension at applied value (geometry is source of truth after apply)
+        role = str(role)
+        ebid = int(entity_b_id)
+        ent_b = None
+        if role == "angle":
+            if ebid < 0:
+                raise ValueError("angle dimension requires two lines")
+            ent_b = sk.find_entity(ebid)
+            if ent_b is None:
+                raise ValueError("angle dimension: second line not found")
+            if not isinstance(ent, LineEntity) or not isinstance(ent_b, LineEntity):
+                raise ValueError("angle dimension requires two lines")
+            if int(entity_id) == ebid:
+                raise ValueError("angle dimension needs two different lines")
+
+        before = snapshot_sketch_contents(sk)
+        # Seed geometry toward the target
         try:
-            measured = measure_dimension_value(ent, role)
-        except ValueError:
-            measured = float(value_mm)
-        dim = sk.add_or_update_dimension(entity_id, role, measured)
-        dim_after = snapshot_dimension(dim)
-        self.push_command(
-            DimensionApplyCommand(sketch_id, before, after, dim_before, dim_after)
+            if role == "angle":
+                apply_dimension_value(ent, role, value_mm, ent_b=ent_b)
+            else:
+                apply_dimension_value(ent, role, value_mm)
+        except ValueError as exc:
+            restore_sketch_contents(sk, before)
+            raise ValueError(str(exc)) from exc
+
+        dim = sk.add_or_update_dimension(
+            int(entity_id),
+            role,
+            float(value_mm),
+            entity_b_id=ebid,
         )
+        residual = solve_sketch(sk, max_iters=80)
+        # Angle residual is in degrees; length residual in mm
+        tol = 0.05 if role == "angle" else 1e-3
+        if residual > max(tol, 1e-2):
+            restore_sketch_contents(sk, before)
+            raise ValueError(
+                f"cannot apply {role} dimension ({value_mm:g}): "
+                f"conflicts with existing constraints/dimensions "
+                f"(residual {residual:.4g}). Sketch left unchanged."
+            )
+        after = snapshot_sketch_contents(sk)
+        self.push_command(SketchContentsCommand(sketch_id, before, after))
         return dim
 
     def create_extrude(

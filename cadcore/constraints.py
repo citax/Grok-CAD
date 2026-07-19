@@ -214,10 +214,49 @@ def constraint_residual(sk: Sketch, c: SketchConstraint) -> float:
     return 1e9
 
 
+def dimension_residual(sk: Sketch, dim) -> float:
+    """How far a driving dimension is from its stored value."""
+    from cadcore.sketch import (
+        CircleEntity,
+        LineEntity,
+        line_angle_degrees_oriented,
+        line_length,
+        measure_dimension_value,
+    )
+
+    role = str(dim.role)
+    ent = sk.find_entity(int(dim.entity_id))
+    if ent is None:
+        return 1e9
+    if role == "angle":
+        ent_b = sk.find_entity(int(getattr(dim, "entity_b_id", -1)))
+        if not isinstance(ent, LineEntity) or not isinstance(ent_b, LineEntity):
+            return 1e9
+        # Smallest difference considering 180° periodicity of undirected lines
+        meas = line_angle_degrees_oriented(ent, ent_b)
+        target = float(dim.value_mm) % 180.0
+        # undirected: angle and 180-angle are same line pair — use min to either
+        d1 = abs(meas - target)
+        d2 = abs(meas - (180.0 - target)) if target not in (0.0, 90.0) else d1
+        # Also meas vs target when both represent same
+        return float(min(d1, abs((180.0 - meas) - target), d2))
+    try:
+        if role == "diameter" and isinstance(ent, CircleEntity):
+            return abs(float(ent.radius) * 2.0 - float(dim.value_mm))
+        if role == "length" and isinstance(ent, LineEntity):
+            return abs(line_length(ent) - float(dim.value_mm))
+        return abs(measure_dimension_value(ent, role) - float(dim.value_mm))
+    except ValueError:
+        return 1e9
+
+
 def max_residual(sk: Sketch) -> float:
-    if not sk.constraints:
-        return 0.0
-    return max(constraint_residual(sk, c) for c in sk.constraints)
+    vals = []
+    if sk.constraints:
+        vals.extend(constraint_residual(sk, c) for c in sk.constraints)
+    for d in getattr(sk, "dimensions", None) or []:
+        vals.append(dimension_residual(sk, d))
+    return max(vals) if vals else 0.0
 
 
 def all_satisfied(sk: Sketch, *, tol: float = TOL * 50) -> bool:
@@ -435,6 +474,55 @@ def _project_fix(sk: Sketch, c: SketchConstraint) -> None:
     _set_point(sk, c.e0, c.h0, (c.u, c.v))
 
 
+def _project_dimensions(
+    sk: Sketch,
+    fixed: Dict[PointRef, np.ndarray],
+    *,
+    prefer_entity: Optional[int] = None,
+    prefer_handle: Optional[str] = None,
+) -> None:
+    """Drive geometry to stored dimension values (length / diameter / angle)."""
+    from cadcore.sketch import (
+        CircleEntity,
+        LineEntity,
+        RectEntity,
+        set_circle_diameter,
+        set_line_pair_angle,
+        set_rect_height,
+        set_rect_width,
+    )
+
+    for dim in getattr(sk, "dimensions", None) or []:
+        role = str(dim.role)
+        ent = sk.find_entity(int(dim.entity_id))
+        if ent is None:
+            continue
+        if role == "length" and isinstance(ent, LineEntity):
+            # If user drags one end, keep the other as pivot
+            if prefer_entity == ent.id and prefer_handle in ("p0", "p1"):
+                pivot = "p0" if prefer_handle == "p1" else "p1"
+                tmp_fixed = dict(fixed)
+                tmp_fixed[(ent.id, pivot)] = _get_point(sk, ent.id, pivot)  # type: ignore[arg-type]
+                _scale_line_to_length(ent, float(dim.value_mm), tmp_fixed)
+            else:
+                _scale_line_to_length(ent, float(dim.value_mm), fixed)
+        elif role == "diameter" and isinstance(ent, CircleEntity):
+            set_circle_diameter(ent, float(dim.value_mm))
+        elif role == "width" and isinstance(ent, RectEntity):
+            set_rect_width(ent, float(dim.value_mm), free_side="max")
+        elif role == "height" and isinstance(ent, RectEntity):
+            set_rect_height(ent, float(dim.value_mm), free_side="max")
+        elif role == "angle" and isinstance(ent, LineEntity):
+            ent_b = sk.find_entity(int(getattr(dim, "entity_b_id", -1)))
+            if not isinstance(ent_b, LineEntity):
+                continue
+            # set_line_pair_angle(a, b) rotates b; keep the dragged line if possible
+            if prefer_entity is not None and int(prefer_entity) == int(ent.id):
+                set_line_pair_angle(ent_b, ent, float(dim.value_mm))
+            else:
+                set_line_pair_angle(ent, ent_b, float(dim.value_mm))
+
+
 def _project_one(
     sk: Sketch,
     c: SketchConstraint,
@@ -465,21 +553,25 @@ def solve_sketch(
     max_iters: int = SOLVE_ITERS,
     tol: float = TOL * 50,
 ) -> float:
-    """Iteratively project constraints. Optional drag pin (eid, handle, uv).
+    """Iteratively project constraints + driving dimensions.
 
-    Returns final max residual. Underconstrained DOF stay free (drag moves them).
+    Optional drag pin (eid, handle, uv). Returns final max residual.
+    Underconstrained DOF stay free (drag moves them).
     """
-    if not sk.constraints and drag is None:
+    has_dims = bool(getattr(sk, "dimensions", None))
+    if not sk.constraints and not has_dims and drag is None:
         return 0.0
 
     # Soft pin: repeatedly re-apply dragged handle toward target if free
     drag_ref: Optional[PointRef] = None
     drag_uv: Optional[np.ndarray] = None
     prefer_entity: Optional[int] = None
+    prefer_handle: Optional[str] = None
     if drag is not None:
         drag_ref = (int(drag[0]), str(drag[1]))
         drag_uv = np.array([float(drag[2][0]), float(drag[2][1])], dtype=np.float64)
         prefer_entity = int(drag[0])
+        prefer_handle = str(drag[1])
         # Initial move
         if drag_ref[1]:
             _set_point(sk, drag_ref[0], drag_ref[1], drag_uv)
@@ -490,8 +582,9 @@ def solve_sketch(
         drag_ref = None
         drag_uv = None
         prefer_entity = None
+        prefer_handle = None
 
-    residual = max_residual(sk) if sk.constraints else 0.0
+    residual = max_residual(sk)
     for _ in range(max_iters):
         # Prefer FIX first so others work around anchors
         ordered = sorted(
@@ -500,22 +593,28 @@ def solve_sketch(
         )
         for c in ordered:
             _project_one(sk, c, fixed, prefer_entity=prefer_entity)
-        # Re-assert fixes
         for c in sk.constraints:
             if c.kind is ConstraintKind.FIX:
                 _project_fix(sk, c)
-        # Soft drag: if point is still free, pull it toward the mouse
+        # Soft drag before dimensions so length/angle can re-assert
         if drag_ref is not None and drag_uv is not None and not _is_fixed(fixed, drag_ref):
             _set_point(sk, drag_ref[0], drag_ref[1], drag_uv)
-            # One more projection pass so constraints absorb the drag
-            for c in ordered:
-                if c.kind is ConstraintKind.FIX:
-                    continue
-                _project_one(sk, c, fixed, prefer_entity=prefer_entity)
-            for c in sk.constraints:
-                if c.kind is ConstraintKind.FIX:
-                    _project_fix(sk, c)
-        residual = max_residual(sk) if sk.constraints else 0.0
+        _project_dimensions(
+            sk, fixed, prefer_entity=prefer_entity, prefer_handle=prefer_handle
+        )
+        # Constraints again to absorb dimension moves
+        for c in ordered:
+            if c.kind is ConstraintKind.FIX:
+                continue
+            _project_one(sk, c, fixed, prefer_entity=prefer_entity)
+        for c in sk.constraints:
+            if c.kind is ConstraintKind.FIX:
+                _project_fix(sk, c)
+        # Final dimension assert (dimensions win over soft drag)
+        _project_dimensions(
+            sk, fixed, prefer_entity=prefer_entity, prefer_handle=prefer_handle
+        )
+        residual = max_residual(sk)
         if residual <= tol:
             break
     return residual

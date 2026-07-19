@@ -121,12 +121,15 @@ def test_document_apply_sketch_dimension_undo():
     assert any(d.entity_id == ln.id for d in skf.sketch.dimensions)
     # Labels stay after change
     dim2 = doc.apply_sketch_dimension(skf.id, ln.id, "length", 25.0)
+    ln = skf.sketch.find_entity(ln.id)
     assert line_length(ln) == pytest.approx(25.0)
     assert dim2 is not None and dim2.id == dim.id  # updated in place
-    # Undo restores previous geometry
+    # Undo restores previous geometry (re-fetch — contents replace entity objects)
     assert doc.undo()
+    ln = skf.sketch.find_entity(ln.id)
     assert line_length(ln) == pytest.approx(40.0)
     assert doc.undo()
+    ln = skf.sketch.find_entity(ln.id)
     assert line_length(ln) == pytest.approx(10.0)
 
 

@@ -75,6 +75,7 @@ class DimKind(Enum):
 
     LINEAR = auto()  # line length, or rect width/height
     DIAMETER = auto()  # circle diameter
+    ANGULAR = auto()  # angle between two lines (degrees in value_mm)
 
 
 class HandleKind(Enum):
@@ -216,13 +217,16 @@ class CircleEntity(SketchEntity):
 
 @dataclass
 class SketchDimension:
-    """Driving dimension: ``value_mm`` owns geometry when applied.
+    """Driving dimension: stored value owns geometry when applied.
 
     ``role``:
-      * ``length`` — full line length (LineEntity)
-      * ``width``  — |Δu| of a rectangle (RectEntity)
-      * ``height`` — |Δv| of a rectangle (RectEntity)
-      * ``diameter`` — 2·radius of a circle (CircleEntity)
+      * ``length`` — full line length (LineEntity), value in mm
+      * ``width``  — |Δu| of a rectangle (RectEntity), value in mm
+      * ``height`` — |Δv| of a rectangle (RectEntity), value in mm
+      * ``diameter`` — 2·radius of a circle (CircleEntity), value in mm
+      * ``angle`` — angle between two lines, value in **degrees** (stored in value_mm)
+
+    ``entity_b_id`` is the second line for angle dimensions (−1 otherwise).
     """
 
     id: int
@@ -230,6 +234,7 @@ class SketchDimension:
     entity_id: int
     role: str = "length"
     value_mm: float = 0.0
+    entity_b_id: int = -1
 
 
 @dataclass
@@ -358,10 +363,20 @@ class Sketch:
         return None
 
     def dimensions_for_entity(self, eid: int) -> List[SketchDimension]:
-        return [d for d in self.dimensions if d.entity_id == eid]
+        eid = int(eid)
+        return [
+            d
+            for d in self.dimensions
+            if int(d.entity_id) == eid or int(getattr(d, "entity_b_id", -1)) == eid
+        ]
 
     def remove_dimensions_for_entity(self, eid: int) -> None:
-        self.dimensions = [d for d in self.dimensions if d.entity_id != eid]
+        eid = int(eid)
+        self.dimensions = [
+            d
+            for d in self.dimensions
+            if int(d.entity_id) != eid and int(getattr(d, "entity_b_id", -1)) != eid
+        ]
 
     def add_or_update_dimension(
         self,
@@ -370,15 +385,37 @@ class Sketch:
         value_mm: float,
         *,
         kind: Optional[DimKind] = None,
+        entity_b_id: int = -1,
     ) -> SketchDimension:
-        """Create or replace a driving dimension for (entity, role)."""
+        """Create or replace a driving dimension for (entity, role[, entity_b])."""
         eid = int(entity_id)
+        ebid = int(entity_b_id)
         role = str(role)
         val = float(value_mm)
         if kind is None:
-            kind = DimKind.DIAMETER if role == "diameter" else DimKind.LINEAR
+            if role == "diameter":
+                kind = DimKind.DIAMETER
+            elif role == "angle":
+                kind = DimKind.ANGULAR
+            else:
+                kind = DimKind.LINEAR
         for d in self.dimensions:
-            if d.entity_id == eid and d.role == role:
+            if (
+                int(d.entity_id) == eid
+                and str(d.role) == role
+                and int(getattr(d, "entity_b_id", -1)) == ebid
+            ):
+                d.value_mm = val
+                d.kind = kind
+                d.entity_b_id = ebid
+                return d
+            # Angle is unordered pair
+            if (
+                role == "angle"
+                and str(d.role) == "angle"
+                and {int(d.entity_id), int(getattr(d, "entity_b_id", -1))}
+                == {eid, ebid}
+            ):
                 d.value_mm = val
                 d.kind = kind
                 return d
@@ -388,6 +425,7 @@ class Sketch:
             entity_id=eid,
             role=role,
             value_mm=val,
+            entity_b_id=ebid,
         )
         self._next_dim_id += 1
         self.dimensions.append(d)
@@ -458,8 +496,42 @@ def set_circle_diameter(ent: CircleEntity, diameter: float) -> None:
     ent.radius = max(1e-12, float(diameter) * 0.5)
 
 
-def measure_dimension_value(ent: SketchEntity, role: str) -> float:
-    """Current geometric measure for a dimension role (mm)."""
+def line_direction(ent: LineEntity) -> np.ndarray:
+    d = np.array(
+        [ent.p1[0] - ent.p0[0], ent.p1[1] - ent.p0[1]], dtype=np.float64
+    )
+    return d
+
+
+def line_angle_degrees(a: LineEntity, b: LineEntity) -> float:
+    """Smaller angle between two line directions in degrees, range [0, 90].
+
+    For driving dims we also support obtuse targets via apply; measurement
+    reports the acute angle between undirected lines (SolidWorks-style).
+    Use ``line_angle_degrees_oriented`` for 0–180 undirected interior.
+    """
+    return line_angle_degrees_oriented(a, b)
+
+
+def line_angle_degrees_oriented(a: LineEntity, b: LineEntity) -> float:
+    """Angle between direction vectors in degrees, range [0, 180]."""
+    d0 = line_direction(a)
+    d1 = line_direction(b)
+    n0 = float(np.linalg.norm(d0))
+    n1 = float(np.linalg.norm(d1))
+    if n0 < 1e-12 or n1 < 1e-12:
+        return 0.0
+    c = float(np.clip(np.dot(d0, d1) / (n0 * n1), -1.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
+
+def measure_dimension_value(
+    ent: SketchEntity,
+    role: str,
+    *,
+    ent_b: Optional[SketchEntity] = None,
+) -> float:
+    """Current geometric measure for a dimension role (mm, or degrees for angle)."""
     if isinstance(ent, LineEntity) and role == "length":
         return line_length(ent)
     if isinstance(ent, RectEntity) and role == "width":
@@ -468,13 +540,23 @@ def measure_dimension_value(ent: SketchEntity, role: str) -> float:
         return rect_height(ent)
     if isinstance(ent, CircleEntity) and role == "diameter":
         return float(ent.radius) * 2.0
+    if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
+        return line_angle_degrees_oriented(ent, ent_b)
     raise ValueError(f"cannot measure role={role!r} on {type(ent).__name__}")
 
 
-def apply_dimension_value(ent: SketchEntity, role: str, value_mm: float) -> None:
-    """Drive geometry so the measured role equals ``value_mm``."""
+def apply_dimension_value(
+    ent: SketchEntity,
+    role: str,
+    value_mm: float,
+    *,
+    ent_b: Optional[SketchEntity] = None,
+) -> None:
+    """Drive geometry so the measured role equals ``value_mm`` (or degrees)."""
     val = float(value_mm)
-    if not np.isfinite(val) or val <= 1e-12:
+    if not np.isfinite(val):
+        raise ValueError("dimension value must be finite")
+    if role != "angle" and val <= 1e-12:
         raise ValueError("dimension value must be a positive finite number")
     if isinstance(ent, LineEntity) and role == "length":
         set_line_length(ent, val, free_end="p1")
@@ -488,7 +570,48 @@ def apply_dimension_value(ent: SketchEntity, role: str, value_mm: float) -> None
     if isinstance(ent, CircleEntity) and role == "diameter":
         set_circle_diameter(ent, val)
         return
+    if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
+        set_line_pair_angle(ent, ent_b, val)
+        return
     raise ValueError(f"cannot apply role={role!r} on {type(ent).__name__}")
+
+
+def set_line_pair_angle(
+    a: LineEntity, b: LineEntity, degrees: float, *, move: str = "b"
+) -> None:
+    """Rotate line ``b`` (default) so the angle with ``a`` is ``degrees`` (0–180)."""
+    target = float(degrees) % 180.0
+    if target < 0:
+        target += 180.0
+    d0 = line_direction(a)
+    n0 = float(np.linalg.norm(d0))
+    if n0 < 1e-12:
+        d0 = np.array([1.0, 0.0])
+        n0 = 1.0
+    u0 = d0 / n0
+    # Two candidate directions for b: rotate u0 by ±target
+    rad = np.radians(target)
+    c, s = float(np.cos(rad)), float(np.sin(rad))
+    cand1 = np.array([u0[0] * c - u0[1] * s, u0[0] * s + u0[1] * c])
+    cand2 = np.array([u0[0] * c + u0[1] * s, -u0[0] * s + u0[1] * c])
+    # Also 180-target gives same undirected angle with opposite sense — use closest to current b
+    d1 = line_direction(b)
+    n1 = float(np.linalg.norm(d1))
+    cur = d1 / n1 if n1 > 1e-12 else cand1
+    best = cand1
+    best_score = -1e9
+    for cand in (cand1, cand2, -cand1, -cand2):
+        score = float(np.dot(cur, cand))
+        if score > best_score:
+            best_score = score
+            best = cand
+    L = line_length(b)
+    if L < 1e-12:
+        L = 1.0
+    mid = b.midpoint()
+    half = 0.5 * L
+    b.p0 = (mid[0] - best[0] * half, mid[1] - best[1] * half)
+    b.p1 = (mid[0] + best[0] * half, mid[1] + best[1] * half)
 
 
 def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -> str:
@@ -522,10 +645,27 @@ def infer_dimension_role(ent: SketchEntity, *, uv_hint: Optional[Vec2] = None) -
     raise ValueError(f"unsupported entity for dimension: {type(ent).__name__}")
 
 
-def dimension_anchor_uv(ent: SketchEntity, role: str) -> Vec2:
+def dimension_anchor_uv(
+    ent: SketchEntity,
+    role: str,
+    *,
+    ent_b: Optional[SketchEntity] = None,
+) -> Vec2:
     """Label placement UV for a dimension."""
+    if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
+        m0 = ent.midpoint()
+        m1 = ent_b.midpoint()
+        return (0.5 * (m0[0] + m1[0]), 0.5 * (m0[1] + m1[1]))
     if isinstance(ent, LineEntity):
-        return ent.midpoint()
+        mid = ent.midpoint()
+        # Offset slightly off the line for readability
+        d = line_direction(ent)
+        n = float(np.linalg.norm(d))
+        if n > 1e-12:
+            # perpendicular offset
+            off = 0.08 * max(n, 1.0)
+            return (mid[0] - d[1] / n * off, mid[1] + d[0] / n * off)
+        return mid
     if isinstance(ent, RectEntity):
         u0, u1 = sorted([ent.c0[0], ent.c1[0]])
         v0, v1 = sorted([ent.c0[1], ent.c1[1]])
@@ -605,25 +745,33 @@ def snapshot_dimension(dim: SketchDimension) -> dict:
         "entity_id": int(dim.entity_id),
         "role": str(dim.role),
         "value_mm": float(dim.value_mm),
+        "entity_b_id": int(getattr(dim, "entity_b_id", -1)),
     }
 
 
 def restore_dimension(data: dict) -> SketchDimension:
     """Rebuild a SketchDimension from snapshot_dimension() output."""
     kind_raw = data.get("kind", "LINEAR")
+    role = str(data.get("role", "length"))
     if isinstance(kind_raw, DimKind):
         kind = kind_raw
     else:
         try:
             kind = DimKind[str(kind_raw)]
         except KeyError:
-            kind = DimKind.DIAMETER if str(data.get("role")) == "diameter" else DimKind.LINEAR
+            if role == "diameter":
+                kind = DimKind.DIAMETER
+            elif role == "angle":
+                kind = DimKind.ANGULAR
+            else:
+                kind = DimKind.LINEAR
     return SketchDimension(
         id=int(data["id"]),
         kind=kind,
         entity_id=int(data["entity_id"]),
-        role=str(data.get("role", "length")),
+        role=role,
         value_mm=float(data.get("value_mm", 0.0)),
+        entity_b_id=int(data.get("entity_b_id", -1)),
     )
 
 

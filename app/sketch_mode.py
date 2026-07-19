@@ -117,6 +117,7 @@ class SketchController:
         # World-unit point snap radius; viewport overwrites from pixel scale
         self.snap_point_tol: float = SNAP_POINT
         self.snap_grid: float = SNAP_GRID
+        self._dim_first_id: Optional[int] = None  # Smart Dimension two-click angle
 
     # --- selection property (compat for single-id consumers) ---
     @property
@@ -424,16 +425,35 @@ class SketchController:
         ctrl: bool = False,
     ) -> Optional[str]:
         if self.tool == SketchTool.DIMENSION:
-            # Smart Dimension: pick entity (body or handle), role from click location
-            from cadcore.sketch import infer_dimension_role
+            # Smart Dimension: one entity → length/diameter; two lines → angle
+            from cadcore.sketch import LineEntity, infer_dimension_role
 
             h = self.pick_handle(raw_uv)
             eid = h.entity_id if h is not None else self.pick_entity_body(raw_uv)
             if eid is None:
+                self._dim_first_id = None
                 return "DimPickMiss"
             ent = self.sketch.find_entity(eid)
             if ent is None:
                 return "DimPickMiss"
+            # Second click on another line → angle between them
+            first = getattr(self, "_dim_first_id", None)
+            if first is not None and int(first) != int(eid):
+                e0 = self.sketch.find_entity(int(first))
+                if isinstance(e0, LineEntity) and isinstance(ent, LineEntity):
+                    self._dim_first_id = None
+                    self.selected_ids = {int(first), int(eid)}
+                    return f"DimPick:{int(first)}:angle:{int(eid)}"
+            if isinstance(ent, LineEntity):
+                # Wait for optional second line; first click alone after re-click same = length
+                if first is not None and int(first) == int(eid):
+                    self._dim_first_id = None
+                    self.selected_entity_id = eid
+                    return f"DimPick:{eid}:length"
+                self._dim_first_id = int(eid)
+                self.selected_entity_id = eid
+                return "DimPickWait"
+            self._dim_first_id = None
             self.selected_entity_id = eid
             role = infer_dimension_role(ent, uv_hint=raw_uv)
             return f"DimPick:{eid}:{role}"
@@ -557,8 +577,10 @@ class SketchController:
             return
         if isinstance(ent, (LineEntity, RectEntity, CircleEntity)):
             ent.set_handle(self.drag.handle_name, uv)
-            # Keep geometric relationships after the drag
-            if getattr(self.sketch, "constraints", None):
+            # Keep geometric relationships + driving dimensions after the drag
+            if getattr(self.sketch, "constraints", None) or getattr(
+                self.sketch, "dimensions", None
+            ):
                 from cadcore.constraints import solve_sketch
 
                 solve_sketch(

@@ -544,6 +544,11 @@ class MainWindow(QMainWindow):
             "Remove constraints on the selected sketch entities"
         )
         self.act_del_cstr.triggered.connect(self._remove_constraints)
+        self.act_angle = QAction(fa_icon("fa5s.drafting-compass"), "Angle", self)
+        self.act_angle.setToolTip(
+            "Angle dimension — select two lines, type degrees (persists on drag)"
+        )
+        self.act_angle.triggered.connect(self._make_angle_dimension)
         self.act_exit_sketch = QAction(
             fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit", self
         )
@@ -584,6 +589,7 @@ class MainWindow(QMainWindow):
                     self.act_coincident,
                     self.act_fix,
                     self.act_del_cstr,
+                    self.act_angle,
                     self.act_exit_sketch,
                 ],
             )
@@ -611,6 +617,7 @@ class MainWindow(QMainWindow):
             "act_coincident",
             "act_fix",
             "act_del_cstr",
+            "act_angle",
         ):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(on)
@@ -749,6 +756,27 @@ class MainWindow(QMainWindow):
             )
             return item
 
+        def _add_sketch_dim_children(parent: QTreeWidgetItem, skf) -> None:
+            """Nest driving dimensions under a sketch in the feature tree."""
+            sk = getattr(skf, "sketch", None)
+            if sk is None:
+                return
+            unit = self.doc.display_unit
+            for dim in getattr(sk, "dimensions", None) or []:
+                role = str(dim.role)
+                val = float(dim.value_mm)
+                if role == "angle":
+                    label = f"∠ {val:g}°"
+                elif role == "diameter":
+                    label = f"⌀ {format_length(val, unit)}"
+                else:
+                    label = f"{role.title()} {format_length(val, unit)}"
+                ditem = QTreeWidgetItem([label])
+                ditem.setData(0, Qt.ItemDataRole.UserRole, -100000 - int(dim.id))
+                ditem.setIcon(0, fa_icon("fa5s.ruler", color=ACCENT))
+                ditem.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                parent.addChild(ditem)
+
         for f in self.doc.features:
             if is_reference_plane(f.type):
                 item = _make_item(f)
@@ -762,6 +790,8 @@ class MainWindow(QMainWindow):
                 continue
             item = _make_item(f)
             features_root.addChild(item)
+            if f.type is FeatureType.SKETCH:
+                _add_sketch_dim_children(item, f)
             # Nest absorbed sketch(es) under consuming feature
             for sk_id in children.get(f.id, ()):
                 skf = self.doc.find(sk_id)
@@ -769,6 +799,7 @@ class MainWindow(QMainWindow):
                     continue
                 child = _make_item(skf)
                 item.addChild(child)
+                _add_sketch_dim_children(child, skf)
                 if sk_id == self.doc.selected_id:
                     child.setSelected(True)
                     self.tree.setCurrentItem(child)
@@ -1868,8 +1899,10 @@ class MainWindow(QMainWindow):
             return
         self._on_dimension_requested(ent.id, "length")
 
-    def _on_dimension_requested(self, entity_id: int, role: str) -> None:
-        """Smart Dimension / Set Length: typed value drives geometry + persists."""
+    def _on_dimension_requested(
+        self, entity_id: int, role: str, entity_b_id: int = -1
+    ) -> None:
+        """Smart Dimension: typed value drives geometry + persists through drag."""
         if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
             return
         sid = self.viewport._sketch_feature_id
@@ -1878,38 +1911,93 @@ class MainWindow(QMainWindow):
         if ent is None:
             return
         unit = self.doc.display_unit
+        role = str(role)
+        ebid = int(entity_b_id)
+        ent_b = sk.find_entity(ebid) if role == "angle" else None
         try:
-            cur_mm = measure_dimension_value(ent, role)
+            if role == "angle":
+                from cadcore.sketch import line_angle_degrees_oriented
+
+                if not isinstance(ent, LineEntity) or not isinstance(ent_b, LineEntity):
+                    self.statusBar().showMessage(
+                        "Angle dimension needs two lines", 3000
+                    )
+                    return
+                cur_disp = line_angle_degrees_oriented(ent, ent_b)
+            else:
+                cur_mm = measure_dimension_value(ent, role)
+                cur_disp = from_mm(cur_mm, unit)
         except ValueError:
             self.statusBar().showMessage(f"Cannot dimension {role} on that entity", 3000)
             return
-        cur_disp = from_mm(cur_mm, unit)
         role_label = {
             "length": "Length",
             "width": "Width",
             "height": "Height",
             "diameter": "Diameter",
+            "angle": "Angle",
         }.get(role, role.title())
-        val, ok = QInputDialog.getDouble(
-            self,
-            "Smart Dimension",
-            f"{role_label} ({unit.label}):",
-            cur_disp,
-            1e-6,
-            1e9,
-            4,
-        )
-        if not ok:
+        if role == "angle":
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Smart Dimension",
+                f"{role_label} (°):",
+                float(cur_disp),
+                0.0,
+                180.0,
+                4,
+            )
+            if not ok:
+                return
+            store_val = float(val)
+        else:
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Smart Dimension",
+                f"{role_label} ({unit.label}):",
+                float(cur_disp),
+                1e-6,
+                1e9,
+                4,
+            )
+            if not ok:
+                return
+            store_val = to_mm(val, unit)
+        try:
+            dim = self.doc.apply_sketch_dimension(
+                sid, int(entity_id), role, store_val, entity_b_id=ebid
+            )
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                "Dimension conflict",
+                f"{exc}\n\nThe sketch was not changed.",
+            )
+            self.statusBar().showMessage(f"Dimension refused: {exc}", 5000)
             return
-        mm = to_mm(val, unit)
-        dim = self.doc.apply_sketch_dimension(sid, int(entity_id), role, mm)
         self.viewport.sync_sketch_visuals()
+        self._refresh_tree()
         self._update_window_title()
-        shown = format_length(measure_dimension_value(ent, role), unit)
+        if role == "angle":
+            shown = f"{store_val:g}°"
+        else:
+            shown = format_length(store_val, unit)
+            if role == "diameter":
+                shown = "⌀" + shown
         self.statusBar().showMessage(
             f"{role_label} → {shown}" + (f"  (dim #{dim.id})" if dim else ""),
             3000,
         )
+
+    def _make_angle_dimension(self) -> None:
+        """Angle between two selected lines — type degrees, persists through drag."""
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage(
+                "Select two lines, then Angle dimension", 3000
+            )
+            return
+        self._on_dimension_requested(lines[0].id, "angle", entity_b_id=lines[1].id)
 
     def _sketch_context(self):
         if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:

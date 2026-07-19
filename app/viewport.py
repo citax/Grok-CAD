@@ -414,7 +414,7 @@ class Viewport(QWidget):
     sketch_status = Signal(str)
     renderer_info = Signal(str)
     # Smart Dimension: entity_id, role ("length"|"width"|"height"|"diameter")
-    dimension_requested = Signal(int, str)
+    dimension_requested = Signal(int, str, int)  # entity_id, role, entity_b_id
     # Camera view changed via triad / cube / space menu (name of view)
     view_changed = Signal(str)
 
@@ -2127,25 +2127,28 @@ class Viewport(QWidget):
         points = []
         labels = []
         seen: Set[Tuple[int, str]] = set()
-        # 1) Driving dimensions (persist, drive geometry)
+        # 1) Driving dimensions (persist — stored value is the promise, not measured)
         for dim in getattr(sk, "dimensions", None) or []:
             ent = sk.find_entity(dim.entity_id)
             if ent is None:
                 continue
-            key = (int(dim.entity_id), str(dim.role))
+            role = str(dim.role)
+            ebid = int(getattr(dim, "entity_b_id", -1))
+            key = (int(dim.entity_id), role, ebid)
             if key in seen:
                 continue
             seen.add(key)
-            try:
-                val = measure_dimension_value(ent, dim.role)
-            except ValueError:
-                val = float(dim.value_mm)
-            # Keep stored value in sync if user dragged handles
-            dim.value_mm = float(val)
-            anchor = dimension_anchor_uv(ent, dim.role)
+            ent_b = sk.find_entity(ebid) if role == "angle" else None
+            # Show the driving value (promise), not a drifted measure
+            val = float(dim.value_mm)
+            anchor = dimension_anchor_uv(ent, role, ent_b=ent_b)
             points.append(fr.to_world(anchor))
-            prefix = "⌀" if dim.role == "diameter" else ""
-            labels.append(prefix + format_length(val, unit))
+            if role == "angle":
+                labels.append(f"{val:g}°")
+            elif role == "diameter":
+                labels.append("⌀" + format_length(val, unit))
+            else:
+                labels.append(format_length(val, unit))
         # 2) Ephemeral selected/hovered line lengths (when no driving dim yet)
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
@@ -2191,16 +2194,19 @@ class Viewport(QWidget):
             ent = sk.find_entity(dim.entity_id)
             if ent is None:
                 continue
-            key = (int(dim.entity_id), str(dim.role))
+            role = str(dim.role)
+            ebid = int(getattr(dim, "entity_b_id", -1))
+            key = (int(dim.entity_id), role, ebid)
             if key in seen:
                 continue
             seen.add(key)
-            try:
-                val = measure_dimension_value(ent, dim.role)
-            except ValueError:
-                val = float(dim.value_mm)
-            prefix = "⌀" if dim.role == "diameter" else ""
-            out.append(prefix + format_length(val, unit))
+            val = float(dim.value_mm)
+            if role == "angle":
+                out.append(f"{val:g}°")
+            elif role == "diameter":
+                out.append("⌀" + format_length(val, unit))
+            else:
+                out.append(format_length(val, unit))
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
@@ -2573,7 +2579,9 @@ class Viewport(QWidget):
                 ent0 = self._sketch_ctrl.sketch.find_entity(h.entity_id)
                 if ent0 is not None:
                     sk0 = self._sketch_ctrl.sketch
-                    if getattr(sk0, "constraints", None):
+                    if getattr(sk0, "constraints", None) or getattr(
+                        sk0, "dimensions", None
+                    ):
                         from cadcore.sketch import snapshot_sketch_contents
 
                         self._drag_before_sketch = snapshot_sketch_contents(sk0)
@@ -2585,20 +2593,32 @@ class Viewport(QWidget):
         )
         sk = self._sketch_ctrl.sketch
         if msg and msg.startswith("DimPick:"):
-            # DimPick:<entity_id>:<role>
+            # DimPick:<entity_id>:<role>[:entity_b_id]
             parts = msg.split(":")
             if len(parts) >= 3:
                 try:
                     eid = int(parts[1])
                     role = parts[2]
-                    self.dimension_requested.emit(eid, role)
-                    self.sketch_status.emit(f"Dimension on entity {eid} ({role})")
+                    ebid = int(parts[3]) if len(parts) >= 4 else -1
+                    self.dimension_requested.emit(eid, role, ebid)
+                    self.sketch_status.emit(
+                        f"Dimension on entity {eid} ({role})"
+                        + (f" / {ebid}" if ebid >= 0 else "")
+                    )
                 except ValueError:
                     pass
             self._request_render()
             return
+        if msg == "DimPickWait":
+            self.sketch_status.emit(
+                "Smart Dimension: click a second line for angle, or the same line again for length"
+            )
+            self._request_render()
+            return
         if msg == "DimPickMiss":
-            self.sketch_status.emit("Smart Dimension: click a line, rectangle, or circle")
+            self.sketch_status.emit(
+                "Smart Dimension: click a line, rectangle, or circle"
+            )
             return
         if msg in ("Line", "LineClosed", "Rectangle", "Circle"):
             if len(sk.entities) > n_before:
