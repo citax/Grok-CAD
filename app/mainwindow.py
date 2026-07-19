@@ -61,18 +61,22 @@ from cadcore.project_io import (
     replace_document_contents,
     save_document,
 )
+from cadcore.constraints import (
+    ConstraintKind,
+    SketchConstraint,
+    add_constraint,
+    remove_constraints_for_entity,
+)
 from cadcore.sketch import (
     CircleEntity,
     LineEntity,
     RectEntity,
     apply_dimension_value,
     line_length,
-    make_line_horizontal,
-    make_line_vertical,
-    make_lines_equal_length,
     measure_dimension_value,
     set_line_length,
     snapshot_entity,
+    snapshot_sketch_contents,
 )
 from cadcore.units import Unit, format_length, from_mm, parse_length, to_mm
 
@@ -510,19 +514,36 @@ class MainWindow(QMainWindow):
             sketch_tool_actions.append(act)
 
         self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horizontal", self)
-        self.act_horiz.setToolTip("Make selected line(s) horizontal")
+        self.act_horiz.setToolTip("Horizontal — selected line(s) stay horizontal")
         self.act_horiz.setShortcut(QKeySequence("H"))
         self.act_horiz.triggered.connect(self._make_horizontal)
         self.act_vert = QAction(fa_icon("fa5s.arrows-alt-v"), "Vertical", self)
-        self.act_vert.setToolTip("Make selected line(s) vertical")
+        self.act_vert.setToolTip("Vertical — selected line(s) stay vertical")
         self.act_vert.setShortcut(QKeySequence("V"))
         self.act_vert.triggered.connect(self._make_vertical)
         self.act_equal = QAction(fa_icon("fa5s.equals"), "Equal", self)
-        self.act_equal.setToolTip(
-            "Make selected lines equal length (first is source)"
-        )
+        self.act_equal.setToolTip("Equal — selected lines keep the same length")
         self.act_equal.setShortcut(QKeySequence("="))
         self.act_equal.triggered.connect(self._make_equal)
+        self.act_parallel = QAction(fa_icon("fa5s.grip-lines"), "Parallel", self)
+        self.act_parallel.setToolTip("Parallel — two selected lines stay parallel")
+        self.act_parallel.triggered.connect(self._make_parallel)
+        self.act_perp = QAction(fa_icon("fa5s.plus"), "Perpendicular", self)
+        self.act_perp.setToolTip("Perpendicular — two selected lines stay at 90°")
+        self.act_perp.triggered.connect(self._make_perpendicular)
+        self.act_coincident = QAction(fa_icon("fa5s.dot-circle"), "Coincident", self)
+        self.act_coincident.setToolTip(
+            "Coincident — stick two selected line endpoints together"
+        )
+        self.act_coincident.triggered.connect(self._make_coincident)
+        self.act_fix = QAction(fa_icon("fa5s.anchor"), "Fix", self)
+        self.act_fix.setToolTip("Fix — lock selected line endpoint(s) in place")
+        self.act_fix.triggered.connect(self._make_fix)
+        self.act_del_cstr = QAction(fa_icon("fa5s.unlink"), "Remove constraint", self)
+        self.act_del_cstr.setToolTip(
+            "Remove constraints on the selected sketch entities"
+        )
+        self.act_del_cstr.triggered.connect(self._remove_constraints)
         self.act_exit_sketch = QAction(
             fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit", self
         )
@@ -558,6 +579,11 @@ class MainWindow(QMainWindow):
                     self.act_horiz,
                     self.act_vert,
                     self.act_equal,
+                    self.act_parallel,
+                    self.act_perp,
+                    self.act_coincident,
+                    self.act_fix,
+                    self.act_del_cstr,
                     self.act_exit_sketch,
                 ],
             )
@@ -575,7 +601,17 @@ class MainWindow(QMainWindow):
     def _set_sketch_ribbon_enabled(self, on: bool) -> None:
         for act in self._sketch_tool_actions.values():
             act.setEnabled(on)
-        for name in ("act_exit_sketch", "act_horiz", "act_vert", "act_equal"):
+        for name in (
+            "act_exit_sketch",
+            "act_horiz",
+            "act_vert",
+            "act_equal",
+            "act_parallel",
+            "act_perp",
+            "act_coincident",
+            "act_fix",
+            "act_del_cstr",
+        ):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(on)
 
@@ -1875,77 +1911,227 @@ class MainWindow(QMainWindow):
             3000,
         )
 
-    def _make_horizontal(self) -> None:
-        self._apply_line_constraint("horizontal")
-
-    def _make_vertical(self) -> None:
-        self._apply_line_constraint("vertical")
-
-    def _apply_line_constraint(self, kind: str) -> None:
+    def _sketch_context(self):
         if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+            return None
+        return self.viewport._sketch_ctrl, self.viewport._sketch_feature_id
+
+    def _apply_persistent_constraint(self, c: SketchConstraint) -> bool:
+        """Add constraint with undo; False on conflict (message shown)."""
+        ctx = self._sketch_context()
+        if ctx is None:
+            return False
+        ctrl, sid = ctx
+        before = snapshot_sketch_contents(ctrl.sketch)
+        try:
+            add_constraint(ctrl.sketch, c)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                "Constraint conflict",
+                f"{exc}\n\nThe sketch was not changed.",
+            )
+            self.statusBar().showMessage(f"Constraint refused: {exc}", 5000)
+            return False
+        after = snapshot_sketch_contents(ctrl.sketch)
+        self.doc.record_sketch_contents(sid, before, after)
+        self.viewport.sync_sketch_visuals()
+        return True
+
+    def _make_horizontal(self) -> None:
+        ctx = self._sketch_context()
+        if ctx is None:
             return
-        ctrl = self.viewport._sketch_ctrl
-        sid = self.viewport._sketch_feature_id
+        ctrl, _sid = ctx
         n = 0
         for eid in list(ctrl.selected_ids):
             ent = ctrl.sketch.find_entity(eid)
             if not isinstance(ent, LineEntity):
                 continue
-            before = snapshot_entity(ent)
-            if kind == "horizontal":
-                make_line_horizontal(ent)
+            if self._apply_persistent_constraint(
+                SketchConstraint(id=-1, kind=ConstraintKind.HORIZONTAL, e0=int(eid))
+            ):
+                n += 1
             else:
-                make_line_vertical(ent)
-            after = snapshot_entity(ent)
-            self.doc.record_entity_move(sid, before, after)
-            n += 1
-        if n == 0:
+                break
+        if n == 0 and not any(
+            isinstance(ctrl.sketch.find_entity(e), LineEntity) for e in ctrl.selected_ids
+        ):
             self.statusBar().showMessage("Select one or more lines first", 2500)
-            return
-        self.viewport.sync_sketch_visuals()
-        self.statusBar().showMessage(f"{kind.title()} → {n} line(s)", 2500)
+        elif n:
+            self.statusBar().showMessage(f"Horizontal → {n} line(s)", 2500)
 
-    def _make_equal(self) -> None:
-        """Equal length: first selected line is source; others match it."""
-        if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:
+    def _make_vertical(self) -> None:
+        ctx = self._sketch_context()
+        if ctx is None:
             return
-        ctrl = self.viewport._sketch_ctrl
-        lines = [
-            ctrl.sketch.find_entity(eid)
-            for eid in ctrl.selected_ids
-            if isinstance(ctrl.sketch.find_entity(eid), LineEntity)
-        ]
-        lines = [e for e in lines if e is not None]
-        if len(lines) < 2:
-            self.statusBar().showMessage(
-                "Select at least two lines (first is the source length)", 3000
-            )
-            return
-        # Deterministic source: lowest entity id among selection order is unstable;
-        # use sorted ids so Equal is reproducible; status names the source.
+        ctrl, _sid = ctx
+        n = 0
+        for eid in list(ctrl.selected_ids):
+            ent = ctrl.sketch.find_entity(eid)
+            if not isinstance(ent, LineEntity):
+                continue
+            if self._apply_persistent_constraint(
+                SketchConstraint(id=-1, kind=ConstraintKind.VERTICAL, e0=int(eid))
+            ):
+                n += 1
+            else:
+                break
+        if n == 0 and not any(
+            isinstance(ctrl.sketch.find_entity(e), LineEntity) for e in ctrl.selected_ids
+        ):
+            self.statusBar().showMessage("Select one or more lines first", 2500)
+        elif n:
+            self.statusBar().showMessage(f"Vertical → {n} line(s)", 2500)
+
+    def _selected_lines(self):
+        ctx = self._sketch_context()
+        if ctx is None:
+            return []
+        ctrl, _ = ctx
         ids = sorted(
             eid
             for eid in ctrl.selected_ids
             if isinstance(ctrl.sketch.find_entity(eid), LineEntity)
         )
-        source = ctrl.sketch.find_entity(ids[0])
-        assert isinstance(source, LineEntity)
-        sid = self.viewport._sketch_feature_id
+        return [ctrl.sketch.find_entity(i) for i in ids]
+
+    def _make_equal(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage("Select at least two lines for Equal", 3000)
+            return
         n = 0
-        for eid in ids[1:]:
+        src = lines[0]
+        for ent in lines[1:]:
+            if self._apply_persistent_constraint(
+                SketchConstraint(
+                    id=-1,
+                    kind=ConstraintKind.EQUAL,
+                    e0=int(src.id),
+                    e1=int(ent.id),
+                )
+            ):
+                n += 1
+            else:
+                break
+        if n:
+            self.statusBar().showMessage(
+                f"Equal → {n} line(s) = "
+                f"{format_length(line_length(src), self.doc.display_unit)}",
+                3000,
+            )
+
+    def _make_parallel(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage("Select two lines for Parallel", 3000)
+            return
+        if self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.PARALLEL,
+                e0=int(lines[0].id),
+                e1=int(lines[1].id),
+            )
+        ):
+            self.statusBar().showMessage("Parallel applied", 2500)
+
+    def _make_perpendicular(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage("Select two lines for Perpendicular", 3000)
+            return
+        if self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.PERPENDICULAR,
+                e0=int(lines[0].id),
+                e1=int(lines[1].id),
+            )
+        ):
+            self.statusBar().showMessage("Perpendicular applied", 2500)
+
+    def _nearest_endpoints(self, a: LineEntity, b: LineEntity):
+        pairs = [
+            ("p0", "p0", a.p0, b.p0),
+            ("p0", "p1", a.p0, b.p1),
+            ("p1", "p0", a.p1, b.p0),
+            ("p1", "p1", a.p1, b.p1),
+        ]
+        best = min(
+            pairs,
+            key=lambda t: (t[2][0] - t[3][0]) ** 2 + (t[2][1] - t[3][1]) ** 2,
+        )
+        return best[0], best[1]
+
+    def _make_coincident(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage(
+                "Select two lines — nearest endpoints will stick together", 3000
+            )
+            return
+        h0, h1 = self._nearest_endpoints(lines[0], lines[1])
+        if self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.COINCIDENT,
+                e0=int(lines[0].id),
+                h0=h0,
+                e1=int(lines[1].id),
+                h1=h1,
+            )
+        ):
+            self.statusBar().showMessage(
+                f"Coincident → line {lines[0].id}.{h0} ↔ line {lines[1].id}.{h1}",
+                3000,
+            )
+
+    def _make_fix(self) -> None:
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, _ = ctx
+        n = 0
+        for eid in list(ctrl.selected_ids):
             ent = ctrl.sketch.find_entity(eid)
             if not isinstance(ent, LineEntity):
                 continue
-            before = snapshot_entity(ent)
-            make_lines_equal_length(source, ent)
-            after = snapshot_entity(ent)
-            self.doc.record_entity_move(sid, before, after)
-            n += 1
+            # Fix both endpoints of selected lines
+            for h in ("p0", "p1"):
+                if self._apply_persistent_constraint(
+                    SketchConstraint(
+                        id=-1, kind=ConstraintKind.FIX, e0=int(eid), h0=h
+                    )
+                ):
+                    n += 1
+                else:
+                    return
+        if n == 0:
+            self.statusBar().showMessage("Select a line to Fix its endpoints", 2500)
+        else:
+            self.statusBar().showMessage(f"Fix → {n} point(s)", 2500)
+
+    def _remove_constraints(self) -> None:
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, sid = ctx
+        if not ctrl.selected_ids:
+            self.statusBar().showMessage("Select entities to clear their constraints", 2500)
+            return
+        before = snapshot_sketch_contents(ctrl.sketch)
+        removed = 0
+        for eid in list(ctrl.selected_ids):
+            removed += remove_constraints_for_entity(ctrl.sketch, int(eid))
+        if removed == 0:
+            self.statusBar().showMessage("No constraints on selection", 2500)
+            return
+        after = snapshot_sketch_contents(ctrl.sketch)
+        self.doc.record_sketch_contents(sid, before, after)
         self.viewport.sync_sketch_visuals()
-        self.statusBar().showMessage(
-            f"Equal → {n} line(s) = {format_length(line_length(source), self.doc.display_unit)}",
-            3000,
-        )
+        self.statusBar().showMessage(f"Removed {removed} constraint(s)", 2500)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:

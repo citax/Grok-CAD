@@ -1539,12 +1539,14 @@ class Viewport(QWidget):
             pass
         self._dim_label_names: Set[str] = set()
         self._drag_before: Optional[dict] = None
+        self._drag_before_sketch: Optional[dict] = None
         self._clear_length_buffer()
         self._last_sketch_uv = (0.0, 0.0)
         self._draw_sketch_overlay()
         self._rebuild_all_sketch_entities()
         self._update_junction_dots()
         self._update_dim_labels()
+        self._update_constraint_glyphs()
         self._restyle_selection_only()
         self._request_render()
         plane = self._doc.find(f.plane_id)
@@ -2044,6 +2046,7 @@ class Viewport(QWidget):
         self._update_handles_visual()
         self._update_junction_dots()
         self._update_dim_labels()
+        self._update_constraint_glyphs()
 
     def sync_sketch_visuals(self) -> None:
         """Full resync after undo/redo/paste/unit change (clears ghost actors).
@@ -2561,14 +2564,21 @@ class Viewport(QWidget):
         uv = self._mouse_to_uv(x, y)
         if uv is None:
             return
-        # Snapshot before drag for undoable move
+        # Snapshot before drag for undoable move (full sketch if constraints)
         self._drag_before = None
+        self._drag_before_sketch = None
         if self._sketch_ctrl.tool == SketchTool.SELECT:
             h = self._sketch_ctrl.pick_handle(uv)
             if h is not None:
                 ent0 = self._sketch_ctrl.sketch.find_entity(h.entity_id)
                 if ent0 is not None:
-                    self._drag_before = snapshot_entity(ent0)
+                    sk0 = self._sketch_ctrl.sketch
+                    if getattr(sk0, "constraints", None):
+                        from cadcore.sketch import snapshot_sketch_contents
+
+                        self._drag_before_sketch = snapshot_sketch_contents(sk0)
+                    else:
+                        self._drag_before = snapshot_entity(ent0)
         n_before = len(self._sketch_ctrl.sketch.entities)
         msg = self._sketch_ctrl.on_press(
             uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
@@ -2680,19 +2690,35 @@ class Viewport(QWidget):
             uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
         )
         if was is not None:
-            ent = self._sketch_ctrl.sketch.find_entity(was.entity_id)
-            if ent:
-                self._upsert_entity_actor(ent)
-                if (
-                    self._doc is not None
-                    and self._sketch_feature_id >= 0
-                    and self._drag_before is not None
-                ):
-                    after = snapshot_entity(ent)
-                    self._doc.record_entity_move(
-                        self._sketch_feature_id, self._drag_before, after
-                    )
+            sk = self._sketch_ctrl.sketch
+            if (
+                self._doc is not None
+                and self._sketch_feature_id >= 0
+                and self._drag_before_sketch is not None
+            ):
+                from cadcore.sketch import snapshot_sketch_contents
+
+                after_sk = snapshot_sketch_contents(sk)
+                self._doc.record_sketch_contents(
+                    self._sketch_feature_id, self._drag_before_sketch, after_sk
+                )
+                self._rebuild_all_sketch_entities()
+            else:
+                ent = sk.find_entity(was.entity_id)
+                if ent:
+                    self._upsert_entity_actor(ent)
+                    if (
+                        self._doc is not None
+                        and self._sketch_feature_id >= 0
+                        and self._drag_before is not None
+                    ):
+                        after = snapshot_entity(ent)
+                        self._doc.record_entity_move(
+                            self._sketch_feature_id, self._drag_before, after
+                        )
             self._end_draw_lod()
+            self._update_handles_visual()
+            self._update_constraint_glyphs()
             self.sketch_status.emit(f"{self._sketch_ctrl.sketch.name} — edited")
         elif was_box:
             self._clear_selbox()
@@ -2722,7 +2748,59 @@ class Viewport(QWidget):
                 self._render_timer.stop()
             self._do_render()
         self._drag_before = None
+        self._drag_before_sketch = None
         self._request_render()
+
+    def _update_constraint_glyphs(self) -> None:
+        """Draw small markers so constrained geometry is visible in sketch mode."""
+        if not self.plotter or self._sketch_ctrl is None or not self.in_sketch_mode:
+            return
+        # Remove previous glyphs
+        for name in list(self.plotter.actors.keys()):
+            if str(name).startswith("__sk_cstr"):
+                self._remove_actor(name)
+        sk = self._sketch_ctrl.sketch
+        cons = getattr(sk, "constraints", None) or []
+        if not cons:
+            return
+        from cadcore.constraints import constraint_anchor_uv
+        import pyvista as pv
+
+        fr = sk.frame
+        # Group anchors by kind letter
+        letters = {
+            "HORIZONTAL": "H",
+            "VERTICAL": "V",
+            "PARALLEL": "∥",
+            "PERPENDICULAR": "⊥",
+            "EQUAL": "=",
+            "COINCIDENT": "●",
+            "FIX": "⚓",
+        }
+        for c in cons:
+            uv = constraint_anchor_uv(sk, c)
+            # Offset slightly so glyph sits off the geometry
+            w = fr.to_world((uv[0] + 0.8, uv[1] + 0.8))
+            kind = c.kind.name
+            label = letters.get(kind, "?")
+            try:
+                # Point cloud marker (always visible scale in sketch units)
+                pts = np.asarray([w], dtype=float)
+                cloud = pv.PolyData(pts)
+                name = f"__sk_cstr_{c.id}"
+                self.plotter.add_mesh(
+                    cloud,
+                    color="#f0c040",
+                    point_size=14,
+                    render_points_as_spheres=True,
+                    name=name,
+                    pickable=False,
+                    render=False,
+                )
+                # Store label in actor user data via status if needed
+                _ = label
+            except Exception:
+                continue
 
     # ----- pick / views -----
     def _on_mesh_pick(self, mesh) -> None:  # noqa: ANN001

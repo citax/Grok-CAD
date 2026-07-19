@@ -20,6 +20,7 @@ If the session is about to end or switch tasks and the working tree has intentio
 - Match **SolidWorks-like** workflow: feature tree, PropertyManager (select → set params → OK/Cancel), undo, save/reopen (`.gcad`).
 - **Fillet** rounds **edges on a solid** (`EDGE_FILLET`), not sketch-profile corners.
 - **Extrude** from a sketch on a solid face **merges** (boolean union) into that solid — one continuous body, no double-counted volume. Base extrudes from reference planes stay standalone.
+- **Sketch constraints** are persistent (coincident, parallel, perpendicular, H/V, equal, fix). They must survive drag, save/reopen; conflicts refuse and leave the sketch unchanged. Partial under-constraint is normal.
 - Keep the PropertyManager **compact** (~240px preferred, ≤300px max); selection/hint text must not clip and must not balloon the panel.
 - Failed features must show a clear message and **leave the part unchanged**.
 

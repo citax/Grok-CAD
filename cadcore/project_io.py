@@ -63,26 +63,34 @@ def deserialize_plane_frame(data: dict) -> PlaneFrame:
 
 
 def serialize_sketch(sk: Sketch) -> dict:
+    from cadcore.constraints import snapshot_constraint
+
     return {
         "name": sk.name,
         "plane_feature_id": int(sk.plane_feature_id),
         "frame": serialize_plane_frame(sk.frame),
         "entities": [snapshot_entity(e) for e in sk.entities],
         "dimensions": [snapshot_dimension(d) for d in sk.dimensions],
+        "constraints": [snapshot_constraint(c) for c in (getattr(sk, "constraints", None) or [])],
         "next_entity_id": int(sk._next_entity_id),
         "next_dim_id": int(sk._next_dim_id),
+        "next_constraint_id": int(getattr(sk, "_next_constraint_id", 1)),
     }
 
 
 def deserialize_sketch(data: dict) -> Sketch:
+    from cadcore.constraints import restore_constraint
+
     sk = Sketch(
         name=str(data.get("name", "Sketch")),
         plane_feature_id=int(data.get("plane_feature_id", -1)),
         frame=deserialize_plane_frame(data["frame"]),
         entities=[],
         dimensions=[],
+        constraints=[],
         _next_entity_id=int(data.get("next_entity_id", 1)),
         _next_dim_id=int(data.get("next_dim_id", 1)),
+        _next_constraint_id=int(data.get("next_constraint_id", 1)),
     )
     for ed in data.get("entities") or []:
         # JSON may turn tuples into lists — restore_entity handles sequences
@@ -93,11 +101,17 @@ def deserialize_sketch(data: dict) -> Sketch:
         sk.entities.append(restore_entity(ed))
     for dd in data.get("dimensions") or []:
         sk.dimensions.append(restore_dimension(dd))
+    for cd in data.get("constraints") or []:
+        sk.constraints.append(restore_constraint(cd))
     # Ensure counters cover restored ids
     if sk.entities:
         sk._next_entity_id = max(sk._next_entity_id, max(e.id for e in sk.entities) + 1)
     if sk.dimensions:
         sk._next_dim_id = max(sk._next_dim_id, max(d.id for d in sk.dimensions) + 1)
+    if sk.constraints:
+        sk._next_constraint_id = max(
+            sk._next_constraint_id, max(c.id for c in sk.constraints) + 1
+        )
     return sk
 
 

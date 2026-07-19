@@ -557,6 +557,18 @@ class SketchController:
             return
         if isinstance(ent, (LineEntity, RectEntity, CircleEntity)):
             ent.set_handle(self.drag.handle_name, uv)
+            # Keep geometric relationships after the drag
+            if getattr(self.sketch, "constraints", None):
+                from cadcore.constraints import solve_sketch
+
+                solve_sketch(
+                    self.sketch,
+                    drag=(
+                        int(self.drag.entity_id),
+                        str(self.drag.handle_name),
+                        (float(uv[0]), float(uv[1])),
+                    ),
+                )
 
     def _try_finish_draw(self) -> Optional[str]:
         if self.draw is None:

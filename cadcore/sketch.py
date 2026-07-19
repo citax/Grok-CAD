@@ -239,8 +239,11 @@ class Sketch:
     frame: PlaneFrame = field(default_factory=lambda: PlaneFrame.from_plane_type("FRONT"))
     entities: List[SketchEntity] = field(default_factory=list)
     dimensions: List[SketchDimension] = field(default_factory=list)
+    # Persistent geometric relationships (see cadcore.constraints)
+    constraints: list = field(default_factory=list)
     _next_entity_id: int = 1
     _next_dim_id: int = 1
+    _next_constraint_id: int = 1
 
     def add_line(self, p0: Vec2, p1: Vec2) -> LineEntity:
         e = LineEntity(id=self._next_entity_id, kind=EntityKind.LINE, p0=p0, p1=p1)
@@ -625,25 +628,41 @@ def restore_dimension(data: dict) -> SketchDimension:
 
 
 def snapshot_sketch_contents(sk: Sketch) -> dict:
-    """Full entity + dimension state for undo of bulk sketch mutations (e.g. fillet)."""
+    """Full entity + dimension + constraint state for undo / bulk mutations."""
+    from cadcore.constraints import snapshot_constraint
+
     return {
         "entities": [snapshot_entity(e) for e in sk.entities],
         "dimensions": [snapshot_dimension(d) for d in sk.dimensions],
+        "constraints": [snapshot_constraint(c) for c in (sk.constraints or [])],
         "_next_entity_id": int(sk._next_entity_id),
         "_next_dim_id": int(sk._next_dim_id),
+        "_next_constraint_id": int(getattr(sk, "_next_constraint_id", 1)),
     }
 
 
 def restore_sketch_contents(sk: Sketch, data: dict) -> None:
-    """Replace sketch entities/dimensions from snapshot_sketch_contents()."""
+    """Replace sketch entities/dimensions/constraints from snapshot_sketch_contents()."""
+    from cadcore.constraints import restore_constraint
+
     sk.entities.clear()
     sk.dimensions.clear()
+    sk.constraints = []
     for ed in data.get("entities") or []:
         sk.entities.append(restore_entity(ed))
     for dd in data.get("dimensions") or []:
         sk.dimensions.append(restore_dimension(dd))
+    for cd in data.get("constraints") or []:
+        sk.constraints.append(restore_constraint(cd))
     sk._next_entity_id = int(data.get("_next_entity_id", sk._next_entity_id))
     sk._next_dim_id = int(data.get("_next_dim_id", sk._next_dim_id))
+    sk._next_constraint_id = int(
+        data.get("_next_constraint_id", getattr(sk, "_next_constraint_id", 1))
+    )
+    if sk.constraints:
+        sk._next_constraint_id = max(
+            sk._next_constraint_id, max(c.id for c in sk.constraints) + 1
+        )
 
 
 def restore_entity(data: dict) -> SketchEntity:

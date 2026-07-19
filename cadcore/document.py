@@ -311,6 +311,11 @@ def copy_sketch(sk: Optional[Sketch]) -> Optional[Sketch]:
                 value_mm=float(d.value_mm),
             )
         )
+    from cadcore.constraints import restore_constraint, snapshot_constraint
+
+    for c in getattr(sk, "constraints", None) or []:
+        out.constraints.append(restore_constraint(snapshot_constraint(c)))
+    out._next_constraint_id = int(getattr(sk, "_next_constraint_id", 1))
     return out
 
 
@@ -331,6 +336,10 @@ def sketch_fingerprint(sk: Optional[Sketch]) -> str:
             parts.append(
                 f"C{e.id}:{e.center[0]:.6g},{e.center[1]:.6g},{e.radius:.6g}"
             )
+    for c in getattr(sk, "constraints", None) or []:
+        parts.append(
+            f"K{c.id}:{c.kind.name}:{c.e0}:{c.h0}:{c.e1}:{c.h1}:{c.u:.6g}:{c.v:.6g}"
+        )
     return ";".join(parts)
 
 
@@ -509,6 +518,26 @@ class EntityMoveCommand(HistoryCommand):
 
     def description(self) -> str:
         return "Move entity"
+
+
+class SketchContentsCommand(HistoryCommand):
+    """Undoable full sketch geometry + dimensions + constraints replace."""
+
+    def __init__(self, sketch_id: int, before: dict, after: dict) -> None:
+        self.sketch_id = int(sketch_id)
+        self.before = dict(before)
+        self.after = dict(after)
+
+    def redo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        restore_sketch_contents(sk, self.after)
+
+    def undo(self, doc: "Document") -> None:
+        sk = _sketch_of(doc, self.sketch_id)
+        restore_sketch_contents(sk, self.before)
+
+    def description(self) -> str:
+        return "Edit sketch"
 
 
 class DimensionApplyCommand(HistoryCommand):
@@ -909,15 +938,19 @@ class Document:
 
     def delete_entity(self, sketch_id: int, eid: int) -> bool:
         """Delete sketch entity (undoable), restoring its dimensions on undo."""
+        from cadcore.constraints import remove_constraints_for_entity
+
         sk = _sketch_of(self, sketch_id)
         idx = next((i for i, e in enumerate(sk.entities) if e.id == eid), -1)
         if idx < 0:
             return False
-        data = snapshot_entity(sk.entities[idx])
-        dims = [snapshot_dimension(d) for d in sk.dimensions_for_entity(eid)]
+        # Full snapshot so constraints involving this entity restore correctly
+        before = snapshot_sketch_contents(sk)
         sk.remove_entity(eid)
         sk.remove_dimensions_for_entity(eid)
-        self.push_command(EntityDeleteCommand(sketch_id, data, idx, dims))
+        remove_constraints_for_entity(sk, eid)
+        after = snapshot_sketch_contents(sk)
+        self.push_command(SketchContentsCommand(sketch_id, before, after))
         return True
 
     def delete_entities(self, sketch_id: int, eids: List[int]) -> int:
@@ -950,6 +983,14 @@ class Document:
         if before == after:
             return
         self.push_command(EntityMoveCommand(sketch_id, before, after))
+
+    def record_sketch_contents(
+        self, sketch_id: int, before: dict, after: dict
+    ) -> None:
+        """Record multi-entity / constraint sketch change if before != after."""
+        if before == after:
+            return
+        self.push_command(SketchContentsCommand(sketch_id, before, after))
 
     def record_feature_add(self, f: Feature) -> None:
         """Feature already added; push undoable feature-add."""
