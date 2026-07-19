@@ -185,6 +185,9 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFeature.DockWidgetMovable
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
         )
+        # Compact SolidWorks-like width — do not let the panel dominate the window
+        dock.setMinimumWidth(200)
+        dock.setMaximumWidth(PropertyPanel.MAX_WIDTH + 16)
         self.props = PropertyPanel(self)
         self.props.set_document(self.doc)
         self.props.params_applied.connect(self._on_props_applied)
@@ -193,6 +196,9 @@ class MainWindow(QMainWindow):
         self.props.command_cancel.connect(self._on_command_cancel)
         dock.setWidget(self.props)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._props_dock = dock
+        # Prefer ~240px; user can still drag wider up to MAX_WIDTH
+        self.resizeDocks([dock], [PropertyPanel.PREFERRED_WIDTH], Qt.Orientation.Horizontal)
         # Active feature command: {"kind": "extrude"|..., "sketch_id": int, "target_id": int}
         self._feature_cmd: Optional[dict] = None
         self._await_face_sketch: bool = False

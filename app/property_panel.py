@@ -37,9 +37,18 @@ class PropertyPanel(QWidget):
     command_ok = Signal()
     command_cancel = Signal()
 
+    # Compact SolidWorks-like panel width (content + form labels)
+    PREFERRED_WIDTH = 240
+    MAX_WIDTH = 300
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("PropertiesPanel")
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(self.MAX_WIDTH)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
+        )
         self._doc: Optional[Document] = None
         self._feature_id: int = -1
         self._sketch_line: Optional[tuple] = None
@@ -56,11 +65,12 @@ class PropertyPanel(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         self._form = QFormLayout(body)
-        self._form.setContentsMargins(12, 12, 12, 12)
-        self._form.setHorizontalSpacing(12)
-        self._form.setVerticalSpacing(10)
+        self._form.setContentsMargins(8, 8, 8, 8)
+        self._form.setHorizontalSpacing(8)
+        self._form.setVerticalSpacing(6)
         self._form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -83,20 +93,21 @@ class PropertyPanel(QWidget):
         self._selection_label.setObjectName("fieldValue")
         self._selection_label.setWordWrap(True)
         self._selection_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self._selection_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
         )
         self._selection_label.setMinimumHeight(0)
+        self._selection_label.setMaximumHeight(72)
         self._selection_label.hide()
         self._form.addRow(self._lbl("Selection"), self._selection_label)
 
         self._dyn_host = QWidget()
         self._dyn_layout = QFormLayout(self._dyn_host)
         self._dyn_layout.setContentsMargins(0, 0, 0, 0)
-        self._dyn_layout.setHorizontalSpacing(12)
-        self._dyn_layout.setVerticalSpacing(10)
+        self._dyn_layout.setHorizontalSpacing(8)
+        self._dyn_layout.setVerticalSpacing(6)
         self._form.addRow(self._dyn_host)
 
         self._hint = QLabel("Nothing selected.")
@@ -106,13 +117,14 @@ class PropertyPanel(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
         self._hint.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
         )
         self._hint.setMinimumHeight(0)
+        self._hint.setMaximumHeight(64)
         self._form.addRow(self._hint)
 
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(12, 4, 12, 12)
+        btn_row.setContentsMargins(8, 4, 8, 8)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_cancel.hide()
@@ -132,32 +144,45 @@ class PropertyPanel(QWidget):
 
         self.show_empty()
 
+    def sizeHint(self):  # noqa: N802
+        from PySide6.QtCore import QSize
+
+        return QSize(self.PREFERRED_WIDTH, 320)
+
     @staticmethod
     def _lbl(text: str) -> QLabel:
         l = QLabel(text)
         l.setObjectName("fieldLabel")
         return l
 
-    def _fit_wrapped_label(self, label: QLabel, *, min_lines: int = 1) -> None:
-        """Ensure wrapped labels are tall enough that text is never vertically clipped.
+    def _content_width(self) -> int:
+        """Usable width for wrapped field text inside this compact panel."""
+        w = int(self.width())
+        if w < 80:
+            w = self.PREFERRED_WIDTH
+        # form label (~64) + margins + spacing
+        return max(120, min(w - 72, 220))
 
-        QFormLayout often sizes multi-line QLabels before the final width is known,
-        which clips the bottom of the glyphs. heightForWidth fixes that.
+    def _fit_wrapped_label(self, label: QLabel, *, max_lines: int = 3) -> None:
+        """Size wrapped labels just tall enough — keep the PropertyManager compact.
+
+        Avoids the previous bug where min_lines floors + heightForWidth inflated
+        the panel to a huge empty state.
         """
         label.setWordWrap(True)
-        # Prefer the label's current width; fall back to a typical PropertyManager width
-        w = int(label.width())
-        if w < 40:
-            # Dock panel body is typically ~220–280px; leave room for the form label
-            host_w = int(self.width()) if self.width() > 80 else 260
-            w = max(160, host_w - 100)
-        # Qt heightForWidth includes the text layout; add padding for the styled box
-        h = int(label.heightForWidth(w))
         fm = label.fontMetrics()
-        line_h = max(fm.height() + fm.leading(), 16)
-        pad = 16  # matches fieldValue vertical padding (≈8 top + 8 bottom)
-        floor = min_lines * line_h + pad
-        label.setMinimumHeight(max(h + 4, floor))
+        line = max(fm.lineSpacing(), 14)
+        w = self._content_width()
+        text = label.text() or ""
+        # boundingRect is more reliable than heightForWidth for short wraps
+        br = fm.boundingRect(0, 0, w, 2000, int(Qt.TextFlag.TextWordWrap), text)
+        text_h = max(br.height(), line)
+        pad = 10 if label.objectName() == "fieldValue" else 4
+        need = text_h + pad
+        cap = max_lines * line + pad + 2
+        h = max(line + pad // 2, min(need, cap))
+        label.setMinimumHeight(h)
+        label.setMaximumHeight(cap)
         label.updateGeometry()
 
     def set_document(self, doc: Document) -> None:
@@ -194,11 +219,10 @@ class PropertyPanel(QWidget):
         self.prop_name.setText("")
         self.prop_type.setText("")
         self._hint.setText(
-            "Nothing selected.\n\n"
-            "Select a feature in the tree or viewport, or start a command "
+            "Nothing selected. Pick a feature or start a command "
             "(Sketch, Extrude, Cut, Fillet…)."
         )
-        self._fit_wrapped_label(self._hint, min_lines=3)
+        self._fit_wrapped_label(self._hint, max_lines=3)
         self._set_mode_buttons(apply=False, ok=False)
         self._building = False
 
@@ -216,10 +240,9 @@ class PropertyPanel(QWidget):
         self.prop_type.setText(f.type.name.replace("_", " ").title())
         self._clear_dyn()
         self._hint.setText(
-            "Reference plane — fixed document geometry.\n"
-            "Not renameable or editable. Select a plane and click Sketch to draw on it."
+            "Reference plane — fixed. Select it and click Sketch to draw."
         )
-        self._fit_wrapped_label(self._hint, min_lines=2)
+        self._fit_wrapped_label(self._hint, max_lines=2)
         self._set_mode_buttons(apply=False, ok=False)
         self._building = False
 
@@ -336,7 +359,7 @@ class PropertyPanel(QWidget):
         else:
             self._hint.setText("—")
             self.btn_apply.setEnabled(False)
-        self._fit_wrapped_label(self._hint, min_lines=2)
+        self._fit_wrapped_label(self._hint, max_lines=2)
         self._building = False
 
     def show_sketch_line(
@@ -356,7 +379,7 @@ class PropertyPanel(QWidget):
         self._clear_dyn()
         self._add_length("line_len", "Length", line_length(ent), unit)
         self._hint.setText("Type exact length, then Apply.")
-        self._fit_wrapped_label(self._hint, min_lines=1)
+        self._fit_wrapped_label(self._hint, max_lines=1)
         self._set_mode_buttons(apply=True, ok=False)
         self._building = False
 
@@ -384,7 +407,7 @@ class PropertyPanel(QWidget):
         self.prop_type.setText("Command")
         self._selection_label.setText(selection_text or "Nothing selected yet.")
         self._selection_label.show()
-        self._fit_wrapped_label(self._selection_label, min_lines=2)
+        self._fit_wrapped_label(self._selection_label, max_lines=3)
         self._clear_dyn()
 
         if command in ("extrude", "cut"):
@@ -413,19 +436,17 @@ class PropertyPanel(QWidget):
             )
 
         if ready:
-            self._hint.setText("Adjust settings, then OK to apply — or Cancel.")
+            self._hint.setText("Adjust settings, then OK — or Cancel.")
         else:
             if command == "fillet":
                 self._hint.setText(
-                    "Click edges on a solid to fillet, set the radius, "
-                    "then press OK. Cancel exits the command."
+                    "Click solid edges, set radius, then OK."
                 )
             else:
                 self._hint.setText(
-                    "Select what this feature acts on (sketch / solid), "
-                    "then adjust settings and press OK. Cancel exits the command."
+                    "Select sketch/solid, set values, then OK."
                 )
-        self._fit_wrapped_label(self._hint, min_lines=2)
+        self._fit_wrapped_label(self._hint, max_lines=2)
         self._set_mode_buttons(apply=False, ok=ready)
         # Allow OK only when selection is ready; user can still cancel
         self.btn_ok.setEnabled(ready)
@@ -437,20 +458,16 @@ class PropertyPanel(QWidget):
         if self._mode != "command":
             return
         self._selection_label.setText(selection_text)
-        self._fit_wrapped_label(self._selection_label, min_lines=2)
+        self._fit_wrapped_label(self._selection_label, max_lines=3)
         self.btn_ok.setEnabled(ready)
         if ready:
-            self._hint.setText("Selection ready. Adjust settings, then OK — or Cancel.")
+            self._hint.setText("Ready — adjust settings, then OK.")
         else:
             if self._command == "fillet":
-                self._hint.setText(
-                    "Click edges on a solid to fillet, then OK. Cancel exits."
-                )
+                self._hint.setText("Click solid edges, then OK.")
             else:
-                self._hint.setText(
-                    "Select what this feature acts on, then OK. Cancel exits."
-                )
-        self._fit_wrapped_label(self._hint, min_lines=2)
+                self._hint.setText("Select what this feature acts on, then OK.")
+        self._fit_wrapped_label(self._hint, max_lines=2)
 
     def read_command_params(self) -> dict:
         """Read typed values for the active command. Raises ValueError if invalid."""

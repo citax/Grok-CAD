@@ -101,11 +101,18 @@ def main() -> int:
     )
     assert loaded.update_feature_params(fl2.id, radius=4.0)
 
-    # ----- 2) PropertyManager selection / hint not height-clipped -----
+    # ----- 2) PropertyManager stays compact; text still fully readable -----
     p = PropertyPanel()
-    p.resize(280, 600)
+    p.resize(PropertyPanel.PREFERRED_WIDTH, 400)
     p.show()
     app.processEvents()
+    assert p.maximumWidth() <= PropertyPanel.MAX_WIDTH
+    assert p.sizeHint().width() <= PropertyPanel.PREFERRED_WIDTH + 20
+    print(
+        f"[edge_fillet_verify] PM sizeHint={p.sizeHint().width()}x{p.sizeHint().height()} "
+        f"maxW={p.maximumWidth()}",
+        flush=True,
+    )
     for state, kwargs in (
         ("empty", None),
         (
@@ -152,24 +159,20 @@ def main() -> int:
         app.processEvents()
         sel = p._selection_label
         hint = p._hint
+        # Compact caps — panel must not balloon
+        assert hint.maximumHeight() <= 72, f"{state}: hint maxH={hint.maximumHeight()}"
+        assert hint.minimumHeight() <= 64, f"{state}: hint minH={hint.minimumHeight()}"
         if not sel.isHidden():
-            need = sel.heightForWidth(max(sel.width(), 160))
-            assert sel.minimumHeight() >= need - 1 or sel.height() >= need - 1, (
-                f"{state}: selection label clipped "
-                f"minH={sel.minimumHeight()} h={sel.height()} need={need}"
-            )
+            assert sel.maximumHeight() <= 80, f"{state}: sel maxH={sel.maximumHeight()}"
+            assert sel.minimumHeight() <= 72, f"{state}: sel minH={sel.minimumHeight()}"
             print(
                 f"[edge_fillet_verify] PM {state}: selection "
-                f"minH={sel.minimumHeight()} h={sel.height()} need≈{need}",
+                f"minH={sel.minimumHeight()} maxH={sel.maximumHeight()}",
                 flush=True,
             )
-        need_h = hint.heightForWidth(max(hint.width(), 160))
-        assert hint.minimumHeight() >= need_h - 1 or hint.height() >= need_h - 1, (
-            f"{state}: hint clipped minH={hint.minimumHeight()} h={hint.height()} need={need_h}"
-        )
         print(
             f"[edge_fillet_verify] PM {state}: hint "
-            f"minH={hint.minimumHeight()} h={hint.height()} need≈{need_h}",
+            f"minH={hint.minimumHeight()} maxH={hint.maximumHeight()}",
             flush=True,
         )
     p.close()

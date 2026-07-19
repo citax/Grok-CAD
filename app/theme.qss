@@ -266,17 +266,14 @@ QLabel#fieldValue {
     color: @TEXT_PRIMARY;
     background-color: @BG_ELEVATED;
     border: 1px solid @BORDER;
-    border-radius: 6px;
-    /* Padding + min-height must leave room for a full line of glyphs;
-       previously min-height:18 with padding:6 clipped descenders. */
-    padding: 8px 10px;
-    min-height: 22px;
+    border-radius: 4px;
+    /* Compact PM fields: enough for one full line of glyphs, not a tall block */
+    padding: 4px 8px;
+    min-height: 16px;
 }
 QLabel#secondaryLabel {
-    /* Multi-line command hints must not clip the last line */
-    padding-top: 2px;
-    padding-bottom: 4px;
-    min-height: 1.3em;
+    padding-top: 1px;
+    padding-bottom: 2px;
 }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: @BG_ELEVATED;
