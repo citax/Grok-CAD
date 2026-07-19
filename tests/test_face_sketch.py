@@ -58,13 +58,21 @@ def test_front_extrude_top_face_sketch_and_boss():
     # UV on face: small boss footprint
     sk2.sketch.add_rectangle((-5.0, -5.0), (5.0, 5.0))
     ex2 = doc.create_extrude(sk2.id, 10.0)
+    assert ex2.operand_b == ex1.id  # merges into base solid
     mesh2 = doc.evaluate_feature(ex2.id)
-    assert mesh2 is not None
+    assert mesh2 is not None and mesh2.is_watertight()
     zs = mesh2.vertices[:, 2]
-    assert zs.min() == pytest.approx(15.0, abs=1e-4)
+    # Merged body includes the base (z from 0) and boss up to 25
+    assert zs.min() == pytest.approx(0.0, abs=1e-4)
     assert zs.max() == pytest.approx(25.0, abs=1e-4)
-    # Volume of 10×10×10 boss
-    assert abs(mesh2.volume() - 1000.0) < 1e-3
+    # Base 40×30×15 + boss 10×10×10 (no volume overlap at coplanar face)
+    v_base = 40.0 * 30.0 * 15.0
+    v_boss = 10.0 * 10.0 * 10.0
+    assert abs(mesh2.volume() - (v_base + v_boss)) < 1e-2
+    # Single body in the display (parent consumed)
+    display = doc.evaluate_display_solids()
+    assert ex2.id in display
+    assert ex1.id not in display
 
 
 def test_create_sketch_on_face_rejects_plane():

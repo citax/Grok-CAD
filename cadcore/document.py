@@ -354,7 +354,9 @@ class Feature:
     sketch: Optional[Sketch] = None
     # Extrude (pad): operand_a = source sketch id, depth = distance (always ≥ 0),
     # profile_entity_id = closed entity (or -1 → first closed profile),
-    # reversed = pad along −plane normal (SolidWorks "Reverse Direction")
+    # reversed = pad along −plane normal (SolidWorks "Reverse Direction"),
+    # operand_b = parent solid to merge into when sketch is on a solid face
+    #            (−1 = base feature, no merge — standalone body)
     profile_entity_id: int = -1
     reversed: bool = False
     # Revolve: operand_a = sketch id, revolve_angle in degrees (default 360),
@@ -1194,11 +1196,17 @@ class Document:
         profile_entity_id: int = -1,
         segments: int = 64,
         reversed: bool = False,
+        merge_solid_id: Optional[int] = None,
     ) -> Feature:
         """Pad a closed sketch profile by ``distance`` along ±plane normal.
 
         ``distance`` is always a positive magnitude. ``reversed=True`` pads along
         the opposite of the sketch plane normal (SolidWorks Reverse Direction).
+
+        When the sketch lives on a solid face (or ``merge_solid_id`` is given),
+        the boss is **boolean-unioned** into that solid so the result is one
+        continuous body (SolidWorks Boss-Extrude / merge result). Overlapping
+        volume is counted once.
         """
         skf = self.find(sketch_id)
         if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
@@ -1214,8 +1222,23 @@ class Document:
         if not np.isfinite(dist) or dist <= 1e-12:
             raise ValueError("extrude distance must be a positive finite number")
         rev = bool(reversed)
-        # Validate by building once (also catches open types / holes)
-        _ = extrude_profile(
+        # Parent solid for merge: explicit arg, else sketch-on-face plane_id
+        merge_id = -1
+        if merge_solid_id is not None:
+            merge_id = int(merge_solid_id)
+        elif int(skf.plane_id) >= 0:
+            parent = self.find(int(skf.plane_id))
+            if parent is not None and is_solid_feature(parent.type):
+                merge_id = int(parent.id)
+        if merge_id >= 0:
+            parent = self.find(merge_id)
+            if parent is None or not is_solid_feature(parent.type):
+                raise ValueError("extrude merge target is not a valid solid")
+            if merge_id == sketch_id:
+                raise ValueError("extrude cannot merge into its own sketch")
+
+        # Validate tool (and merge) before committing history
+        tool = extrude_profile(
             ent,
             dist,
             sketch.frame,
@@ -1223,6 +1246,19 @@ class Document:
             holes=resolved.holes,
             reversed=rev,
         )
+        if merge_id >= 0:
+            body = self.evaluate_feature(merge_id)
+            if body is None or body.empty:
+                raise ValueError("cannot merge extrude: parent solid has no mesh")
+            try:
+                merged = boolean_op(body, tool, BooleanOp.UNION)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"could not merge boss into solid: {exc}") from exc
+            if merged.empty:
+                raise ValueError("merged extrude is empty")
+            if not merged.is_watertight():
+                raise ValueError("merged extrude is not watertight")
+
         self._extrude_count += 1
         f = Feature(
             type=FeatureType.EXTRUDE,
@@ -1230,6 +1266,7 @@ class Document:
             depth=dist,
             segments=int(segments),
             operand_a=sketch_id,
+            operand_b=int(merge_id),
             profile_entity_id=int(profile_entity_id),
             reversed=rev,
         )
@@ -1691,6 +1728,17 @@ class Document:
                 holes=resolved.holes,
                 reversed=bool(getattr(f, "reversed", False)),
             )
+            # Sketch-on-face boss: union into parent solid (one continuous body)
+            if int(getattr(f, "operand_b", -1)) >= 0:
+                body = self.evaluate_feature(int(f.operand_b))
+                if body is None or body.empty:
+                    return None
+                try:
+                    mesh = boolean_op(body, mesh, BooleanOp.UNION)
+                except Exception:
+                    return None
+                if mesh is None or mesh.empty:
+                    return None
         elif f.type is FeatureType.FILLET:
             skf = self.find(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -1849,6 +1897,9 @@ class Document:
                     used.add(f.operand_b)
             # Cut consumes its target solid (like boolean difference operand)
             if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
+                used.add(f.operand_b)
+            # Boss-extrude merges into parent solid — show only the result
+            if f.type is FeatureType.EXTRUDE and f.operand_b >= 0:
                 used.add(f.operand_b)
             # Edge fillet replaces its parent solid in the display
             if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:

@@ -79,6 +79,11 @@ def feature_fingerprint_with_deps(f: Feature, by_id: Dict[int, Feature]) -> str:
         parent = by_id.get(int(f.operand_b))
         if parent is not None:
             deps.append("pb:" + feature_fingerprint(parent))
+    # Boss-extrude merges into parent solid
+    if f.type is FeatureType.EXTRUDE and int(f.operand_b) >= 0:
+        parent = by_id.get(int(f.operand_b))
+        if parent is not None:
+            deps.append("pb:" + feature_fingerprint(parent))
     if not deps:
         return base
     return base + "|" + "|".join(deps)
@@ -172,6 +177,19 @@ def evaluate_solids_snapshot(
                 holes=resolved.holes,
                 reversed=bool(getattr(f, "reversed", False)),
             )
+            if int(getattr(f, "operand_b", -1)) >= 0:
+                body = eval_one(int(f.operand_b))
+                if body is None or body.empty:
+                    cache[fid] = None
+                    return None
+                try:
+                    mesh = boolean_op(body, mesh, BooleanOp.UNION)
+                except Exception:
+                    cache[fid] = None
+                    return None
+                if mesh is None or mesh.empty:
+                    cache[fid] = None
+                    return None
         elif f.type is FeatureType.FILLET:
             skf = by_id.get(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -338,6 +356,8 @@ def evaluate_solids_snapshot(
             if f.operand_b >= 0:
                 used.add(f.operand_b)
         if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
+            used.add(f.operand_b)
+        if f.type is FeatureType.EXTRUDE and f.operand_b >= 0:
             used.add(f.operand_b)
         if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:
             used.add(f.operand_a)
