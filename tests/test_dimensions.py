@@ -53,6 +53,23 @@ def test_circle_diameter_drives():
     assert c.radius == pytest.approx(5.0)
 
 
+def test_arc_radius_keeps_endpoints():
+    from cadcore.sketch import ArcEntity, set_arc_radius
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    arc = sk.add_arc((0, 0), (4, 3), (8, 0))
+    assert isinstance(arc, ArcEntity)
+    p0, p1 = arc.p0(), arc.p1()
+    set_arc_radius(arc, 20.0)
+    assert arc.radius == pytest.approx(20.0)
+    assert arc.p0()[0] == pytest.approx(p0[0], abs=1e-6)
+    assert arc.p0()[1] == pytest.approx(p0[1], abs=1e-6)
+    assert arc.p1()[0] == pytest.approx(p1[0], abs=1e-6)
+    assert arc.p1()[1] == pytest.approx(p1[1], abs=1e-6)
+    assert measure_dimension_value(arc, "radius") == pytest.approx(20.0)
+    assert infer_dimension_role(arc) == "radius"
+
+
 def test_infer_role_for_rect_edges():
     """Clicked edge's length is the dimension — not the perpendicular span."""
     sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))

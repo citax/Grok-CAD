@@ -94,6 +94,45 @@ def test_radius_dimension_holds_after_drag():
     assert arc.radius == pytest.approx(12.0, abs=1e-3)
 
 
+def test_radius_dimension_keeps_endpoints():
+    """Resizing via radius dim must not scale endpoints about the center.
+
+    The old center-fixed radius write made the drawn arc jump/vanish; the
+    SolidWorks-like promise is: same p0/p1, new bulge (center moves).
+    """
+    doc, skf, sk = _doc_sketch()
+    arc = sk.add_arc((0, 0), (5, 4), (10, 0))
+    p0_before = tuple(arc.p0())
+    p1_before = tuple(arc.p1())
+    mid_before = tuple(arc.mid_uv())
+    r_before = float(arc.radius)
+    target = r_before * 1.8
+    doc.apply_sketch_dimension(skf.id, arc.id, "radius", target)
+    assert arc.radius == pytest.approx(target, abs=1e-6)
+    assert arc.p0()[0] == pytest.approx(p0_before[0], abs=1e-6)
+    assert arc.p0()[1] == pytest.approx(p0_before[1], abs=1e-6)
+    assert arc.p1()[0] == pytest.approx(p1_before[0], abs=1e-6)
+    assert arc.p1()[1] == pytest.approx(p1_before[1], abs=1e-6)
+    # Bulge changed (mid moved) while ends stayed put
+    mid_after = tuple(arc.mid_uv())
+    assert np.hypot(mid_after[0] - mid_before[0], mid_after[1] - mid_before[1]) > 0.5
+    # Entity still present (no "disappear")
+    assert sk.find_entity(arc.id) is arc
+
+
+def test_radius_dimension_rejects_too_small():
+    doc, skf, sk = _doc_sketch()
+    arc = sk.add_arc((0, 0), (5, 4), (10, 0))
+    p0_before = tuple(arc.p0())
+    r_before = float(arc.radius)
+    # Chord is 10 → min R is 5
+    with pytest.raises(ValueError, match="too small"):
+        doc.apply_sketch_dimension(skf.id, arc.id, "radius", 2.0)
+    # Sketch unchanged on refuse
+    assert arc.radius == pytest.approx(r_before)
+    assert arc.p0()[0] == pytest.approx(p0_before[0], abs=1e-9)
+
+
 def test_tangent_survives_drag():
     doc, skf, sk = _doc_sketch()
     ln = sk.add_line((0, 0), (10, 0))

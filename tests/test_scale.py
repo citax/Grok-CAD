@@ -73,6 +73,17 @@ def test_sketch_entity_extent_and_parallel_scale():
     assert ps >= ext
 
 
+def test_sketch_entity_extent_handles_arc():
+    """ArcEntity.p0/p1 are methods — extent must not crash or use chord only."""
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    sk.add_arc((0, 0), (5, 5), (10, 0))
+    ext = sketch_entity_uv_extent(sk.entities)
+    assert ext > 0.0
+    assert math.isfinite(ext)
+    # Bulge goes to y≈5; extent must exceed half the chord alone (~5)
+    assert ext >= 5.0
+
+
 def test_origin_glyph_sizes_track_axes():
     h1, r1 = origin_glyph_sizes(50.0)
     h2, r2 = origin_glyph_sizes(500.0)

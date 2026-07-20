@@ -726,6 +726,94 @@ def set_circle_diameter(ent: CircleEntity, diameter: float) -> None:
     ent.radius = max(1e-12, float(diameter) * 0.5)
 
 
+def set_arc_radius(ent: ArcEntity, radius: float) -> None:
+    """Drive arc radius while keeping endpoints fixed (SolidWorks-style).
+
+    Only the center (and angles) move so the curve still spans the same p0→p1
+    chord; the bulge side is preserved.  Scaling about a fixed center is wrong
+    here — endpoints would fly outward and the drawn arc would appear to vanish.
+    """
+    r = max(1e-9, float(radius))
+    if not np.isfinite(r):
+        raise ValueError("arc radius must be finite")
+    p0 = ent.p0()
+    p1 = ent.p1()
+    mid_old = ent.mid_uv()
+    ax, ay = float(p0[0]), float(p0[1])
+    bx, by = float(p1[0]), float(p1[1])
+    dx, dy = bx - ax, by - ay
+    chord = float(np.hypot(dx, dy))
+    if chord < 1e-12:
+        # Degenerate endpoints: fall back to center-fixed scale
+        ent.radius = r
+        return
+    half = 0.5 * chord
+    if r + 1e-12 < half:
+        raise ValueError(
+            f"radius {r:g} is too small for the arc chord ({chord:g}); "
+            f"minimum is {half:g}"
+        )
+    mx, my = 0.5 * (ax + bx), 0.5 * (ay + by)
+    # Unit along chord and unit perpendicular
+    ux, uy = dx / chord, dy / chord
+    nx, ny = -uy, ux
+    h = float(np.sqrt(max(0.0, r * r - half * half)))
+    c1 = (mx + nx * h, my + ny * h)
+    c2 = (mx - nx * h, my - ny * h)
+    cur = (float(ent.center[0]), float(ent.center[1]))
+    d1 = (c1[0] - cur[0]) ** 2 + (c1[1] - cur[1]) ** 2
+    d2 = (c2[0] - cur[0]) ** 2 + (c2[1] - cur[1]) ** 2
+    new_c = c1 if d1 <= d2 else c2
+    # Project the previous mid-arc point onto the new circle (keeps bulge side)
+    vo = np.array([mid_old[0] - new_c[0], mid_old[1] - new_c[1]], dtype=np.float64)
+    no = float(np.linalg.norm(vo))
+    if no < 1e-12:
+        # Mid collinear with center: use perpendicular offset from chord
+        side = 1.0 if d1 <= d2 else -1.0
+        # Prefer the side opposite the center for minor arcs (bulge away from center)
+        vo = np.array([-(new_c[0] - mx), -(new_c[1] - my)], dtype=np.float64)
+        no = float(np.linalg.norm(vo))
+        if no < 1e-12:
+            vo = np.array([nx * side, ny * side], dtype=np.float64)
+            no = 1.0
+    mid_new = (
+        float(new_c[0] + vo[0] / no * r),
+        float(new_c[1] + vo[1] / no * r),
+    )
+    built = arc_from_three_points(p0, mid_new, p1)
+    if built is None:
+        # Extremely flat / numerical edge: place geometry directly
+        a0 = float(np.atan2(ay - new_c[1], ax - new_c[0]))
+        a1 = float(np.atan2(by - new_c[1], bx - new_c[0]))
+        ent.center = (float(new_c[0]), float(new_c[1]))
+        ent.radius = r
+        ent.a0 = a0
+        ent.a1 = a1
+        # Infer ccw from whether mid_new lies on the CCW sweep
+        am = float(np.atan2(mid_new[1] - new_c[1], mid_new[0] - new_c[0]))
+
+        def _delta_ccw(from_a: float, to_a: float) -> float:
+            d = to_a - from_a
+            while d < 0:
+                d += 2 * np.pi
+            while d >= 2 * np.pi:
+                d -= 2 * np.pi
+            return d
+
+        de = _delta_ccw(a0, a1)
+        if de < 1e-12:
+            de = 2 * np.pi
+        dm = _delta_ccw(a0, am)
+        ent.ccw = 1e-12 < dm < de - 1e-12
+        return
+    center, _r, a0, a1, ccw = built
+    ent.center = (float(center[0]), float(center[1]))
+    ent.radius = r
+    ent.a0 = float(a0)
+    ent.a1 = float(a1)
+    ent.ccw = bool(ccw)
+
+
 def line_direction(ent: LineEntity) -> np.ndarray:
     d = np.array(
         [ent.p1[0] - ent.p0[0], ent.p1[1] - ent.p0[1]], dtype=np.float64
@@ -803,7 +891,7 @@ def apply_dimension_value(
         set_circle_diameter(ent, val)
         return
     if isinstance(ent, ArcEntity) and role == "radius":
-        ent.radius = max(1e-9, float(val))
+        set_arc_radius(ent, val)
         return
     if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
         set_line_pair_angle(ent, ent_b, val)

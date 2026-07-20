@@ -528,6 +528,7 @@ def _project_dimensions(
         CircleEntity,
         LineEntity,
         RectEntity,
+        set_arc_radius,
         set_circle_diameter,
         set_line_pair_angle,
         set_rect_height,
@@ -551,7 +552,13 @@ def _project_dimensions(
         elif role == "diameter" and isinstance(ent, CircleEntity):
             set_circle_diameter(ent, float(dim.value_mm))
         elif role == "radius" and isinstance(ent, ArcEntity):
-            ent.radius = max(1e-9, float(dim.value_mm))
+            # Keep endpoints; only center/bulge moves (same as apply_dimension_value)
+            try:
+                set_arc_radius(ent, float(dim.value_mm))
+            except ValueError:
+                # Chord too long for stored R (e.g. after a drag) — leave geometry;
+                # residual will report the conflict.
+                pass
         elif role == "width" and isinstance(ent, RectEntity):
             set_rect_width(ent, float(dim.value_mm), free_side="max")
         elif role == "height" and isinstance(ent, RectEntity):

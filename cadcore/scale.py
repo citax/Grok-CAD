@@ -183,7 +183,20 @@ def sketch_entity_uv_extent(entities) -> float:
     for e in entities or ():
         kind = getattr(e, "kind", None)
         name = getattr(kind, "name", "") or type(e).__name__
-        if hasattr(e, "p0") and hasattr(e, "p1"):
+        # ArcEntity has p0/p1 as methods — must not treat them as LineEntity points.
+        if name == "ARC" or type(e).__name__ == "ArcEntity":
+            # Sample the curve so extent covers the bulge, not just the chord
+            sample = getattr(e, "sample_uv", None)
+            if callable(sample):
+                for p in sample(12):
+                    us.append(float(p[0]))
+                    vs.append(float(p[1]))
+            else:
+                c = e.center
+                r = float(e.radius)
+                us.extend([c[0] - r, c[0] + r])
+                vs.extend([c[1] - r, c[1] + r])
+        elif hasattr(e, "p0") and hasattr(e, "p1") and not callable(getattr(e, "p0", None)):
             us.extend([e.p0[0], e.p1[0]])
             vs.extend([e.p0[1], e.p1[1]])
         elif hasattr(e, "c0") and hasattr(e, "c1"):
