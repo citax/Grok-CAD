@@ -118,8 +118,11 @@ def _get_point(sk: Sketch, eid: int, handle: str) -> Optional[np.ndarray]:
             return np.array(ent.p1, dtype=np.float64)
         if handle == "mid":
             return np.array(ent.midpoint(), dtype=np.float64)
-    if isinstance(ent, CircleEntity) and handle == "center":
-        return np.array(ent.center, dtype=np.float64)
+    if isinstance(ent, CircleEntity):
+        if handle == "center":
+            return np.array(ent.center, dtype=np.float64)
+        if handle == "rim":
+            return np.array(ent.rim_point(), dtype=np.float64)
     if isinstance(ent, ArcEntity):
         if handle == "p0":
             return np.array(ent.p0(), dtype=np.float64)
@@ -147,8 +150,9 @@ def _set_point(sk: Sketch, eid: int, handle: str, uv: Sequence[float]) -> None:
             ent.set_handle(handle, p)
         elif handle == "mid":
             ent.set_handle("mid", p)
-    elif isinstance(ent, CircleEntity) and handle == "center":
-        ent.set_handle("center", p)
+    elif isinstance(ent, CircleEntity):
+        if handle in ("center", "rim"):
+            ent.set_handle(handle, p)
     elif isinstance(ent, ArcEntity):
         ent.set_handle(handle, p)
     elif isinstance(ent, RectEntity) and handle.startswith("c"):

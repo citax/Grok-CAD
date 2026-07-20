@@ -2104,7 +2104,20 @@ class Viewport(QWidget):
         self._update_handles_visual()
         self._update_junction_dots()
         self._update_dim_labels()
+        self._emit_dof_status()
         self._request_render()
+
+    def _emit_dof_status(self) -> None:
+        """Push SolidWorks-like free-DOF line to the status bar while sketching."""
+        if self._sketch_ctrl is None:
+            return
+        try:
+            from cadcore.dof import format_dof_status_line
+
+            line = format_dof_status_line(self._sketch_ctrl.sketch)
+            self.sketch_status.emit(line)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] dof status: {exc}", file=sys.stderr)
 
     def refresh_dim_labels(self) -> None:
         """Recompute length labels (e.g. after unit change)."""
@@ -2341,31 +2354,37 @@ class Viewport(QWidget):
             return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
         pdata = _entity_polydata(ent, self._sketch_ctrl.sketch)
-        # Fully-defined coloring: black well / blue under / red over (SW-like)
+        # Fully-defined coloring from *mobility* (not constraint counts)
         if selected:
             col = SKETCH_SELECTED
+            st = "sel"
         elif bool(getattr(ent, "construction", False)):
             col = (0.55, 0.55, 0.6)  # gray construction
+            st = "cons"
         else:
             try:
-                from cadcore.sketch_ops import entity_dof_status
+                from cadcore.dof import entity_dof_status
 
                 st = entity_dof_status(self._sketch_ctrl.sketch, ent)
             except Exception:
                 st = "under"
+            # SolidWorks-like: blue under / black fully-defined / red over.
+            # Do NOT use theme SKETCH_COLOR for under — light theme sketch ink is
+            # nearly black and would look "fully defined" by accident.
             if st == "well":
-                col = (0.05, 0.05, 0.08)  # near-black fully defined
+                col = (0.08, 0.08, 0.10)  # black = cannot move
             elif st == "over":
-                col = (0.85, 0.15, 0.12)  # red over-defined
+                col = (0.90, 0.12, 0.10)  # red = conflict
             else:
-                col = SKETCH_COLOR  # blue-ish under-defined
+                col = (0.15, 0.35, 0.95)  # blue = free DOF remain
         lw = 2.0 if bool(getattr(ent, "construction", False)) else 3.0
         self._add_overlay_mesh(
             pdata, color=col, line_width=lw, name=name, pickable=False, render=False
         )
         self._apply_sketch_actor_priority(name)
         self._sketch_entity_actors.add(ent.id)
-        self._sketch_entity_fps[ent.id] = fp
+        # Fingerprint includes DOF status so colors refresh when constraints change
+        self._sketch_entity_fps[ent.id] = f"{fp}|dof={st}"
 
     def _clear_preview(self) -> None:
         self._remove_actor("__sk_preview")

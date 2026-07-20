@@ -960,42 +960,10 @@ def extend_line_to_point(ln: LineEntity, uv: Vec2, *, free_end: str = "p1") -> N
 
 
 def entity_dof_status(sk: Sketch, ent: SketchEntity) -> str:
-    """Heuristic DOF status: under / well / over."""
-    from cadcore.constraints import constraint_residual, dimension_residual
+    """Motion-based DOF status (fully defined = cannot move). See cadcore.dof."""
+    from cadcore.dof import entity_dof_status as _status
 
-    n_c = 0
-    max_r = 0.0
-    for c in sk.constraints or []:
-        if int(c.e0) == ent.id or int(getattr(c, "e1", -1)) == ent.id:
-            n_c += 1
-            try:
-                max_r = max(max_r, float(constraint_residual(sk, c)))
-            except Exception:
-                pass
-    n_d = 0
-    for d in sk.dimensions or []:
-        if int(d.entity_id) == ent.id or int(getattr(d, "entity_b_id", -1)) == ent.id:
-            n_d += 1
-            try:
-                max_r = max(max_r, float(dimension_residual(sk, d)))
-            except Exception:
-                pass
-    if max_r > 0.05:
-        return "over"
-    if isinstance(ent, LineEntity):
-        have = n_c + n_d
-        if have >= 4:
-            return "well"
-        return "under"
-    if isinstance(ent, (CircleEntity, ArcEntity)):
-        have = n_c + n_d
-        if have >= 3:
-            return "well"
-        return "under" if have < 2 else "well"
-    if isinstance(ent, RectEntity):
-        have = n_c + n_d
-        return "well" if have >= 2 else "under"
-    return "under"
+    return _status(sk, ent)
 
 
 def convert_face_edges_to_sketch(

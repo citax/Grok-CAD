@@ -811,15 +811,20 @@ class MainWindow(QMainWindow):
         if act is not None and not act.isChecked():
             act.setChecked(True)
         # Refresh icons: checked tools get white glyphs for contrast on accent
+        icon_names = {
+            SketchTool.SELECT: "fa5s.mouse-pointer",
+            SketchTool.LINE: "fa5s.minus",
+            SketchTool.RECTANGLE: "fa5s.vector-square",
+            SketchTool.CIRCLE: "fa5s.circle",
+            SketchTool.ARC: "fa5s.circle-notch",
+            SketchTool.SPLINE: "fa5s.bezier-curve",
+            SketchTool.DIMENSION: "fa5s.ruler-combined",
+            SketchTool.TRIM: "fa5s.cut",
+            SketchTool.EXTEND: "fa5s.expand",
+            SketchTool.OFFSET: "fa5s.copy",
+        }
         for t, a in self._sketch_tool_actions.items():
-            name = {
-                SketchTool.SELECT: "fa5s.mouse-pointer",
-                SketchTool.LINE: "fa5s.minus",
-                SketchTool.RECTANGLE: "fa5s.vector-square",
-                SketchTool.CIRCLE: "fa5s.circle",
-                SketchTool.ARC: "fa5s.circle-notch",
-                SketchTool.DIMENSION: "fa5s.ruler-combined",
-            }[t]
+            name = icon_names.get(t, "fa5s.pencil-alt")
             col = "#ffffff" if a.isChecked() else TEXT_PRIMARY
             a.setIcon(fa_icon(name, color=col))
 
