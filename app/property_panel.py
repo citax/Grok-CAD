@@ -36,6 +36,7 @@ class PropertyPanel(QWidget):
     status_message = Signal(str)
     command_ok = Signal()
     command_cancel = Signal()
+    edit_sketch_requested = Signal(int)  # sketch feature id
 
     # Compact SolidWorks-like panel width (content + form labels)
     PREFERRED_WIDTH = 240
@@ -136,7 +137,14 @@ class PropertyPanel(QWidget):
         self.btn_apply.setObjectName("primaryButton")
         self.btn_apply.setEnabled(False)
         self.btn_apply.clicked.connect(self._on_apply)
+        self.btn_edit_sketch = QPushButton("Edit Sketch")
+        self.btn_edit_sketch.setToolTip(
+            "Re-open the sketch that drives this feature (rolls back later features)"
+        )
+        self.btn_edit_sketch.clicked.connect(self._on_edit_sketch)
+        self.btn_edit_sketch.hide()
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_edit_sketch)
         btn_row.addWidget(self.btn_cancel)
         btn_row.addWidget(self.btn_ok)
         btn_row.addWidget(self.btn_apply)
@@ -194,12 +202,16 @@ class PropertyPanel(QWidget):
         self._type_label.setVisible(on)
         self.prop_type.setVisible(on)
 
-    def _set_mode_buttons(self, *, apply: bool = False, ok: bool = False) -> None:
-        self.btn_apply.setVisible(apply)
-        self.btn_apply.setEnabled(apply)
-        self.btn_ok.setVisible(ok)
-        self.btn_ok.setEnabled(ok)
-        self.btn_cancel.setVisible(ok)
+    def _set_mode_buttons(
+        self, *, apply: bool = False, ok: bool = False, edit_sketch: bool = False
+    ) -> None:
+        self.btn_apply.setVisible(bool(apply))
+        self.btn_apply.setEnabled(bool(apply))
+        self.btn_ok.setVisible(bool(ok))
+        self.btn_ok.setEnabled(bool(ok))
+        self.btn_cancel.setVisible(bool(ok))
+        self.btn_edit_sketch.setVisible(bool(edit_sketch))
+        self.btn_edit_sketch.setEnabled(bool(edit_sketch))
 
     def _clear_dyn(self) -> None:
         while self._dyn_layout.rowCount():
@@ -316,17 +328,26 @@ class PropertyPanel(QWidget):
         self.prop_name.setText(f.name)
         self.prop_type.setText(f.type.name.replace("_", " ").title())
         self._clear_dyn()
-        self._set_mode_buttons(apply=True, ok=False)
+        from cadcore.document import is_sketch_consuming_feature
+
+        has_sketch = (
+            is_sketch_consuming_feature(f.type) and int(getattr(f, "operand_a", -1)) >= 0
+        )
+        self._set_mode_buttons(apply=True, ok=False, edit_sketch=has_sketch)
 
         if f.type is FeatureType.EXTRUDE:
             self._add_length("depth", "Depth", f.depth, unit)
             self._add_checkbox("reversed", "Reverse direction", bool(f.reversed))
-            self._hint.setText("Edit extrude depth or reverse direction, then Apply.")
+            self._hint.setText(
+                "Edit depth / reverse, Apply. Or Edit Sketch to change the profile."
+            )
         elif f.type is FeatureType.CUT_EXTRUDE:
             self._add_length("depth", "Depth", f.depth, unit)
             self._add_checkbox("through_all", "Through all", bool(f.through_all))
             self._add_checkbox("reversed", "Reverse direction", bool(f.reversed))
-            self._hint.setText("Edit cut depth / through-all, then Apply.")
+            self._hint.setText(
+                "Edit cut params, Apply. Or Edit Sketch to change the cut profile."
+            )
         elif f.type is FeatureType.EDGE_FILLET:
             n = len(getattr(f, "edge_keys", None) or [])
             self._add_length("radius", "Radius", f.radius, unit)
@@ -335,6 +356,13 @@ class PropertyPanel(QWidget):
                 f"Solid edge fillet — {n} edge{'s' if n != 1 else ''}. "
                 "Edit radius, then Apply."
             )
+        elif f.type is FeatureType.EDGE_CHAMFER:
+            n = len(getattr(f, "edge_keys", None) or [])
+            self._add_length("radius", "Distance", f.radius, unit)
+            self._hint.setText(
+                f"Solid edge chamfer — {n} edge{'s' if n != 1 else ''}. "
+                "Edit distance, then Apply."
+            )
         elif f.type is FeatureType.FILLET:
             self._add_length("radius", "Radius", f.radius, unit)
             self._add_length("depth", "Depth", f.depth, unit)
@@ -342,25 +370,65 @@ class PropertyPanel(QWidget):
             self._hint.setText("Edit fillet radius and depth, then Apply.")
         elif f.type is FeatureType.REVOLVE:
             self._add_number("angle", "Angle (°)", float(f.revolve_angle))
-            self._hint.setText("Edit revolve angle, then Apply.")
+            self._hint.setText(
+                "Edit revolve angle, Apply. Or Edit Sketch to change the profile."
+            )
         elif f.type is FeatureType.POCKET:
             self._add_length("radius", "Hole r", f.radius, unit)
             self._add_length("depth", "Depth", f.depth, unit)
             self._add_length("hole_u", "Center U", f.hole_center_u, unit)
             self._add_length("hole_v", "Center V", f.hole_center_v, unit)
             self._hint.setText("Edit pocket parameters, then Apply.")
+        elif f.type is FeatureType.LINEAR_PATTERN:
+            self._add_number("count", "Count", float(getattr(f, "pattern_count", 2)))
+            self._add_length("dx", "ΔX", float(getattr(f, "pattern_dx", 10.0)), unit)
+            self._add_length("dy", "ΔY", float(getattr(f, "pattern_dy", 0.0)), unit)
+            self._add_length("dz", "ΔZ", float(getattr(f, "pattern_dz", 0.0)), unit)
+            self._hint.setText("Edit linear pattern spacing / count, then Apply.")
+        elif f.type is FeatureType.CIRCULAR_PATTERN:
+            self._add_number("count", "Count", float(getattr(f, "pattern_count", 4)))
+            self._add_number(
+                "angle", "Total angle (°)", float(getattr(f, "pattern_angle", 360.0))
+            )
+            self._hint.setText("Edit circular pattern count / angle, then Apply.")
+        elif f.type is FeatureType.MIRROR:
+            self._hint.setText(
+                "Mirror feature — rename and Apply. Geometry follows source + plane."
+            )
+        elif f.type is FeatureType.PLANE_OFFSET:
+            self._add_length("depth", "Offset", f.depth, unit)
+            self._add_checkbox("reversed", "Flip normal", bool(f.reversed))
+            self._hint.setText("Edit offset plane distance, then Apply.")
         elif f.type is FeatureType.SKETCH:
             n = len(f.sketch.entities) if f.sketch else 0
             self._hint.setText(
                 f"Sketch — {n} entit{'y' if n == 1 else 'ies'}. "
-                "Double-click to edit. Rename and Apply, or select a line for length."
+                "Double-click or Edit Sketch to edit. Rename and Apply."
             )
             self.btn_apply.setEnabled(True)
+            self.btn_edit_sketch.setVisible(True)
+            self.btn_edit_sketch.setEnabled(True)
         else:
             self._hint.setText("—")
             self.btn_apply.setEnabled(False)
         self._fit_wrapped_label(self._hint, max_lines=2)
         self._building = False
+
+    def _on_edit_sketch(self) -> None:
+        if self._doc is None or self._building:
+            return
+        f = self._doc.find(self._feature_id)
+        if f is None:
+            return
+        if f.type is FeatureType.SKETCH:
+            self.edit_sketch_requested.emit(int(f.id))
+            return
+        from cadcore.document import is_sketch_consuming_feature
+
+        if is_sketch_consuming_feature(f.type) and int(f.operand_a) >= 0:
+            self.edit_sketch_requested.emit(int(f.operand_a))
+            return
+        self.status_message.emit("No sketch linked to this feature")
 
     def show_sketch_line(
         self, sketch_fid: int, ent: LineEntity, *, unit: Unit = Unit.MM
@@ -423,6 +491,22 @@ class PropertyPanel(QWidget):
             # Solid edge fillet — radius only (no sketch depth)
             self._add_length("radius", "Radius", float(defaults.get("radius", 2.0)), unit)
             self._add_number("segments", "Arc segments", int(defaults.get("segments", 32)))
+        elif command == "chamfer":
+            self._add_length(
+                "radius", "Distance", float(defaults.get("radius", 2.0)), unit
+            )
+        elif command == "lpattern":
+            self._add_number("count", "Count", float(defaults.get("count", 3)))
+            self._add_length("dx", "ΔX", float(defaults.get("dx", 20.0)), unit)
+            self._add_length("dy", "ΔY", float(defaults.get("dy", 0.0)), unit)
+            self._add_length("dz", "ΔZ", float(defaults.get("dz", 0.0)), unit)
+        elif command == "cpattern":
+            self._add_number("count", "Count", float(defaults.get("count", 4)))
+            self._add_number(
+                "angle", "Total angle (°)", float(defaults.get("angle", 360.0))
+            )
+        elif command == "mirror":
+            pass  # selection-only: solid + plane
         elif command == "revolve":
             self._add_number("angle", "Angle (°)", float(defaults.get("angle", 360.0)))
         elif command == "pocket":
@@ -438,14 +522,16 @@ class PropertyPanel(QWidget):
         if ready:
             self._hint.setText("Adjust settings, then OK — or Cancel.")
         else:
-            if command == "fillet":
-                self._hint.setText(
-                    "Click solid edges, set radius, then OK."
-                )
-            else:
-                self._hint.setText(
-                    "Select sketch/solid, set values, then OK."
-                )
+            hints = {
+                "fillet": "Click solid edges, set radius, then OK.",
+                "chamfer": "Click solid edges, set distance, then OK.",
+                "lpattern": "Select a solid, set count/spacing, then OK.",
+                "cpattern": "Select a solid, set count/angle, then OK.",
+                "mirror": "Select a solid, then a reference plane, then OK.",
+            }
+            self._hint.setText(
+                hints.get(command, "Select sketch/solid, set values, then OK.")
+            )
         self._fit_wrapped_label(self._hint, max_lines=2)
         self._set_mode_buttons(apply=False, ok=ready)
         # Allow OK only when selection is ready; user can still cancel
@@ -484,6 +570,18 @@ class PropertyPanel(QWidget):
         elif cmd == "fillet":
             out["radius"] = self._read_length_mm("radius", unit)
             out["segments"] = self._read_int("segments")
+        elif cmd == "chamfer":
+            out["radius"] = self._read_length_mm("radius", unit)
+        elif cmd == "lpattern":
+            out["count"] = self._read_int("count")
+            out["dx"] = self._read_length_mm("dx", unit)
+            out["dy"] = self._read_length_mm("dy", unit)
+            out["dz"] = self._read_length_mm("dz", unit)
+        elif cmd == "cpattern":
+            out["count"] = self._read_int("count")
+            out["angle"] = self._read_float("angle")
+        elif cmd == "mirror":
+            pass
         elif cmd == "revolve":
             out["angle"] = self._read_float("angle")
         elif cmd == "pocket":
@@ -547,6 +645,8 @@ class PropertyPanel(QWidget):
             elif f.type is FeatureType.EDGE_FILLET:
                 params["radius"] = self._read_length_mm("radius", unit)
                 params["segments"] = self._read_int("segments")
+            elif f.type is FeatureType.EDGE_CHAMFER:
+                params["radius"] = self._read_length_mm("radius", unit)
             elif f.type is FeatureType.FILLET:
                 params["radius"] = self._read_length_mm("radius", unit)
                 params["depth"] = self._read_length_mm("depth", unit)
@@ -558,6 +658,17 @@ class PropertyPanel(QWidget):
                 params["depth"] = self._read_length_mm("depth", unit)
                 params["hole_center_u"] = self._read_length_mm("hole_u", unit)
                 params["hole_center_v"] = self._read_length_mm("hole_v", unit)
+            elif f.type is FeatureType.LINEAR_PATTERN:
+                params["pattern_count"] = self._read_int("count")
+                params["pattern_dx"] = self._read_length_mm("dx", unit)
+                params["pattern_dy"] = self._read_length_mm("dy", unit)
+                params["pattern_dz"] = self._read_length_mm("dz", unit)
+            elif f.type is FeatureType.CIRCULAR_PATTERN:
+                params["pattern_count"] = self._read_int("count")
+                params["pattern_angle"] = self._read_float("angle")
+            elif f.type is FeatureType.PLANE_OFFSET:
+                params["depth"] = self._read_length_mm("depth", unit)
+                params["reversed"] = self._read_bool("reversed")
             elif f.type is FeatureType.SKETCH:
                 if name and name != f.name:
                     f.name = name

@@ -114,7 +114,9 @@ def find_closed_line_loops(
     edges = [
         e
         for e in sketch.entities
-        if isinstance(e, (LineEntity, ArcEntity))
+        if isinstance(e, (LineEntity, ArcEntity)) and not bool(
+            getattr(e, "construction", False)
+        )
     ]
     if not edges:
         return []
@@ -217,8 +219,11 @@ def find_closed_line_loops(
 
 def has_open_line_chain(sketch: Sketch, *, tol: float = ENDPOINT_TOL) -> bool:
     edges = [
-        e for e in sketch.entities if isinstance(e, (LineEntity, ArcEntity))
-    ]
+        e
+        for e in sketch.entities
+        if isinstance(e, (LineEntity, ArcEntity))
+        and not bool(getattr(e, "construction", False))
+        ]
     if not edges:
         return False
     deg: Dict[Tuple[float, float], int] = {}
@@ -254,8 +259,11 @@ def list_closed_profiles(sketch: Sketch) -> List[object]:
     if closed:
         return closed
     edges = [
-        e for e in sketch.entities if isinstance(e, (LineEntity, ArcEntity))
-    ]
+        e
+        for e in sketch.entities
+        if isinstance(e, (LineEntity, ArcEntity))
+        and not bool(getattr(e, "construction", False))
+        ]
     if edges:
         raise ValueError("open chain: segments do not form a closed loop")
     raise ValueError(

@@ -41,7 +41,11 @@ class SketchTool(Enum):
     RECTANGLE = auto()
     CIRCLE = auto()
     ARC = auto()
-    DIMENSION = auto()  # Smart Dimension — click entity, value drives geometry
+    SPLINE = auto()
+    DIMENSION = auto()
+    TRIM = auto()
+    EXTEND = auto()
+    OFFSET = auto()  # Smart Dimension — click entity, value drives geometry
 
 
 @dataclass
@@ -456,7 +460,7 @@ class SketchController:
     ) -> Optional[str]:
         if self.tool == SketchTool.DIMENSION:
             # Smart Dimension: one entity → length/diameter; two lines → angle
-            from cadcore.sketch import LineEntity, infer_dimension_role
+            from cadcore.sketch import infer_dimension_role
 
             h = self.pick_handle(raw_uv)
             eid = h.entity_id if h is not None else self.pick_entity_body(raw_uv)
@@ -487,6 +491,51 @@ class SketchController:
             self.selected_entity_id = eid
             role = infer_dimension_role(ent, uv_hint=raw_uv)
             return f"DimPick:{eid}:{role}"
+
+        if self.tool == SketchTool.TRIM:
+            eid = self.pick_entity_body(raw_uv)
+            ent = self.sketch.find_entity(eid) if eid is not None else None
+            if isinstance(ent, LineEntity):
+                from cadcore.sketch_ops import trim_line_at
+
+                trim_line_at(ent, raw_uv)
+                return f"Trim:{ent.id}"
+            return "TrimMiss"
+
+        if self.tool == SketchTool.EXTEND:
+            eid = self.pick_entity_body(raw_uv)
+            ent = self.sketch.find_entity(eid) if eid is not None else None
+            if isinstance(ent, LineEntity):
+                from cadcore.sketch_ops import extend_line_to_point
+
+                # Extend free end nearer the click
+                d0 = float(np.hypot(raw_uv[0] - ent.p0[0], raw_uv[1] - ent.p0[1]))
+                d1 = float(np.hypot(raw_uv[0] - ent.p1[0], raw_uv[1] - ent.p1[1]))
+                free = "p0" if d0 <= d1 else "p1"
+                extend_line_to_point(ent, raw_uv, free_end=free)
+                return f"Extend:{ent.id}"
+            return "ExtendMiss"
+
+        if self.tool == SketchTool.OFFSET:
+            eid = self.pick_entity_body(raw_uv)
+            ent = self.sketch.find_entity(eid) if eid is not None else None
+            if ent is None:
+                return "OffsetMiss"
+            # Fixed default offset 5 mm — refined via PropertyManager later
+            from cadcore.sketch_ops import offset_circle, offset_line
+
+            try:
+                if isinstance(ent, LineEntity):
+                    off = offset_line(ent, 5.0)
+                    self.sketch.add_line(off.p0, off.p1)
+                elif isinstance(ent, CircleEntity):
+                    off = offset_circle(ent, 5.0)
+                    self.sketch.add_circle(off.center, off.radius)
+                else:
+                    return "OffsetMiss"
+            except ValueError:
+                return "OffsetMiss"
+            return f"Offset:{ent.id}"
 
         if self.tool == SketchTool.SELECT:
             h = self.pick_handle(raw_uv)
@@ -605,7 +654,9 @@ class SketchController:
         ent = self.sketch.find_entity(self.drag.entity_id)
         if ent is None:
             return
-        if isinstance(ent, (LineEntity, RectEntity, CircleEntity, ArcEntity)):
+        from cadcore.sketch import SplineEntity
+
+        if isinstance(ent, (LineEntity, RectEntity, CircleEntity, ArcEntity, SplineEntity)):
             ent.set_handle(self.drag.handle_name, uv)
             # Keep geometric relationships + driving dimensions after the drag
             if getattr(self.sketch, "constraints", None) or getattr(
@@ -683,6 +734,24 @@ class SketchController:
             self._maybe_auto_tangent_at_line(arc, end="p1")
             self.draw = None
             return "Arc"
+        if tool is SketchTool.SPLINE:
+            # Keep collecting; finish when same point double-clicked or ≥4 pts + close to start
+            if len(pts) >= 2:
+                last = pts[-1]
+                prev = pts[-2]
+                if float(np.hypot(last[0] - prev[0], last[1] - prev[1])) < 1e-9:
+                    # double-click finish: drop duplicate last
+                    pts = pts[:-1]
+                    if len(pts) >= 2:
+                        self.sketch.add_spline(pts)
+                        self.draw = None
+                        return "Spline"
+                    self.draw.points.pop()
+                    return None
+            # Continue collecting (need at least 2 points; keep draw open until double-click)
+            if len(pts) >= 2:
+                return "SplinePoint"
+            return None
         return None
 
     def _maybe_auto_tangent_at_line(self, arc: ArcEntity, *, end: str) -> None:

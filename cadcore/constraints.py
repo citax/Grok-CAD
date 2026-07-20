@@ -39,6 +39,11 @@ class ConstraintKind(Enum):
     EQUAL = auto()  # two lines keep equal length
     FIX = auto()  # point locked in place
     TANGENT = auto()  # line and arc meet smoothly (h0 = arc end "p0"/"p1")
+    MIDPOINT = auto()  # point is midpoint of line (e0=line, e1=point-ent, h1)
+    CONCENTRIC = auto()  # two circles/arcs share center
+    COLLINEAR = auto()  # two lines collinear
+    SYMMETRIC = auto()  # e0=mirror line; e1=subject; h0/h1 handles on e1
+    EQUAL_RADIUS = auto()  # two arcs/circles equal radius
 
 
 @dataclass
@@ -227,7 +232,84 @@ def constraint_residual(sk: Sketch, c: SketchConstraint) -> float:
         return float(np.hypot(p[0] - c.u, p[1] - c.v))
     if c.kind is ConstraintKind.TANGENT:
         return _tangent_residual(sk, c)
+    if c.kind is ConstraintKind.MIDPOINT:
+        ln = sk.find_entity(int(c.e0))
+        if not isinstance(ln, LineEntity):
+            return 1e9
+        mid = np.array(ln.midpoint(), dtype=np.float64)
+        p = _get_point(sk, c.e1, c.h1 or c.h0)
+        if p is None:
+            return 1e9
+        return float(np.linalg.norm(p - mid))
+    if c.kind is ConstraintKind.CONCENTRIC:
+        a = sk.find_entity(int(c.e0))
+        b = sk.find_entity(int(c.e1))
+        if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+            b, (CircleEntity, ArcEntity)
+        ):
+            return 1e9
+        ca = np.array(a.center, dtype=np.float64)
+        cb = np.array(b.center, dtype=np.float64)
+        return float(np.linalg.norm(ca - cb))
+    if c.kind is ConstraintKind.COLLINEAR:
+        d0 = _line_dir(sk, c.e0)
+        d1 = _line_dir(sk, c.e1)
+        e0 = sk.find_entity(c.e0)
+        e1 = sk.find_entity(c.e1)
+        if (
+            d0 is None
+            or d1 is None
+            or not isinstance(e0, LineEntity)
+            or not isinstance(e1, LineEntity)
+        ):
+            return 1e9
+        n0 = float(np.linalg.norm(d0))
+        n1 = float(np.linalg.norm(d1))
+        if n0 < 1e-12 or n1 < 1e-12:
+            return 0.0
+        # Parallel residual + point-on-line residual
+        par = abs(float(d0[0] * d1[1] - d0[1] * d1[0])) / (n0 * n1) * max(n0, n1)
+        # distance of e1.p0 to line e0
+        p = np.array(e1.p0, dtype=np.float64)
+        a = np.array(e0.p0, dtype=np.float64)
+        dhat = d0 / n0
+        dist = abs(float((p - a)[0] * dhat[1] - (p - a)[1] * dhat[0]))
+        return par + dist
+    if c.kind is ConstraintKind.SYMMETRIC:
+        mir = sk.find_entity(int(c.e0))
+        sub = sk.find_entity(int(c.e1))
+        if not isinstance(mir, LineEntity):
+            return 1e9
+        h0 = str(c.h0 or "p0")
+        h1 = str(c.h1 or "p1")
+        pa = _get_point(sk, c.e1, h0)
+        pb = _get_point(sk, c.e1, h1)
+        if pa is None or pb is None:
+            return 1e9
+        # Reflect pa over mir; distance to pb
+        mid = _reflect_point_over_line(pa, mir)
+        return float(np.linalg.norm(mid - pb))
+    if c.kind is ConstraintKind.EQUAL_RADIUS:
+        a = sk.find_entity(int(c.e0))
+        b = sk.find_entity(int(c.e1))
+        if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+            b, (CircleEntity, ArcEntity)
+        ):
+            return 1e9
+        return abs(float(a.radius) - float(b.radius))
     return 1e9
+
+
+def _reflect_point_over_line(p: np.ndarray, ln: LineEntity) -> np.ndarray:
+    a = np.array(ln.p0, dtype=np.float64)
+    b = np.array(ln.p1, dtype=np.float64)
+    d = b - a
+    n2 = float(np.dot(d, d))
+    if n2 < 1e-24:
+        return p.copy()
+    t = float(np.dot(p - a, d) / n2)
+    proj = a + t * d
+    return 2.0 * proj - p
 
 
 def _tangent_residual(sk: Sketch, c: SketchConstraint) -> float:
@@ -606,6 +688,116 @@ def _project_one(
         _project_equal(sk, c, fixed, prefer_entity=prefer_entity)
     elif c.kind is ConstraintKind.TANGENT:
         _project_tangent(sk, c, fixed)
+    elif c.kind is ConstraintKind.MIDPOINT:
+        _project_midpoint(sk, c, fixed)
+    elif c.kind is ConstraintKind.CONCENTRIC:
+        _project_concentric(sk, c, fixed)
+    elif c.kind is ConstraintKind.COLLINEAR:
+        _project_collinear(sk, c, fixed)
+    elif c.kind is ConstraintKind.SYMMETRIC:
+        _project_symmetric(sk, c, fixed)
+    elif c.kind is ConstraintKind.EQUAL_RADIUS:
+        _project_equal_radius(sk, c, prefer_entity=prefer_entity)
+
+
+def _project_midpoint(
+    sk: Sketch, c: SketchConstraint, fixed: Dict[PointRef, np.ndarray]
+) -> None:
+    ln = sk.find_entity(int(c.e0))
+    if not isinstance(ln, LineEntity):
+        return
+    mid = ln.midpoint()
+    h = str(c.h1 or c.h0 or "p0")
+    ref = (int(c.e1), h)
+    if not _is_fixed(fixed, ref):
+        _set_point(sk, c.e1, h, mid)
+
+
+def _project_concentric(
+    sk: Sketch, c: SketchConstraint, fixed: Dict[PointRef, np.ndarray]
+) -> None:
+    a = sk.find_entity(int(c.e0))
+    b = sk.find_entity(int(c.e1))
+    if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+        b, (CircleEntity, ArcEntity)
+    ):
+        return
+    # Move b's center to a's (unless a center fixed — keep simple: average)
+    ca = np.array(a.center, dtype=np.float64)
+    cb = np.array(b.center, dtype=np.float64)
+    mid = 0.5 * (ca + cb)
+    a.center = (float(mid[0]), float(mid[1]))
+    b.center = (float(mid[0]), float(mid[1]))
+
+
+def _project_collinear(
+    sk: Sketch, c: SketchConstraint, fixed: Dict[PointRef, np.ndarray]
+) -> None:
+    e0 = sk.find_entity(c.e0)
+    e1 = sk.find_entity(c.e1)
+    if not isinstance(e0, LineEntity) or not isinstance(e1, LineEntity):
+        return
+    # Make e1 parallel to e0 then project endpoints onto e0's line
+    d0 = np.array([e0.p1[0] - e0.p0[0], e0.p1[1] - e0.p0[1]], dtype=np.float64)
+    n0 = float(np.linalg.norm(d0))
+    if n0 < 1e-12:
+        return
+    dhat = d0 / n0
+    L = line_length(e1)
+    mid = e1.midpoint()
+    # Project mid onto e0 line
+    a = np.array(e0.p0, dtype=np.float64)
+    m = np.array(mid, dtype=np.float64)
+    t = float(np.dot(m - a, dhat))
+    mproj = a + t * dhat
+    half = 0.5 * L
+    e1.p0 = (float(mproj[0] - dhat[0] * half), float(mproj[1] - dhat[1] * half))
+    e1.p1 = (float(mproj[0] + dhat[0] * half), float(mproj[1] + dhat[1] * half))
+
+
+def _project_symmetric(
+    sk: Sketch, c: SketchConstraint, fixed: Dict[PointRef, np.ndarray]
+) -> None:
+    mir = sk.find_entity(int(c.e0))
+    if not isinstance(mir, LineEntity):
+        return
+    h0 = str(c.h0 or "p0")
+    h1 = str(c.h1 or "p1")
+    pa = _get_point(sk, c.e1, h0)
+    if pa is None:
+        return
+    pb_target = _reflect_point_over_line(pa, mir)
+    if not _is_fixed(fixed, (int(c.e1), h1)):
+        _set_point(sk, c.e1, h1, pb_target)
+
+
+def _project_equal_radius(
+    sk: Sketch,
+    c: SketchConstraint,
+    *,
+    prefer_entity: Optional[int] = None,
+) -> None:
+    a = sk.find_entity(int(c.e0))
+    b = sk.find_entity(int(c.e1))
+    if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+        b, (CircleEntity, ArcEntity)
+    ):
+        return
+    # Prefer leaving prefer_entity alone
+    if prefer_entity is not None and int(prefer_entity) == int(a.id):
+        if isinstance(b, ArcEntity):
+            from cadcore.sketch import set_arc_radius
+
+            set_arc_radius(b, float(a.radius))
+        else:
+            b.radius = float(a.radius)
+    else:
+        if isinstance(a, ArcEntity):
+            from cadcore.sketch import set_arc_radius
+
+            set_arc_radius(a, float(b.radius))
+        else:
+            a.radius = float(b.radius)
 
 
 def _project_tangent(
@@ -856,6 +1048,42 @@ def _validate_refs(sk: Sketch, c: SketchConstraint) -> None:
             raise ValueError("Tangent requires a line and an arc")
         if str(c.h1) not in ("p0", "p1"):
             raise ValueError("Tangent requires the arc end (p0 or p1)")
+        return
+    if c.kind is ConstraintKind.MIDPOINT:
+        ln = sk.find_entity(c.e0)
+        if not isinstance(ln, LineEntity):
+            raise ValueError("Midpoint requires a line as e0")
+        if _get_point(sk, c.e1, c.h1 or c.h0) is None:
+            raise ValueError("Midpoint requires a valid point (e1, h1)")
+        return
+    if c.kind is ConstraintKind.CONCENTRIC:
+        a = sk.find_entity(c.e0)
+        b = sk.find_entity(c.e1)
+        if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+            b, (CircleEntity, ArcEntity)
+        ):
+            raise ValueError("Concentric requires two circles or arcs")
+        return
+    if c.kind is ConstraintKind.COLLINEAR:
+        e0 = sk.find_entity(c.e0)
+        e1 = sk.find_entity(c.e1)
+        if not isinstance(e0, LineEntity) or not isinstance(e1, LineEntity):
+            raise ValueError("Collinear requires two lines")
+        return
+    if c.kind is ConstraintKind.SYMMETRIC:
+        mir = sk.find_entity(c.e0)
+        if not isinstance(mir, LineEntity):
+            raise ValueError("Symmetric requires a mirror line as e0")
+        if _get_point(sk, c.e1, c.h0 or "p0") is None:
+            raise ValueError("Symmetric requires handles on subject entity e1")
+        return
+    if c.kind is ConstraintKind.EQUAL_RADIUS:
+        a = sk.find_entity(c.e0)
+        b = sk.find_entity(c.e1)
+        if not isinstance(a, (CircleEntity, ArcEntity)) or not isinstance(
+            b, (CircleEntity, ArcEntity)
+        ):
+            raise ValueError("Equal radius requires two circles or arcs")
         return
     raise ValueError("unknown constraint kind")
 

@@ -46,13 +46,18 @@ class FeatureType(Enum):
     PLANE_FRONT = auto()  # XY
     PLANE_TOP = auto()  # XZ
     PLANE_RIGHT = auto()  # YZ
+    PLANE_OFFSET = auto()  # user reference plane (offset from parent)
     SKETCH = auto()
     EXTRUDE = auto()  # pad closed sketch profile along plane normal
     REVOLVE = auto()  # revolve closed sketch profile about in-plane axis
     FILLET = auto()  # legacy: fillet closed profile corners, then extrude
     EDGE_FILLET = auto()  # SolidWorks-style: round edges on a solid
+    EDGE_CHAMFER = auto()  # SolidWorks-style: chamfer edges on a solid
     POCKET = auto()  # circular through-hole pocket then extrude
     CUT_EXTRUDE = auto()  # SolidWorks Extruded Cut: remove material from a solid
+    LINEAR_PATTERN = auto()  # pattern solid along a translation vector
+    CIRCULAR_PATTERN = auto()  # pattern solid about an axis
+    MIRROR = auto()  # mirror solid about a plane
     # Kernel primitives (not primary UI path)
     BOX = auto()
     SPHERE = auto()
@@ -67,13 +72,18 @@ def feature_type_name(t: FeatureType) -> str:
         FeatureType.PLANE_FRONT: "Front Plane",
         FeatureType.PLANE_TOP: "Top Plane",
         FeatureType.PLANE_RIGHT: "Right Plane",
+        FeatureType.PLANE_OFFSET: "Offset Plane",
         FeatureType.SKETCH: "Sketch",
         FeatureType.EXTRUDE: "Extrude",
         FeatureType.REVOLVE: "Revolve",
         FeatureType.FILLET: "Fillet (sketch)",
         FeatureType.EDGE_FILLET: "Fillet",
+        FeatureType.EDGE_CHAMFER: "Chamfer",
         FeatureType.POCKET: "Pocket",
         FeatureType.CUT_EXTRUDE: "Cut-Extrude",
+        FeatureType.LINEAR_PATTERN: "Linear Pattern",
+        FeatureType.CIRCULAR_PATTERN: "Circular Pattern",
+        FeatureType.MIRROR: "Mirror",
         FeatureType.BOX: "Box",
         FeatureType.SPHERE: "Sphere",
         FeatureType.CYLINDER: "Cylinder",
@@ -88,6 +98,7 @@ def is_reference_plane(t: FeatureType) -> bool:
         FeatureType.PLANE_FRONT,
         FeatureType.PLANE_TOP,
         FeatureType.PLANE_RIGHT,
+        FeatureType.PLANE_OFFSET,
     )
 
 
@@ -117,8 +128,12 @@ def is_solid_feature(t: FeatureType) -> bool:
         FeatureType.REVOLVE,
         FeatureType.FILLET,
         FeatureType.EDGE_FILLET,
+        FeatureType.EDGE_CHAMFER,
         FeatureType.POCKET,
         FeatureType.CUT_EXTRUDE,
+        FeatureType.LINEAR_PATTERN,
+        FeatureType.CIRCULAR_PATTERN,
+        FeatureType.MIRROR,
         FeatureType.BOX,
         FeatureType.SPHERE,
         FeatureType.CYLINDER,
@@ -129,6 +144,16 @@ def is_solid_feature(t: FeatureType) -> bool:
 
 
 def plane_frame_for_feature(f: "Feature") -> PlaneFrame:
+    if f.type is FeatureType.PLANE_OFFSET:
+        # Offset from parent plane (operand_a) or Front by default
+        parent = None
+        # parent frame resolved by Document when available; fall back to Front
+        base = PlaneFrame.from_plane_type("PLANE_FRONT")
+        if hasattr(f, "_resolved_frame") and f._resolved_frame is not None:  # type: ignore[attr-defined]
+            return f._resolved_frame  # type: ignore[attr-defined]
+        d = float(f.depth) * (-1.0 if f.reversed else 1.0)
+        origin = base.origin + d * base.normal
+        return PlaneFrame(origin, base.u_axis.copy(), base.v_axis.copy(), base.normal.copy())
     if is_reference_plane(f.type):
         return PlaneFrame.from_plane_type(f.type.name)
     if f.sketch is not None:
@@ -403,10 +428,19 @@ class Feature:
     # Fillet (sketch): sharp source polygon in sketch UV (parametric radius edits)
     # List of (u, v); not closed (first != last). Empty = resolve from sketch.
     source_profile_uv: List[Tuple[float, float]] = field(default_factory=list)
-    # Edge fillet (solid): stable edge keys on the parent solid (operand_a)
+    # Edge fillet / chamfer (solid): stable edge keys on the parent solid (operand_a)
     edge_keys: List[str] = field(default_factory=list)
+    # Pattern / mirror
+    pattern_count: int = 2
+    pattern_dx: float = 10.0
+    pattern_dy: float = 0.0
+    pattern_dz: float = 0.0
+    pattern_angle: float = 360.0  # degrees total span for circular
+    # Mirror / offset plane: operand_a = source, plane_id = mirror/parent plane
     visible: bool = True
     suppressed: bool = False
+    # Cached frame for PLANE_OFFSET (set by Document.resolve_offset_plane)
+    _resolved_frame: Optional[PlaneFrame] = field(default=None, repr=False, compare=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1156,7 +1190,7 @@ class Document:
         sketch = Sketch(
             name=f"Sketch{self._sketch_count}",
             plane_feature_id=plane_id,
-            frame=plane_frame_for_feature(plane),
+            frame=self.resolve_plane_frame(plane),
         )
         f = Feature(
             type=FeatureType.SKETCH,
@@ -1606,15 +1640,252 @@ class Document:
         self.record_feature_add(f)
         return f
 
+    def create_edge_chamfer(
+        self,
+        solid_id: int,
+        edge_keys: List[str],
+        distance: float,
+    ) -> Feature:
+        """Equal-distance chamfer on one or more solid edges.
+
+        Validates fully before committing so a failed selection leaves the
+        document unchanged.
+        """
+        from cadcore.edge_chamfer import (
+            chamfer_edges,
+            edges_from_keys,
+            extract_convex_edges,
+        )
+
+        parent = self.find(solid_id)
+        if parent is None or not is_solid_feature(parent.type):
+            raise ValueError("chamfer requires a valid solid feature")
+        keys = [str(k) for k in (edge_keys or []) if str(k).strip()]
+        if not keys:
+            raise ValueError("select at least one edge on the solid to chamfer")
+        dist = float(distance)
+        if not np.isfinite(dist) or dist <= 1e-12:
+            raise ValueError("chamfer distance must be positive")
+        body = self.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            raise ValueError("the selected solid has no mesh to chamfer")
+        try:
+            all_edges = extract_convex_edges(body.vertices, body.faces)
+            edges = edges_from_keys(all_edges, keys)
+            _ = chamfer_edges(body, edges, dist)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"chamfer failed: {exc}") from exc
+        self._fillet_count += 1
+        f = Feature(
+            type=FeatureType.EDGE_CHAMFER,
+            name=f"Chamfer{self._fillet_count}",
+            radius=dist,  # store distance in radius field
+            operand_a=int(solid_id),
+            edge_keys=list(keys),
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def create_linear_pattern(
+        self,
+        solid_id: int,
+        count: int,
+        dx: float,
+        dy: float = 0.0,
+        dz: float = 0.0,
+    ) -> Feature:
+        """Linear pattern of a solid: union of translated copies (includes original)."""
+        parent = self.find(solid_id)
+        if parent is None or not is_solid_feature(parent.type):
+            raise ValueError("linear pattern requires a valid solid feature")
+        n = int(count)
+        if n < 2:
+            raise ValueError("pattern count must be at least 2")
+        step = (float(dx), float(dy), float(dz))
+        if float(np.linalg.norm(step)) < 1e-12:
+            raise ValueError("pattern step vector must be non-zero")
+        body = self.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            raise ValueError("source solid has no mesh to pattern")
+        # Validate by building once
+        out = body
+        for i in range(1, n):
+            off = (step[0] * i, step[1] * i, step[2] * i)
+            out = boolean_op(out, body.translate(off), BooleanOp.UNION)
+        if out is None or out.empty:
+            raise ValueError("linear pattern produced an empty solid")
+        self._pattern_count = int(getattr(self, "_pattern_count", 0)) + 1
+        f = Feature(
+            type=FeatureType.LINEAR_PATTERN,
+            name=f"LPattern{self._pattern_count}",
+            operand_a=int(solid_id),
+            pattern_count=n,
+            pattern_dx=step[0],
+            pattern_dy=step[1],
+            pattern_dz=step[2],
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def create_circular_pattern(
+        self,
+        solid_id: int,
+        count: int,
+        *,
+        total_angle_deg: float = 360.0,
+        axis_origin: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        axis_direction: Tuple[float, float, float] = (0.0, 0.0, 1.0),
+    ) -> Feature:
+        """Circular pattern of a solid about an axis (includes original instance)."""
+        parent = self.find(solid_id)
+        if parent is None or not is_solid_feature(parent.type):
+            raise ValueError("circular pattern requires a valid solid feature")
+        n = int(count)
+        if n < 2:
+            raise ValueError("pattern count must be at least 2")
+        ang = float(total_angle_deg)
+        if not np.isfinite(ang) or abs(ang) < 1e-9:
+            raise ValueError("pattern angle must be non-zero")
+        body = self.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            raise ValueError("source solid has no mesh to pattern")
+        step = ang / float(n) if abs(abs(ang) - 360.0) < 1e-6 else ang / float(n - 1)
+        # For full 360°, n instances at 360/n; for partial, n instances spanning ang
+        if abs(abs(ang) - 360.0) < 1e-6:
+            step = ang / float(n)
+        else:
+            step = ang / float(max(n - 1, 1))
+        out = body
+        for i in range(1, n):
+            inst = body.rotate_about_axis(axis_origin, axis_direction, step * i)
+            out = boolean_op(out, inst, BooleanOp.UNION)
+        if out is None or out.empty:
+            raise ValueError("circular pattern produced an empty solid")
+        self._pattern_count = int(getattr(self, "_pattern_count", 0)) + 1
+        f = Feature(
+            type=FeatureType.CIRCULAR_PATTERN,
+            name=f"CPattern{self._pattern_count}",
+            operand_a=int(solid_id),
+            pattern_count=n,
+            pattern_angle=ang,
+            axis_origin=(float(axis_origin[0]), float(axis_origin[1])),
+            axis_direction=(float(axis_direction[0]), float(axis_direction[1])),
+            # stash Z components in translation for 3D axis (compact)
+            translation=(
+                float(axis_origin[2]),
+                float(axis_direction[2]),
+                0.0,
+            ),
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def create_mirror(
+        self,
+        solid_id: int,
+        plane_id: int,
+    ) -> Feature:
+        """Mirror a solid about a reference plane; result is source ∪ mirrored."""
+        parent = self.find(solid_id)
+        plane = self.find(plane_id)
+        if parent is None or not is_solid_feature(parent.type):
+            raise ValueError("mirror requires a valid solid feature")
+        if plane is None or not is_reference_plane(plane.type):
+            raise ValueError("mirror requires a reference plane")
+        body = self.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            raise ValueError("source solid has no mesh to mirror")
+        frame = self.resolve_plane_frame(plane)
+        mirrored = _mirror_mesh_about_plane(body, frame)
+        out = boolean_op(body, mirrored, BooleanOp.UNION)
+        if out is None or out.empty:
+            raise ValueError("mirror produced an empty solid")
+        self._pattern_count = int(getattr(self, "_pattern_count", 0)) + 1
+        f = Feature(
+            type=FeatureType.MIRROR,
+            name=f"Mirror{self._pattern_count}",
+            operand_a=int(solid_id),
+            plane_id=int(plane_id),
+        )
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def create_offset_plane(
+        self,
+        parent_plane_id: int,
+        offset_mm: float,
+        *,
+        reversed: bool = False,
+    ) -> Feature:
+        """User reference plane offset from an existing plane along its normal."""
+        parent = self.find(parent_plane_id)
+        if parent is None or not is_reference_plane(parent.type):
+            raise ValueError("offset plane requires a parent reference plane")
+        d = float(offset_mm)
+        if not np.isfinite(d):
+            raise ValueError("offset must be finite")
+        self._plane_count = int(getattr(self, "_plane_count", 0)) + 1
+        f = Feature(
+            type=FeatureType.PLANE_OFFSET,
+            name=f"Plane{self._plane_count}",
+            depth=abs(d),
+            reversed=bool(reversed) if d >= 0 else (not reversed),
+            plane_id=int(parent_plane_id),
+            operand_a=int(parent_plane_id),
+        )
+        # If user passed negative offset, flip reverse instead of negative depth
+        if d < 0:
+            f.depth = abs(d)
+            f.reversed = not bool(reversed)
+        self.resolve_plane_frame(f)  # cache frame
+        self.add_feature(f)
+        self.record_feature_add(f)
+        return f
+
+    def resolve_plane_frame(self, f: Feature) -> PlaneFrame:
+        """Resolved PlaneFrame for seed planes and offset planes."""
+        if f.type is FeatureType.PLANE_OFFSET:
+            parent = self.find(int(f.operand_a if f.operand_a >= 0 else f.plane_id))
+            if parent is None:
+                base = PlaneFrame.from_plane_type("PLANE_FRONT")
+            else:
+                base = self.resolve_plane_frame(parent)
+            sign = -1.0 if f.reversed else 1.0
+            origin = base.origin + sign * float(f.depth) * base.normal
+            frame = PlaneFrame(
+                origin.copy(),
+                base.u_axis.copy(),
+                base.v_axis.copy(),
+                base.normal.copy(),
+            )
+            f._resolved_frame = frame
+            return frame
+        if is_reference_plane(f.type) and f.type is not FeatureType.PLANE_OFFSET:
+            return PlaneFrame.from_plane_type(f.type.name)
+        if f.sketch is not None:
+            return f.sketch.frame
+        return PlaneFrame.from_plane_type("PLANE_FRONT")
+
     def update_feature_params(self, fid: int, **params) -> bool:
         """Apply editable parameters on a solid feature (undoable) and re-sync sketch.
 
         Supported keys: depth, radius, segments, revolve_angle, hole_center_u,
-        hole_center_v, reversed, name. Returns False if feature missing / no change.
+        hole_center_v, reversed, name, pattern_*, through_all.
+        Returns False if feature missing / no change.
         """
         f = self.find(fid)
-        if f is None or is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
+        if f is None or f.type is FeatureType.SKETCH:
             return False
+        if is_reference_plane(f.type) and f.type is not FeatureType.PLANE_OFFSET:
+            # Only offset planes are editable among reference planes
+            if f.type is not FeatureType.PLANE_OFFSET:
+                return False
         keys = (
             "depth",
             "radius",
@@ -1625,6 +1896,11 @@ class Document:
             "reversed",
             "through_all",
             "name",
+            "pattern_count",
+            "pattern_dx",
+            "pattern_dy",
+            "pattern_dz",
+            "pattern_angle",
         )
         before = {k: getattr(f, k) for k in keys if hasattr(f, k)}
         before["source_profile_uv"] = list(f.source_profile_uv)
@@ -1672,6 +1948,18 @@ class Document:
                     "fillet radius cannot be applied to the selected edges "
                     "(geometry invalid for this radius)"
                 )
+        if f.type is FeatureType.EDGE_CHAMFER and "radius" in params:
+            mesh = self.evaluate_feature(fid)
+            if mesh is None or mesh.empty:
+                for k, v in before.items():
+                    if k != "source_profile_uv":
+                        setattr(f, k, v)
+                f.source_profile_uv = list(before["source_profile_uv"])
+                raise ValueError(
+                    "chamfer distance cannot be applied to the selected edges"
+                )
+        if f.type is FeatureType.PLANE_OFFSET:
+            self.resolve_plane_frame(f)
         after = {k: getattr(f, k) for k in keys if hasattr(f, k)}
         after["source_profile_uv"] = list(f.source_profile_uv)
         self.push_command(FeatureParamCommand(fid, before, after))
@@ -1934,6 +2222,77 @@ class Document:
                 )
             except Exception:
                 return None
+        elif f.type is FeatureType.EDGE_CHAMFER:
+            from cadcore.edge_chamfer import (
+                chamfer_edges,
+                edges_from_keys,
+                extract_convex_edges,
+            )
+
+            body = self.evaluate_feature(f.operand_a)
+            if body is None or body.empty:
+                return None
+            try:
+                all_edges = extract_convex_edges(body.vertices, body.faces)
+                edges = edges_from_keys(all_edges, f.edge_keys or [])
+                mesh = chamfer_edges(body, edges, float(f.radius))
+            except Exception:
+                return None
+        elif f.type is FeatureType.LINEAR_PATTERN:
+            body = self.evaluate_feature(f.operand_a)
+            if body is None or body.empty:
+                return None
+            n = max(2, int(getattr(f, "pattern_count", 2)))
+            step = (
+                float(getattr(f, "pattern_dx", 0.0)),
+                float(getattr(f, "pattern_dy", 0.0)),
+                float(getattr(f, "pattern_dz", 0.0)),
+            )
+            mesh = body
+            try:
+                for i in range(1, n):
+                    off = (step[0] * i, step[1] * i, step[2] * i)
+                    mesh = boolean_op(mesh, body.translate(off), BooleanOp.UNION)
+            except Exception:
+                return None
+        elif f.type is FeatureType.CIRCULAR_PATTERN:
+            body = self.evaluate_feature(f.operand_a)
+            if body is None or body.empty:
+                return None
+            n = max(2, int(getattr(f, "pattern_count", 2)))
+            ang = float(getattr(f, "pattern_angle", 360.0))
+            # axis_origin xy in axis_origin; z in translation[0]
+            # axis_direction xy in axis_direction; z in translation[1]
+            ox, oy = float(f.axis_origin[0]), float(f.axis_origin[1])
+            oz = float(f.translation[0])
+            dx, dy = float(f.axis_direction[0]), float(f.axis_direction[1])
+            dz = float(f.translation[1]) if abs(f.translation[1]) > 1e-15 else 1.0
+            if abs(dx) + abs(dy) + abs(dz) < 1e-12:
+                dx, dy, dz = 0.0, 0.0, 1.0
+            if abs(abs(ang) - 360.0) < 1e-6:
+                step = ang / float(n)
+            else:
+                step = ang / float(max(n - 1, 1))
+            mesh = body
+            try:
+                for i in range(1, n):
+                    inst = body.rotate_about_axis(
+                        (ox, oy, oz), (dx, dy, dz), step * i
+                    )
+                    mesh = boolean_op(mesh, inst, BooleanOp.UNION)
+            except Exception:
+                return None
+        elif f.type is FeatureType.MIRROR:
+            body = self.evaluate_feature(f.operand_a)
+            plane = self.find(int(f.plane_id))
+            if body is None or body.empty or plane is None:
+                return None
+            try:
+                frame = self.resolve_plane_frame(plane)
+                mirrored = _mirror_mesh_about_plane(body, frame)
+                mesh = boolean_op(body, mirrored, BooleanOp.UNION)
+            except Exception:
+                return None
         elif f.type is FeatureType.POCKET:
             skf = self.find(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -2029,7 +2388,13 @@ class Document:
             mesh = boolean_op(ma, mb, op)
         else:
             return None
-        if f.translation != (0.0, 0.0, 0.0):
+        # CIRCULAR_PATTERN stores axis Z components in translation — do not
+        # treat that as a body offset.
+        if f.type is not FeatureType.CIRCULAR_PATTERN and f.translation != (
+            0.0,
+            0.0,
+            0.0,
+        ):
             mesh = mesh.translate(f.translation)
         return mesh
 
@@ -2041,14 +2406,17 @@ class Document:
                     used.add(f.operand_a)
                 if f.operand_b >= 0:
                     used.add(f.operand_b)
-            # Cut consumes its target solid (like boolean difference operand)
             if f.type is FeatureType.CUT_EXTRUDE and f.operand_b >= 0:
                 used.add(f.operand_b)
-            # Boss-extrude merges into parent solid — show only the result
             if f.type is FeatureType.EXTRUDE and f.operand_b >= 0:
                 used.add(f.operand_b)
-            # Edge fillet replaces its parent solid in the display
-            if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:
+            if f.type in (
+                FeatureType.EDGE_FILLET,
+                FeatureType.EDGE_CHAMFER,
+                FeatureType.LINEAR_PATTERN,
+                FeatureType.CIRCULAR_PATTERN,
+                FeatureType.MIRROR,
+            ) and f.operand_a >= 0:
                 used.add(f.operand_a)
         out: Dict[int, Mesh] = {}
         for f in self.features:
@@ -2062,3 +2430,18 @@ class Document:
             if m is not None and not m.empty:
                 out[f.id] = m
         return out
+
+
+def _mirror_mesh_about_plane(mesh: Mesh, frame: PlaneFrame) -> Mesh:
+    """Reflect mesh vertices through the plane of ``frame``."""
+    o = np.asarray(frame.origin, dtype=np.float64).reshape(3)
+    n = np.asarray(frame.normal, dtype=np.float64).reshape(3)
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-15:
+        return mesh.copy()
+    n = n / nn
+    pts = mesh.vertices
+    dist = np.sum((pts - o) * n, axis=1, keepdims=True)
+    reflected = pts - 2.0 * dist * n
+    faces = mesh.faces[:, [0, 2, 1]].copy()
+    return Mesh(reflected, faces)

@@ -44,6 +44,13 @@ def feature_fingerprint(f: Feature) -> str:
         f"{f.translation[0]:.6g},{f.translation[1]:.6g},{f.translation[2]:.6g}",
         str(int(bool(f.reversed))),
         str(int(bool(getattr(f, "through_all", False)))),
+        str(int(getattr(f, "pattern_count", 0))),
+        f"{float(getattr(f, 'pattern_dx', 0)):.6g}",
+        f"{float(getattr(f, 'pattern_dy', 0)):.6g}",
+        f"{float(getattr(f, 'pattern_dz', 0)):.6g}",
+        f"{float(getattr(f, 'pattern_angle', 0)):.6g}",
+        str(int(f.plane_id)),
+        ";".join(str(k) for k in (getattr(f, "edge_keys", None) or [])),
         str(int(f.visible)),
         str(int(f.suppressed)),
     ]
@@ -71,7 +78,13 @@ def feature_fingerprint_with_deps(f: Feature, by_id: Dict[int, Feature]) -> str:
     """Fingerprint including parent solid fingerprints (for EDGE_FILLET / CUT)."""
     base = feature_fingerprint(f)
     deps: list[str] = []
-    if f.type is FeatureType.EDGE_FILLET and int(f.operand_a) >= 0:
+    if f.type in (
+        FeatureType.EDGE_FILLET,
+        FeatureType.EDGE_CHAMFER,
+        FeatureType.LINEAR_PATTERN,
+        FeatureType.CIRCULAR_PATTERN,
+        FeatureType.MIRROR,
+    ) and int(f.operand_a) >= 0:
         parent = by_id.get(int(f.operand_a))
         if parent is not None:
             deps.append("pa:" + feature_fingerprint(parent))
@@ -243,6 +256,106 @@ def evaluate_solids_snapshot(
             except Exception:
                 cache[fid] = None
                 return None
+        elif f.type is FeatureType.EDGE_CHAMFER:
+            from cadcore.edge_chamfer import (
+                chamfer_edges,
+                edges_from_keys,
+                extract_convex_edges,
+            )
+
+            body = eval_one(f.operand_a)
+            if body is None or body.empty:
+                cache[fid] = None
+                return None
+            try:
+                all_edges = extract_convex_edges(body.vertices, body.faces)
+                edges = edges_from_keys(all_edges, getattr(f, "edge_keys", None) or [])
+                mesh = chamfer_edges(body, edges, float(f.radius))
+            except Exception:
+                cache[fid] = None
+                return None
+        elif f.type is FeatureType.LINEAR_PATTERN:
+            body = eval_one(f.operand_a)
+            if body is None or body.empty:
+                cache[fid] = None
+                return None
+            n = max(2, int(getattr(f, "pattern_count", 2)))
+            step = (
+                float(getattr(f, "pattern_dx", 0.0)),
+                float(getattr(f, "pattern_dy", 0.0)),
+                float(getattr(f, "pattern_dz", 0.0)),
+            )
+            mesh = body
+            try:
+                for i in range(1, n):
+                    off = (step[0] * i, step[1] * i, step[2] * i)
+                    mesh = boolean_op(mesh, body.translate(off), BooleanOp.UNION)
+            except Exception:
+                cache[fid] = None
+                return None
+        elif f.type is FeatureType.CIRCULAR_PATTERN:
+            body = eval_one(f.operand_a)
+            if body is None or body.empty:
+                cache[fid] = None
+                return None
+            n = max(2, int(getattr(f, "pattern_count", 2)))
+            ang = float(getattr(f, "pattern_angle", 360.0))
+            ox, oy = float(f.axis_origin[0]), float(f.axis_origin[1])
+            oz = float(f.translation[0])
+            dx, dy = float(f.axis_direction[0]), float(f.axis_direction[1])
+            dz = float(f.translation[1]) if abs(f.translation[1]) > 1e-15 else 1.0
+            if abs(dx) + abs(dy) + abs(dz) < 1e-12:
+                dx, dy, dz = 0.0, 0.0, 1.0
+            if abs(abs(ang) - 360.0) < 1e-6:
+                step_a = ang / float(n)
+            else:
+                step_a = ang / float(max(n - 1, 1))
+            mesh = body
+            try:
+                for i in range(1, n):
+                    inst = body.rotate_about_axis(
+                        (ox, oy, oz), (dx, dy, dz), step_a * i
+                    )
+                    mesh = boolean_op(mesh, inst, BooleanOp.UNION)
+            except Exception:
+                cache[fid] = None
+                return None
+        elif f.type is FeatureType.MIRROR:
+            from cadcore.document import (
+                _mirror_mesh_about_plane,
+                plane_frame_for_feature,
+            )
+            from cadcore.sketch import PlaneFrame
+
+            body = eval_one(f.operand_a)
+            plane = by_id.get(int(f.plane_id))
+            if body is None or body.empty or plane is None:
+                cache[fid] = None
+                return None
+            try:
+                if plane.type is FeatureType.PLANE_OFFSET:
+                    parent = by_id.get(
+                        int(plane.operand_a if plane.operand_a >= 0 else plane.plane_id)
+                    )
+                    if parent is not None:
+                        base = plane_frame_for_feature(parent)
+                    else:
+                        base = PlaneFrame.from_plane_type("PLANE_FRONT")
+                    sign = -1.0 if plane.reversed else 1.0
+                    origin = base.origin + sign * float(plane.depth) * base.normal
+                    frame = PlaneFrame(
+                        origin.copy(),
+                        base.u_axis.copy(),
+                        base.v_axis.copy(),
+                        base.normal.copy(),
+                    )
+                else:
+                    frame = plane_frame_for_feature(plane)
+                mirrored = _mirror_mesh_about_plane(body, frame)
+                mesh = boolean_op(body, mirrored, BooleanOp.UNION)
+            except Exception:
+                cache[fid] = None
+                return None
         elif f.type is FeatureType.POCKET:
             skf = by_id.get(f.operand_a)
             if skf is None or skf.sketch is None:
@@ -359,7 +472,13 @@ def evaluate_solids_snapshot(
             used.add(f.operand_b)
         if f.type is FeatureType.EXTRUDE and f.operand_b >= 0:
             used.add(f.operand_b)
-        if f.type is FeatureType.EDGE_FILLET and f.operand_a >= 0:
+        if f.type in (
+            FeatureType.EDGE_FILLET,
+            FeatureType.EDGE_CHAMFER,
+            FeatureType.LINEAR_PATTERN,
+            FeatureType.CIRCULAR_PATTERN,
+            FeatureType.MIRROR,
+        ) and f.operand_a >= 0:
             used.add(f.operand_a)
 
     results: Dict[int, Tuple[np.ndarray, np.ndarray, str]] = {}

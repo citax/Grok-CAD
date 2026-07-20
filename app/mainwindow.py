@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
+
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -198,6 +200,7 @@ class MainWindow(QMainWindow):
         self.props.status_message.connect(self._on_status)
         self.props.command_ok.connect(self._on_command_ok)
         self.props.command_cancel.connect(self._on_command_cancel)
+        self.props.edit_sketch_requested.connect(self._on_edit_sketch_requested)
         dock.setWidget(self.props)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._props_dock = dock
@@ -206,6 +209,8 @@ class MainWindow(QMainWindow):
         # Active feature command: {"kind": "extrude"|..., "sketch_id": int, "target_id": int}
         self._feature_cmd: Optional[dict] = None
         self._await_face_sketch: bool = False
+        # Feature ids suppressed only for sketch edit roll-back (restored on exit)
+        self._edit_rollback_ids: list = []
 
     def _on_props_applied(self, fid: int) -> None:
         """Rebuild after PropertyManager Apply (feature params or sketch length)."""
@@ -469,6 +474,46 @@ class MainWindow(QMainWindow):
         self.act_fillet.setShortcut(QKeySequence("F"))
         self.act_fillet.triggered.connect(self._fillet)
 
+        self.act_chamfer = QAction(
+            fa_icon("fa5s.cut", color=ACCENT), "Chamfer", self
+        )
+        self.act_chamfer.setToolTip(
+            "Chamfer edges on a solid — select edges, set distance, OK"
+        )
+        self.act_chamfer.triggered.connect(self._chamfer)
+
+        self.act_lpattern = QAction(
+            fa_icon("fa5s.th", color=ACCENT), "L-Pattern", self
+        )
+        self.act_lpattern.setToolTip(
+            "Linear pattern of a solid along X/Y/Z spacing"
+        )
+        self.act_lpattern.triggered.connect(self._linear_pattern)
+
+        self.act_cpattern = QAction(
+            fa_icon("fa5s.dharmachakra", color=ACCENT), "C-Pattern", self
+        )
+        self.act_cpattern.setToolTip(
+            "Circular pattern of a solid about Z (world up)"
+        )
+        self.act_cpattern.triggered.connect(self._circular_pattern)
+
+        self.act_mirror = QAction(
+            fa_icon("fa5s.adjust", color=ACCENT), "Mirror", self
+        )
+        self.act_mirror.setToolTip(
+            "Mirror a solid about a reference plane"
+        )
+        self.act_mirror.triggered.connect(self._mirror_feature)
+
+        self.act_offset_plane = QAction(
+            fa_icon("fa5s.clone", color=ACCENT), "Plane", self
+        )
+        self.act_offset_plane.setToolTip(
+            "Create an offset reference plane from the selected plane"
+        )
+        self.act_offset_plane.triggered.connect(self._offset_plane)
+
         self.act_pocket = QAction(
             fa_icon("fa5s.dot-circle", color=ACCENT), "Pocket", self
         )
@@ -501,10 +546,24 @@ class MainWindow(QMainWindow):
                 "Draw an arc (start → on-arc → end)",
             ),
             (
+                SketchTool.SPLINE,
+                "Spline",
+                "fa5s.bezier-curve",
+                "Draw a cubic spline (points, double-click last to finish)",
+            ),
+            (
                 SketchTool.DIMENSION,
                 "Smart Dim",
                 "fa5s.ruler-combined",
                 "Driving dimension — click entity, type size (D)",
+            ),
+            (SketchTool.TRIM, "Trim", "fa5s.cut", "Trim a line at the click"),
+            (SketchTool.EXTEND, "Extend", "fa5s.expand", "Extend a line toward the click"),
+            (
+                SketchTool.OFFSET,
+                "Offset",
+                "fa5s.copy",
+                "Offset a line/circle by 5 mm",
             ),
         )
         sketch_tool_actions: list = []
@@ -555,6 +614,40 @@ class MainWindow(QMainWindow):
             "Angle dimension — select two lines, type degrees (persists on drag)"
         )
         self.act_angle.triggered.connect(self._make_angle_dimension)
+        self.act_radius = QAction(fa_icon("fa5s.ruler"), "Radius", self)
+        self.act_radius.setToolTip(
+            "Radius dimension — select an arc, type radius (ends stay put)"
+        )
+        self.act_radius.triggered.connect(self._make_radius_dimension)
+        self.act_construction = QAction(fa_icon("fa5s.slash"), "Construction", self)
+        self.act_construction.setToolTip(
+            "Toggle construction (centerline) on selected entities"
+        )
+        self.act_construction.triggered.connect(self._toggle_construction)
+        self.act_midpoint = QAction(fa_icon("fa5s.arrows-alt-h"), "Midpoint", self)
+        self.act_midpoint.setToolTip(
+            "Midpoint — selected point handle stays at mid of first selected line"
+        )
+        self.act_midpoint.triggered.connect(self._make_midpoint)
+        self.act_concentric = QAction(fa_icon("fa5s.bullseye"), "Concentric", self)
+        self.act_concentric.setToolTip("Concentric — two circles/arcs share a center")
+        self.act_concentric.triggered.connect(self._make_concentric)
+        self.act_collinear = QAction(fa_icon("fa5s.grip-lines-vertical"), "Collinear", self)
+        self.act_collinear.setToolTip("Collinear — two selected lines stay collinear")
+        self.act_collinear.triggered.connect(self._make_collinear)
+        self.act_symmetric = QAction(fa_icon("fa5s.balance-scale"), "Symmetric", self)
+        self.act_symmetric.setToolTip(
+            "Symmetric — subject line endpoints about first selected mirror line"
+        )
+        self.act_symmetric.triggered.connect(self._make_symmetric)
+        self.act_equal_r = QAction(fa_icon("fa5s.circle"), "Equal R", self)
+        self.act_equal_r.setToolTip("Equal radius — two circles/arcs keep same radius")
+        self.act_equal_r.triggered.connect(self._make_equal_radius)
+        self.act_convert = QAction(fa_icon("fa5s.project-diagram"), "Convert", self)
+        self.act_convert.setToolTip(
+            "Convert face edges into sketch lines (construction)"
+        )
+        self.act_convert.triggered.connect(self._convert_entities)
         self.act_exit_sketch = QAction(
             fa_icon("fa5s.times", color=PLANE_RIGHT), "Exit", self
         )
@@ -577,7 +670,12 @@ class MainWindow(QMainWindow):
                     self.act_cut_extrude,
                     self.act_revolve,
                     self.act_fillet,
+                    self.act_chamfer,
                     self.act_pocket,
+                    self.act_lpattern,
+                    self.act_cpattern,
+                    self.act_mirror,
+                    self.act_offset_plane,
                 ],
             )
         )
@@ -594,8 +692,16 @@ class MainWindow(QMainWindow):
                     self.act_perp,
                     self.act_coincident,
                     self.act_fix,
+                    self.act_midpoint,
+                    self.act_concentric,
+                    self.act_collinear,
+                    self.act_symmetric,
+                    self.act_equal_r,
                     self.act_del_cstr,
                     self.act_angle,
+                    self.act_radius,
+                    self.act_construction,
+                    self.act_convert,
                     self.act_exit_sketch,
                 ],
             )
@@ -624,6 +730,14 @@ class MainWindow(QMainWindow):
             "act_fix",
             "act_del_cstr",
             "act_angle",
+            "act_radius",
+            "act_construction",
+            "act_midpoint",
+            "act_concentric",
+            "act_collinear",
+            "act_symmetric",
+            "act_equal_r",
+            "act_convert",
         ):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(on)
@@ -883,12 +997,84 @@ class MainWindow(QMainWindow):
             return
         fid = int(data)
         f = self.doc.find(fid)
-        if f and f.type is FeatureType.SKETCH and f.sketch is not None:
-            self._sync_selection(fid)
-            self.viewport.enter_sketch(f.id)
-            self._set_sketch_ribbon_enabled(True)
-            self._sync_sketch_tool_ui(SketchTool.LINE)
-            self.statusBar().showMessage(f"Editing {f.name}")
+        if f is None:
+            return
+        # Sketch node → re-enter edit
+        if f.type is FeatureType.SKETCH and f.sketch is not None:
+            self._open_sketch_edit(f.id)
+            return
+        # Solid that consumes a sketch → Edit Sketch (SolidWorks double-click)
+        from cadcore.document import is_sketch_consuming_feature
+
+        if is_sketch_consuming_feature(f.type) and int(f.operand_a) >= 0:
+            sk = self.doc.find(int(f.operand_a))
+            if sk is not None and sk.type is FeatureType.SKETCH and sk.sketch is not None:
+                self._open_sketch_edit(sk.id, rollback_from=f.id)
+                return
+        # Other solids → focus PropertyManager for param edit
+        self._sync_selection(fid)
+        self.statusBar().showMessage(
+            f"Selected {f.name} — edit parameters in PropertyManager, then Apply",
+            3500,
+        )
+
+    def _open_sketch_edit(
+        self, sketch_id: int, *, rollback_from: Optional[int] = None
+    ) -> None:
+        """Enter sketch mode; optionally roll back (suppress) later features."""
+        skf = self.doc.find(int(sketch_id))
+        if skf is None or skf.type is not FeatureType.SKETCH or skf.sketch is None:
+            return
+        # Clear any previous temporary suppress from a prior edit session
+        self._clear_edit_rollback()
+        consumer_id = rollback_from
+        if consumer_id is None:
+            consumer_id = self.doc.absorbed_sketch_map().get(int(sketch_id))
+        if consumer_id is not None:
+            self._apply_edit_rollback(int(consumer_id))
+        self._sync_selection(int(sketch_id))
+        self.viewport.enter_sketch(int(sketch_id))
+        self._set_sketch_ribbon_enabled(True)
+        self._sync_sketch_tool_ui(SketchTool.LINE)
+        msg = f"Editing {skf.name}"
+        if consumer_id is not None:
+            cf = self.doc.find(int(consumer_id))
+            msg += f" (rolled back at {cf.name if cf else consumer_id})"
+        self.statusBar().showMessage(msg)
+
+    def _apply_edit_rollback(self, from_feature_id: int) -> None:
+        """Suppress ``from_feature_id`` and every feature after it (edit-time roll back)."""
+        ids = [f.id for f in self.doc.features]
+        try:
+            idx = ids.index(int(from_feature_id))
+        except ValueError:
+            return
+        suppressed: list[int] = []
+        for f in self.doc.features[idx:]:
+            from cadcore.document import is_reference_plane
+
+            if is_reference_plane(f.type) or f.type is FeatureType.SKETCH:
+                continue
+            if not f.suppressed:
+                f.suppressed = True
+                suppressed.append(int(f.id))
+        self._edit_rollback_ids = suppressed
+        if suppressed:
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+            self._refresh_tree()
+
+    def _clear_edit_rollback(self) -> None:
+        """Restore features suppressed only for sketch edit (not user suppress)."""
+        ids = getattr(self, "_edit_rollback_ids", None) or []
+        if not ids:
+            self._edit_rollback_ids = []
+            return
+        for fid in ids:
+            f = self.doc.find(int(fid))
+            if f is not None:
+                f.suppressed = False
+        self._edit_rollback_ids = []
 
     def _on_pick(self, fid: int) -> None:
         if self.viewport.in_sketch_mode:
@@ -992,14 +1178,31 @@ class MainWindow(QMainWindow):
         )
 
     def _exit_sketch(self) -> None:
+        sid = (
+            int(self.viewport._sketch_feature_id)
+            if self.viewport.in_sketch_mode
+            else -1
+        )
         self.viewport.exit_sketch()
         self._set_sketch_ribbon_enabled(False)
+        # End edit-time roll back so dependent solids reappear and re-evaluate
+        self._clear_edit_rollback()
+        # Rebuild solids that depend on the sketch (edit-sketch → update extrude/cut/…)
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
         self._refresh_tree()
-        self._sync_selection(self.doc.selected_id)
-        self.statusBar().showMessage("Exited sketch", 2000)
+        # Prefer selecting the consuming feature after edit (SolidWorks-like)
+        absorbed = self.doc.absorbed_sketch_map()
+        consumer = absorbed.get(sid) if sid >= 0 else None
+        self._sync_selection(int(consumer) if consumer is not None else self.doc.selected_id)
+        self._update_window_title()
+        self.statusBar().showMessage("Exited sketch — model updated", 2500)
 
     def _on_sketch_exited(self) -> None:
         self._set_sketch_ribbon_enabled(False)
+        self._clear_edit_rollback()
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
         self._refresh_tree()
 
     def _resolve_closed_sketch_id(self) -> int:
@@ -1125,19 +1328,31 @@ class MainWindow(QMainWindow):
             "profile_id": -1,
             "edge_keys": [],  # solid edge fillet multi-select
             "solid_id": -1,
+            "plane_id": -1,
         }
         titles = {
             "extrude": "Extrude (Boss/Base)",
             "cut": "Cut-Extrude",
             "fillet": "Fillet",
+            "chamfer": "Chamfer",
             "revolve": "Revolve",
             "pocket": "Pocket",
+            "lpattern": "Linear Pattern",
+            "cpattern": "Circular Pattern",
+            "mirror": "Mirror",
         }
         if kind == "fillet":
             sel_text = "Click edges on a solid to fillet…"
-            status = (
-                "Fillet: click solid edges, set radius, OK — Esc cancels"
-            )
+            status = "Fillet: click solid edges, set radius, OK — Esc cancels"
+        elif kind == "chamfer":
+            sel_text = "Click edges on a solid to chamfer…"
+            status = "Chamfer: click solid edges, set distance, OK — Esc cancels"
+        elif kind in ("lpattern", "cpattern"):
+            sel_text = "Select a solid to pattern…"
+            status = f"{titles[kind]}: select solid, set params, OK — Esc cancels"
+        elif kind == "mirror":
+            sel_text = "Select a solid, then a reference plane…"
+            status = "Mirror: select solid + plane, OK — Esc cancels"
         else:
             sel_text = "Select a sketch with a closed profile…"
             status = (
@@ -1156,6 +1371,10 @@ class MainWindow(QMainWindow):
                 "segments": 32,
                 "through_all": False,
                 "reversed": False,
+                "count": 3 if kind == "lpattern" else 4,
+                "dx": 20.0,
+                "dy": 0.0,
+                "dz": 0.0,
             },
             ready=False,
         )
@@ -1180,9 +1399,54 @@ class MainWindow(QMainWindow):
         kind = cmd["kind"]
         f = self.doc.find(fid)
 
-        # ----- Solid edge fillet: pick edges on a solid -----
-        if kind == "fillet":
+        # ----- Solid edge fillet / chamfer: pick edges on a solid -----
+        if kind in ("fillet", "chamfer"):
             self._try_add_fillet_edge(fid)
+            return
+
+        # ----- Pattern: pick solid -----
+        if kind in ("lpattern", "cpattern"):
+            if f is not None and is_solid_feature(f.type):
+                cmd["solid_id"] = f.id
+                self.props.update_command_selection(
+                    f"Solid: {f.name}", ready=True
+                )
+            else:
+                self.props.update_command_selection(
+                    "Select a solid to pattern…", ready=False
+                )
+            return
+
+        # ----- Mirror: solid then plane -----
+        if kind == "mirror":
+            if f is not None and is_solid_feature(f.type):
+                cmd["solid_id"] = f.id
+                pl = self.doc.find(int(cmd.get("plane_id", -1)))
+                if pl is not None and is_reference_plane(pl.type):
+                    self.props.update_command_selection(
+                        f"Solid: {f.name}\nPlane: {pl.name}", ready=True
+                    )
+                else:
+                    self.props.update_command_selection(
+                        f"Solid: {f.name}\nSelect a reference plane…",
+                        ready=False,
+                    )
+                return
+            if f is not None and is_reference_plane(f.type):
+                cmd["plane_id"] = f.id
+                solid = self.doc.find(int(cmd.get("solid_id", -1)))
+                if solid is not None and is_solid_feature(solid.type):
+                    self.props.update_command_selection(
+                        f"Solid: {solid.name}\nPlane: {f.name}", ready=True
+                    )
+                else:
+                    self.props.update_command_selection(
+                        f"Plane: {f.name}\nSelect a solid…", ready=False
+                    )
+                return
+            self.props.update_command_selection(
+                "Select a solid, then a reference plane…", ready=False
+            )
             return
 
         # Sketch selection
@@ -1249,12 +1513,13 @@ class MainWindow(QMainWindow):
         )
 
     def _try_add_fillet_edge(self, fid: int) -> None:
-        """During Fillet command: resolve nearest convex edge at the last pick point."""
+        """During Fillet/Chamfer command: resolve nearest convex edge at last pick."""
         cmd = self._feature_cmd
-        if cmd is None or cmd.get("kind") != "fillet":
+        if cmd is None or cmd.get("kind") not in ("fillet", "chamfer"):
             return
         from cadcore.edge_fillet import extract_convex_edges, pick_edge_near_point
 
+        label = "fillet" if cmd.get("kind") == "fillet" else "chamfer"
         f = self.doc.find(fid)
         if f is None or not is_solid_feature(f.type):
             n = len(cmd.get("edge_keys") or [])
@@ -1267,7 +1532,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.props.update_command_selection(
-                    "Click edges on a solid to fillet…", ready=False
+                    f"Click edges on a solid to {label}…", ready=False
                 )
             return
 
@@ -1358,8 +1623,10 @@ class MainWindow(QMainWindow):
                 f"(last L={L:.3g} mm)",
                 ready=True,
             )
+            verb = "radius" if cmd.get("kind") == "fillet" else "distance"
             self.statusBar().showMessage(
-                f"Fillet: {n} edge(s) on {sname} — set radius and OK", 4000
+                f"{label.title()}: {n} edge(s) on {sname} — set {verb} and OK",
+                4000,
             )
         else:
             self.props.update_command_selection(
@@ -1378,40 +1645,116 @@ class MainWindow(QMainWindow):
             return
         kind = cmd["kind"]
 
-        # ----- Solid edge fillet (no sketch) -----
-        if kind == "fillet":
+        # ----- Solid edge fillet / chamfer (no sketch) -----
+        if kind in ("fillet", "chamfer"):
             solid_id = int(cmd.get("solid_id", -1))
             edge_keys = list(cmd.get("edge_keys") or [])
+            title = "Fillet" if kind == "fillet" else "Chamfer"
             if solid_id < 0 or self.doc.find(solid_id) is None:
                 QMessageBox.warning(
                     self,
-                    "Fillet",
+                    title,
                     "Select a solid and click at least one edge before pressing OK.",
                 )
                 return
             if not edge_keys:
                 QMessageBox.warning(
                     self,
-                    "Fillet",
+                    title,
                     "Click one or more edges on the solid, then press OK.",
                 )
                 return
             created = None
             try:
-                created = self.doc.create_edge_fillet(
-                    solid_id,
-                    edge_keys,
-                    float(params["radius"]),
-                    segments=int(params.get("segments", 32)),
-                )
+                if kind == "fillet":
+                    created = self.doc.create_edge_fillet(
+                        solid_id,
+                        edge_keys,
+                        float(params["radius"]),
+                        segments=int(params.get("segments", 32)),
+                    )
+                else:
+                    created = self.doc.create_edge_chamfer(
+                        solid_id,
+                        edge_keys,
+                        float(params["radius"]),
+                    )
             except ValueError as exc:
                 QMessageBox.warning(
                     self,
-                    "Fillet failed",
-                    f"Could not apply the fillet:\n\n{exc}\n\n"
-                    "The part was not changed. Try a smaller radius or different edges.",
+                    f"{title} failed",
+                    f"Could not apply the {title.lower()}:\n\n{exc}\n\n"
+                    "The part was not changed. Try a smaller size or different edges.",
                 )
-                self.statusBar().showMessage(f"Fillet failed: {exc}", 5000)
+                self.statusBar().showMessage(f"{title} failed: {exc}", 5000)
+                return
+            self._feature_cmd = None
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+            self._refresh_tree()
+            if created is not None:
+                self._sync_selection(created.id)
+            self._update_window_title()
+            self.statusBar().showMessage(
+                f"Created {created.name}" if created else "Done", 3000
+            )
+            return
+
+        # ----- Linear / circular pattern -----
+        if kind in ("lpattern", "cpattern"):
+            solid_id = int(cmd.get("solid_id", -1))
+            if solid_id < 0 or self.doc.find(solid_id) is None:
+                QMessageBox.warning(
+                    self, "Pattern", "Select a solid before pressing OK."
+                )
+                return
+            created = None
+            try:
+                if kind == "lpattern":
+                    created = self.doc.create_linear_pattern(
+                        solid_id,
+                        int(params.get("count", 3)),
+                        float(params.get("dx", 20.0)),
+                        float(params.get("dy", 0.0)),
+                        float(params.get("dz", 0.0)),
+                    )
+                else:
+                    created = self.doc.create_circular_pattern(
+                        solid_id,
+                        int(params.get("count", 4)),
+                        total_angle_deg=float(params.get("angle", 360.0)),
+                    )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Pattern failed", str(exc))
+                return
+            self._feature_cmd = None
+            self.viewport.schedule_rebuild()
+            self.viewport.refresh_sketches()
+            self._refresh_tree()
+            if created is not None:
+                self._sync_selection(created.id)
+            self._update_window_title()
+            self.statusBar().showMessage(
+                f"Created {created.name}" if created else "Done", 3000
+            )
+            return
+
+        # ----- Mirror -----
+        if kind == "mirror":
+            solid_id = int(cmd.get("solid_id", -1))
+            plane_id = int(cmd.get("plane_id", -1))
+            if solid_id < 0 or plane_id < 0:
+                QMessageBox.warning(
+                    self,
+                    "Mirror",
+                    "Select a solid and a reference plane before OK.",
+                )
+                return
+            created = None
+            try:
+                created = self.doc.create_mirror(solid_id, plane_id)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Mirror failed", str(exc))
                 return
             self._feature_cmd = None
             self.viewport.schedule_rebuild()
@@ -1512,6 +1855,52 @@ class MainWindow(QMainWindow):
 
     def _fillet(self) -> None:
         self._start_feature_cmd("fillet")
+
+    def _chamfer(self) -> None:
+        self._start_feature_cmd("chamfer")
+
+    def _linear_pattern(self) -> None:
+        self._start_feature_cmd("lpattern")
+
+    def _circular_pattern(self) -> None:
+        self._start_feature_cmd("cpattern")
+
+    def _mirror_feature(self) -> None:
+        self._start_feature_cmd("mirror")
+
+    def _offset_plane(self) -> None:
+        """Offset plane from selected reference plane (quick dialog)."""
+        f = self.doc.find(self.doc.selected_id)
+        if f is None or not is_reference_plane(f.type):
+            self.statusBar().showMessage(
+                "Select a reference plane, then Plane", 4000
+            )
+            return
+        mm = self._get_length_mm("Offset Plane", "Offset", 10.0)
+        if mm is None:
+            return
+        try:
+            pf = self.doc.create_offset_plane(f.id, float(mm))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Offset Plane", str(exc))
+            return
+        self.viewport.schedule_rebuild()
+        self.viewport.refresh_sketches()
+        self._refresh_tree()
+        self._sync_selection(pf.id)
+        self._update_window_title()
+        self.statusBar().showMessage(f"Created {pf.name}", 3000)
+
+    def _on_edit_sketch_requested(self, sketch_id: int) -> None:
+        """PropertyManager Edit Sketch button."""
+        if self._feature_cmd is not None:
+            self._cancel_feature_cmd()
+        sk = self.doc.find(int(sketch_id))
+        if sk is None or sk.type is not FeatureType.SKETCH:
+            self.statusBar().showMessage("Sketch not found", 3000)
+            return
+        consumer = self.doc.absorbed_sketch_map().get(int(sketch_id))
+        self._open_sketch_edit(int(sketch_id), rollback_from=consumer)
 
 
     def _pocket(self) -> None:
@@ -2008,6 +2397,210 @@ class MainWindow(QMainWindow):
             )
             return
         self._on_dimension_requested(lines[0].id, "angle", entity_b_id=lines[1].id)
+
+    def _make_radius_dimension(self) -> None:
+        """Radius driving dimension on the selected arc."""
+        from cadcore.sketch import ArcEntity
+
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, _ = ctx
+        arcs = [
+            ctrl.sketch.find_entity(eid)
+            for eid in ctrl.selected_ids
+            if isinstance(ctrl.sketch.find_entity(eid), ArcEntity)
+        ]
+        if not arcs:
+            self.statusBar().showMessage("Select an arc, then Radius", 3000)
+            return
+        self._on_dimension_requested(arcs[0].id, "radius")
+
+    def _toggle_construction(self) -> None:
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, sid = ctx
+        if not ctrl.selected_ids:
+            self.statusBar().showMessage("Select entities to toggle construction", 2500)
+            return
+        before = snapshot_sketch_contents(ctrl.sketch)
+        from cadcore.sketch_ops import toggle_construction
+
+        ents = [
+            ctrl.sketch.find_entity(eid)
+            for eid in ctrl.selected_ids
+            if ctrl.sketch.find_entity(eid) is not None
+        ]
+        n = toggle_construction(ents)
+        after = snapshot_sketch_contents(ctrl.sketch)
+        self.doc.record_sketch_contents(sid, before, after)
+        self.viewport.sync_sketch_visuals()
+        self.statusBar().showMessage(f"Construction toggled on {n} entit(y/ies)", 2500)
+
+    def _make_midpoint(self) -> None:
+        lines = self._selected_lines()
+        ctx = self._sketch_context()
+        if ctx is None or not lines:
+            self.statusBar().showMessage(
+                "Select a line and another line (endpoint mid of first)", 3000
+            )
+            return
+        ctrl, _ = ctx
+        # Second selected line's p0 becomes midpoint of first
+        ids = list(ctrl.selected_ids)
+        if len(ids) < 2:
+            self.statusBar().showMessage("Select mirror subject: line + point line", 3000)
+            return
+        ln = lines[0]
+        other = ctrl.sketch.find_entity(ids[1] if ids[0] == ln.id else ids[0])
+        if other is None:
+            return
+        self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.MIDPOINT,
+                e0=int(ln.id),
+                e1=int(other.id),
+                h1="p0",
+            )
+        ) and self.statusBar().showMessage("Midpoint applied", 2500)
+
+    def _make_concentric(self) -> None:
+        from cadcore.sketch import ArcEntity, CircleEntity
+
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, _ = ctx
+        ents = [
+            ctrl.sketch.find_entity(eid)
+            for eid in ctrl.selected_ids
+            if isinstance(ctrl.sketch.find_entity(eid), (CircleEntity, ArcEntity))
+        ]
+        if len(ents) < 2:
+            self.statusBar().showMessage("Select two circles/arcs", 3000)
+            return
+        self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.CONCENTRIC,
+                e0=int(ents[0].id),
+                e1=int(ents[1].id),
+            )
+        ) and self.statusBar().showMessage("Concentric applied", 2500)
+
+    def _make_collinear(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage("Select two lines for collinear", 3000)
+            return
+        self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.COLLINEAR,
+                e0=int(lines[0].id),
+                e1=int(lines[1].id),
+            )
+        ) and self.statusBar().showMessage("Collinear applied", 2500)
+
+    def _make_symmetric(self) -> None:
+        lines = self._selected_lines()
+        if len(lines) < 2:
+            self.statusBar().showMessage(
+                "Select mirror line + subject line (endpoints)", 3000
+            )
+            return
+        self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.SYMMETRIC,
+                e0=int(lines[0].id),
+                e1=int(lines[1].id),
+                h0="p0",
+                h1="p1",
+            )
+        ) and self.statusBar().showMessage("Symmetric applied", 2500)
+
+    def _make_equal_radius(self) -> None:
+        from cadcore.sketch import ArcEntity, CircleEntity
+
+        ctx = self._sketch_context()
+        if ctx is None:
+            return
+        ctrl, _ = ctx
+        ents = [
+            ctrl.sketch.find_entity(eid)
+            for eid in ctrl.selected_ids
+            if isinstance(ctrl.sketch.find_entity(eid), (CircleEntity, ArcEntity))
+        ]
+        if len(ents) < 2:
+            self.statusBar().showMessage("Select two circles/arcs for Equal R", 3000)
+            return
+        self._apply_persistent_constraint(
+            SketchConstraint(
+                id=-1,
+                kind=ConstraintKind.EQUAL_RADIUS,
+                e0=int(ents[0].id),
+                e1=int(ents[1].id),
+            )
+        ) and self.statusBar().showMessage("Equal radius applied", 2500)
+
+    def _convert_entities(self) -> None:
+        """Project convex edges of the last face-pick solid into the active sketch."""
+        ctx = self._sketch_context()
+        if ctx is None:
+            self.statusBar().showMessage("Enter a sketch first", 3000)
+            return
+        ctrl, sid = ctx
+        skf = self.doc.find(sid)
+        if skf is None or skf.sketch is None:
+            return
+        # Prefer parent solid of face sketch
+        solid_id = int(skf.plane_id) if skf.plane_id >= 0 else -1
+        if solid_id < 0 or not is_solid_feature(
+            self.doc.find(solid_id).type if self.doc.find(solid_id) else FeatureType.SKETCH
+        ):
+            # last solid in doc
+            for f in reversed(self.doc.features):
+                if is_solid_feature(f.type):
+                    solid_id = f.id
+                    break
+        if solid_id < 0:
+            self.statusBar().showMessage("No solid to convert edges from", 3000)
+            return
+        body = self.doc.evaluate_feature(solid_id)
+        if body is None or body.empty:
+            self.statusBar().showMessage("Solid has no mesh", 3000)
+            return
+        from cadcore.edge_fillet import extract_convex_edges
+        from cadcore.sketch_ops import convert_face_edges_to_sketch
+
+        frame = skf.sketch.frame
+        edges = extract_convex_edges(body.vertices, body.faces)
+        pairs = []
+        for e in edges[:24]:  # cap
+            p0 = frame.to_local(e.p0)
+            p1 = frame.to_local(e.p1)
+            # only edges nearly on the sketch plane
+            w0 = frame.to_world(p0)
+            w1 = frame.to_world(p1)
+            if abs(float(np.dot(w0 - frame.origin, frame.normal))) > 0.5:
+                continue
+            if abs(float(np.dot(w1 - frame.origin, frame.normal))) > 0.5:
+                continue
+            pairs.append((p0, p1))
+        if not pairs:
+            self.statusBar().showMessage("No face edges on this sketch plane", 3000)
+            return
+        before = snapshot_sketch_contents(ctrl.sketch)
+        convert_face_edges_to_sketch(ctrl.sketch, pairs, construction=True)
+        after = snapshot_sketch_contents(ctrl.sketch)
+        self.doc.record_sketch_contents(sid, before, after)
+        self.viewport.sync_sketch_visuals()
+        self.statusBar().showMessage(
+            f"Converted {len(pairs)} edge(s) as construction", 3000
+        )
 
     def _sketch_context(self):
         if not self.viewport.in_sketch_mode or self.viewport._sketch_ctrl is None:

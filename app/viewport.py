@@ -181,6 +181,11 @@ def _entity_polydata(ent: SketchEntity, sketch: Sketch) -> pv.PolyData:
     if isinstance(ent, ArcEntity):
         pts = [fr.to_world(uv) for uv in ent.sample_uv(32)]
         return pv.lines_from_points(np.array(pts, float), close=False)
+    from cadcore.sketch import SplineEntity
+
+    if isinstance(ent, SplineEntity):
+        pts = [fr.to_world(uv) for uv in ent.sample_uv(10)]
+        return pv.lines_from_points(np.array(pts, float), close=False)
     return pv.PolyData()
 
 
@@ -315,8 +320,14 @@ def _entity_fingerprint(ent: SketchEntity, *, selected: bool = False) -> str:
             f"{ent.a0:.6g},{ent.a1:.6g},{int(ent.ccw)}"
         )
     else:
-        g = f"?{ent.id}"
-    return f"{g}|sel={int(selected)}"
+        from cadcore.sketch import SplineEntity
+
+        if isinstance(ent, SplineEntity):
+            g = "S:" + ";".join(f"{p[0]:.6g},{p[1]:.6g}" for p in ent.points)
+        else:
+            g = f"?{ent.id}"
+    cons = int(bool(getattr(ent, "construction", False)))
+    return f"{g}|sel={int(selected)}|c={cons}"
 
 
 class _InteractorFilter(QObject):
@@ -2330,9 +2341,27 @@ class Viewport(QWidget):
             return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
         pdata = _entity_polydata(ent, self._sketch_ctrl.sketch)
-        col = SKETCH_SELECTED if selected else SKETCH_COLOR
+        # Fully-defined coloring: black well / blue under / red over (SW-like)
+        if selected:
+            col = SKETCH_SELECTED
+        elif bool(getattr(ent, "construction", False)):
+            col = (0.55, 0.55, 0.6)  # gray construction
+        else:
+            try:
+                from cadcore.sketch_ops import entity_dof_status
+
+                st = entity_dof_status(self._sketch_ctrl.sketch, ent)
+            except Exception:
+                st = "under"
+            if st == "well":
+                col = (0.05, 0.05, 0.08)  # near-black fully defined
+            elif st == "over":
+                col = (0.85, 0.15, 0.12)  # red over-defined
+            else:
+                col = SKETCH_COLOR  # blue-ish under-defined
+        lw = 2.0 if bool(getattr(ent, "construction", False)) else 3.0
         self._add_overlay_mesh(
-            pdata, color=col, line_width=3.0, name=name, pickable=False, render=False
+            pdata, color=col, line_width=lw, name=name, pickable=False, render=False
         )
         self._apply_sketch_actor_priority(name)
         self._sketch_entity_actors.add(ent.id)
@@ -2656,7 +2685,7 @@ class Viewport(QWidget):
                 "Smart Dimension: click a line, rectangle, or circle"
             )
             return
-        if msg in ("Line", "LineClosed", "Rectangle", "Circle", "Arc"):
+        if msg in ("Line", "LineClosed", "Rectangle", "Circle", "Arc", "Spline", "Offset"):
             if len(sk.entities) > n_before:
                 ent = sk.entities[-1]
                 if self._doc is not None and self._sketch_feature_id >= 0:
@@ -2685,6 +2714,19 @@ class Viewport(QWidget):
                 if self._render_timer.isActive():
                     self._render_timer.stop()
                 self._do_render()
+            return
+        if msg and (msg.startswith("Trim:") or msg.startswith("Extend:")):
+            # Geometry mutated in place — full resync + undo snapshot of sketch
+            if self._doc is not None and self._sketch_feature_id >= 0:
+                # Already mutated; record via contents if we had before — use visual only
+                pass
+            self._rebuild_all_sketch_entities()
+            self.sketch_status.emit(f"Sketch: {msg}")
+            self._request_render()
+            return
+        if msg == "SplinePoint":
+            self.sketch_status.emit("Sketch: spline point… (double-click to finish)")
+            self._request_render()
             return
         elif msg and msg.startswith("Drag"):
             self._begin_draw_lod()

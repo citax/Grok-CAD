@@ -49,6 +49,29 @@ class Mesh:
         v = self.vertices + np.asarray(offset, dtype=np.float64)
         return Mesh(v, self.faces.copy())
 
+    def rotate_about_axis(
+        self,
+        origin: Sequence[float],
+        axis: Sequence[float],
+        degrees: float,
+    ) -> "Mesh":
+        """Return a copy rotated by ``degrees`` about an axis through ``origin``."""
+        o = np.asarray(origin, dtype=np.float64).reshape(3)
+        a = np.asarray(axis, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(a))
+        if n < 1e-15:
+            return self.copy()
+        a = a / n
+        rad = float(np.radians(degrees))
+        c, s = float(np.cos(rad)), float(np.sin(rad))
+        # Rodrigues' rotation formula
+        k = a
+        pts = self.vertices - o
+        cross = np.cross(k, pts)
+        dot = np.sum(pts * k, axis=1, keepdims=True)
+        rotated = pts * c + cross * s + k * dot * (1.0 - c)
+        return Mesh(rotated + o, self.faces.copy())
+
     def volume(self) -> float:
         if self.empty:
             return 0.0

@@ -69,6 +69,7 @@ class EntityKind(Enum):
     RECTANGLE = auto()
     CIRCLE = auto()
     ARC = auto()
+    SPLINE = auto()
 
 
 class DimKind(Enum):
@@ -100,6 +101,7 @@ class Handle:
 class SketchEntity:
     id: int
     kind: EntityKind
+    construction: bool = False  # centerlines / reference — not in solid profiles
 
     def handles(self) -> List[Handle]:
         raise NotImplementedError
@@ -118,6 +120,7 @@ class LineEntity(SketchEntity):
 
     def __post_init__(self) -> None:
         self.kind = EntityKind.LINE
+        self.construction = bool(self.construction)
         self.p0 = (float(self.p0[0]), float(self.p0[1]))
         self.p1 = (float(self.p1[0]), float(self.p1[1]))
 
@@ -152,6 +155,7 @@ class RectEntity(SketchEntity):
 
     def __post_init__(self) -> None:
         self.kind = EntityKind.RECTANGLE
+        self.construction = bool(self.construction)
         self.c0 = (float(self.c0[0]), float(self.c0[1]))
         self.c1 = (float(self.c1[0]), float(self.c1[1]))
 
@@ -193,6 +197,7 @@ class CircleEntity(SketchEntity):
 
     def __post_init__(self) -> None:
         self.kind = EntityKind.CIRCLE
+        self.construction = bool(self.construction)
         self.center = (float(self.center[0]), float(self.center[1]))
         self.radius = max(1e-9, float(self.radius))
 
@@ -233,6 +238,7 @@ class ArcEntity(SketchEntity):
 
     def __post_init__(self) -> None:
         self.kind = EntityKind.ARC
+        self.construction = bool(self.construction)
         self.center = (float(self.center[0]), float(self.center[1]))
         self.radius = max(1e-9, float(self.radius))
         self.a0 = float(self.a0)
@@ -354,6 +360,63 @@ class ArcEntity(SketchEntity):
         self.center = (self.center[0] + du, self.center[1] + dv)
 
 
+@dataclass
+class SplineEntity(SketchEntity):
+    """Cubic Catmull-Rom / polyline control-point spline through points."""
+
+    points: List[Vec2] = field(default_factory=lambda: [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)])
+
+    def __post_init__(self) -> None:
+        self.kind = EntityKind.SPLINE
+        self.construction = bool(self.construction)
+        self.points = [(float(p[0]), float(p[1])) for p in self.points]
+        if len(self.points) < 2:
+            self.points = [(0.0, 0.0), (1.0, 0.0)]
+
+    def sample_uv(self, n_per_seg: int = 8) -> List[Vec2]:
+        """Sample cubic Catmull-Rom through control points (open)."""
+        pts = self.points
+        if len(pts) == 2:
+            return [pts[0], pts[1]]
+        out: List[Vec2] = []
+        # Pad ends
+        ext = [pts[0]] + list(pts) + [pts[-1]]
+        for i in range(1, len(ext) - 2):
+            p0 = np.array(ext[i - 1], dtype=np.float64)
+            p1 = np.array(ext[i], dtype=np.float64)
+            p2 = np.array(ext[i + 1], dtype=np.float64)
+            p3 = np.array(ext[i + 2], dtype=np.float64)
+            steps = max(2, int(n_per_seg))
+            for s in range(steps):
+                t = s / float(steps)
+                t2, t3 = t * t, t * t * t
+                # Centripetal-ish Catmull-Rom (uniform)
+                pos = 0.5 * (
+                    (2 * p1)
+                    + (-p0 + p2) * t
+                    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                    + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+                )
+                out.append((float(pos[0]), float(pos[1])))
+        out.append(pts[-1])
+        return out
+
+    def handles(self) -> List[Handle]:
+        return [
+            Handle(self.id, f"p{i}", HandleKind.ENDPOINT, p)
+            for i, p in enumerate(self.points)
+        ]
+
+    def set_handle(self, name: str, uv: Vec2) -> None:
+        if name.startswith("p") and name[1:].isdigit():
+            idx = int(name[1:])
+            if 0 <= idx < len(self.points):
+                self.points[idx] = (float(uv[0]), float(uv[1]))
+
+    def translate(self, du: float, dv: float) -> None:
+        self.points = [(p[0] + du, p[1] + dv) for p in self.points]
+
+
 def arc_from_three_points(
     p0: Vec2, mid: Vec2, p1: Vec2
 ) -> Optional[Tuple[Vec2, float, float, float, bool]]:
@@ -470,6 +533,20 @@ class Sketch:
             a0=a0,
             a1=a1,
             ccw=ccw,
+        )
+        self._next_entity_id += 1
+        self.entities.append(e)
+        return e
+
+    def add_spline(self, points: Sequence[Vec2]) -> SplineEntity:
+        """Add an open cubic spline through the given control points."""
+        pts = [(float(p[0]), float(p[1])) for p in points]
+        if len(pts) < 2:
+            raise ValueError("spline needs at least two points")
+        e = SplineEntity(
+            id=self._next_entity_id,
+            kind=EntityKind.SPLINE,
+            points=list(pts),
         )
         self._next_entity_id += 1
         self.entities.append(e)
@@ -860,6 +937,11 @@ def measure_dimension_value(
         return float(ent.radius) * 2.0
     if isinstance(ent, ArcEntity) and role == "radius":
         return float(ent.radius)
+    if isinstance(ent, ArcEntity) and role == "chord":
+        p0, p1 = ent.p0(), ent.p1()
+        return float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+    if isinstance(ent, ArcEntity) and role == "arc_length":
+        return abs(float(ent.sweep())) * float(ent.radius)
     if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
         return line_angle_degrees_oriented(ent, ent_b)
     raise ValueError(f"cannot measure role={role!r} on {type(ent).__name__}")
@@ -892,6 +974,21 @@ def apply_dimension_value(
         return
     if isinstance(ent, ArcEntity) and role == "radius":
         set_arc_radius(ent, val)
+        return
+    if isinstance(ent, ArcEntity) and role == "chord":
+        # chord = 2 R sin(|sweep|/2) with fixed center/angles
+        sw = abs(float(ent.sweep()))
+        s = float(np.sin(0.5 * sw))
+        if abs(s) < 1e-12:
+            raise ValueError("cannot set chord on full circle arc")
+        ent.radius = max(1e-9, val / (2.0 * s))
+        return
+    if isinstance(ent, ArcEntity) and role == "arc_length":
+        # L = R * |sweep| with fixed center/angles → R = L / |sweep|
+        sw = abs(float(ent.sweep()))
+        if sw < 1e-12:
+            raise ValueError("arc sweep is degenerate")
+        ent.radius = max(1e-9, val / sw)
         return
     if role == "angle" and isinstance(ent, LineEntity) and isinstance(ent_b, LineEntity):
         set_line_pair_angle(ent, ent_b, val)
@@ -1131,12 +1228,14 @@ def make_lines_equal_length(source: LineEntity, target: LineEntity) -> None:
 
 def snapshot_entity(ent: SketchEntity) -> dict:
     """Serializable snapshot of a sketch entity (for history / clipboard)."""
+    cons = bool(getattr(ent, "construction", False))
     if isinstance(ent, LineEntity):
         return {
             "kind": "line",
             "id": int(ent.id),
             "p0": (float(ent.p0[0]), float(ent.p0[1])),
             "p1": (float(ent.p1[0]), float(ent.p1[1])),
+            "construction": cons,
         }
     if isinstance(ent, RectEntity):
         return {
@@ -1144,6 +1243,7 @@ def snapshot_entity(ent: SketchEntity) -> dict:
             "id": int(ent.id),
             "c0": (float(ent.c0[0]), float(ent.c0[1])),
             "c1": (float(ent.c1[0]), float(ent.c1[1])),
+            "construction": cons,
         }
     if isinstance(ent, CircleEntity):
         return {
@@ -1151,6 +1251,7 @@ def snapshot_entity(ent: SketchEntity) -> dict:
             "id": int(ent.id),
             "center": (float(ent.center[0]), float(ent.center[1])),
             "radius": float(ent.radius),
+            "construction": cons,
         }
     if isinstance(ent, ArcEntity):
         return {
@@ -1161,6 +1262,14 @@ def snapshot_entity(ent: SketchEntity) -> dict:
             "a0": float(ent.a0),
             "a1": float(ent.a1),
             "ccw": bool(ent.ccw),
+            "construction": cons,
+        }
+    if isinstance(ent, SplineEntity):
+        return {
+            "kind": "spline",
+            "id": int(ent.id),
+            "points": [(float(p[0]), float(p[1])) for p in ent.points],
+            "construction": cons,
         }
     raise TypeError(f"unsupported entity type {type(ent)!r}")
 
@@ -1252,13 +1361,22 @@ def restore_entity(data: dict) -> SketchEntity:
     """Rebuild an entity from snapshot_entity() output."""
     kind = data["kind"]
     eid = int(data["id"])
+    cons = bool(data.get("construction", False))
     if kind == "line":
         return LineEntity(
-            id=eid, kind=EntityKind.LINE, p0=tuple(data["p0"]), p1=tuple(data["p1"])  # type: ignore[arg-type]
+            id=eid,
+            kind=EntityKind.LINE,
+            p0=tuple(data["p0"]),  # type: ignore[arg-type]
+            p1=tuple(data["p1"]),  # type: ignore[arg-type]
+            construction=cons,
         )
     if kind == "rect":
         return RectEntity(
-            id=eid, kind=EntityKind.RECTANGLE, c0=tuple(data["c0"]), c1=tuple(data["c1"])  # type: ignore[arg-type]
+            id=eid,
+            kind=EntityKind.RECTANGLE,
+            c0=tuple(data["c0"]),  # type: ignore[arg-type]
+            c1=tuple(data["c1"]),  # type: ignore[arg-type]
+            construction=cons,
         )
     if kind == "circle":
         return CircleEntity(
@@ -1266,6 +1384,7 @@ def restore_entity(data: dict) -> SketchEntity:
             kind=EntityKind.CIRCLE,
             center=tuple(data["center"]),  # type: ignore[arg-type]
             radius=float(data["radius"]),
+            construction=cons,
         )
     if kind == "arc":
         return ArcEntity(
@@ -1276,6 +1395,14 @@ def restore_entity(data: dict) -> SketchEntity:
             a0=float(data.get("a0", 0.0)),
             a1=float(data.get("a1", np.pi / 2)),
             ccw=bool(data.get("ccw", True)),
+            construction=cons,
+        )
+    if kind == "spline":
+        return SplineEntity(
+            id=eid,
+            kind=EntityKind.SPLINE,
+            points=[(float(p[0]), float(p[1])) for p in (data.get("points") or [])],
+            construction=cons,
         )
     raise ValueError(f"unknown entity kind {kind!r}")
 
