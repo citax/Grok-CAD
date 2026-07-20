@@ -14,6 +14,7 @@ from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCloseEvent, QK
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -384,21 +386,31 @@ class MainWindow(QMainWindow):
         act_cut.triggered.connect(self._cut_extrude)
         insert_m.addAction(act_cut)
 
-    def _ribbon_button(self, act: QAction) -> QToolButton:
-        """Compact command icon with label under — section strip style."""
+    # SolidWorks-like Command Manager: small icons (16–18px), short labels under
+    _CMD_ICON = 18
+
+    def _ribbon_button(self, act: QAction, *, icon_only: bool = False) -> QToolButton:
+        """Compact Command Manager button — SW small-button style."""
         btn = QToolButton()
         btn.setDefaultAction(act)
-        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        btn.setIconSize(QSize(22, 22))
+        if icon_only:
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            btn.setObjectName("CmdIconButton")
+            btn.setFixedSize(QSize(28, 28))
+        else:
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            btn.setObjectName("CmdStripButton")
+            btn.setFixedSize(QSize(44, 44))
+        btn.setIconSize(QSize(self._CMD_ICON, self._CMD_ICON))
         btn.setAutoRaise(True)
-        btn.setObjectName("CmdStripButton")
-        btn.setMinimumSize(QSize(52, 48))
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Prefer tooltip for long text; keep button caption short via act text
+        if act.toolTip():
+            btn.setToolTip(act.toolTip())
         return btn
 
     @staticmethod
     def _cmd_separator() -> QWidget:
-        from PySide6.QtWidgets import QFrame
-
         sep = QFrame()
         sep.setObjectName("CmdGroupSep")
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -406,40 +418,48 @@ class MainWindow(QMainWindow):
         sep.setFixedWidth(1)
         return sep
 
-    def _make_cmd_section(self, title: str, actions: list) -> QWidget:
-        """One labelled section of the always-visible command strip."""
-        from PySide6.QtWidgets import QFrame
-
+    def _make_cmd_group(
+        self, actions: list, *, title: str = "", icon_only: bool = False
+    ) -> QWidget:
+        """One horizontal group of compact buttons (optional micro-title)."""
         box = QWidget()
-        box.setObjectName("CmdSection")
-        col = QVBoxLayout(box)
-        col.setContentsMargins(8, 4, 8, 4)
-        col.setSpacing(2)
-        head = QLabel(title)
-        head.setObjectName("CmdSectionTitle")
-        head.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        col.addWidget(head)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(2)
+        box.setObjectName("CmdGroup")
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(1)
+        if title:
+            lab = QLabel(title)
+            lab.setObjectName("CmdGroupTitle")
+            lab.setAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+            )
+            lay.addWidget(lab)
         for act in actions:
-            row.addWidget(self._ribbon_button(act))
-        row.addStretch(0)
-        col.addLayout(row)
+            lay.addWidget(self._ribbon_button(act, icon_only=icon_only))
         return box
 
+    def _make_tab_page(self, *groups: QWidget) -> QWidget:
+        """A Command Manager tab body: groups left-aligned with separators."""
+        page = QWidget()
+        page.setObjectName("CmdTabPage")
+        row = QHBoxLayout(page)
+        row.setContentsMargins(6, 2, 6, 2)
+        row.setSpacing(0)
+        for i, g in enumerate(groups):
+            if i:
+                row.addWidget(self._cmd_separator())
+            row.addWidget(g)
+        row.addStretch(1)
+        return page
+
     def _build_command_manager(self) -> None:
-        """Single always-visible strip: Features | Sketch | Evaluate sections."""
+        """SolidWorks-style Command Manager: compact tabbed ribbon."""
         bar = QToolBar("CommandManager")
         bar.setObjectName("CommandManagerBar")
         bar.setMovable(False)
         bar.setFloatable(False)
-        bar.setIconSize(QSize(22, 22))
+        bar.setIconSize(QSize(self._CMD_ICON, self._CMD_ICON))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
-
-        # No tabs — one strip. Keep cmd_tabs alias None for old call sites.
-        self.cmd_tabs = None  # type: ignore[assignment]
-        self._sketch_tab_index = -1
 
         # --- Actions (shared) ---
         self.act_sketch = QAction(
@@ -483,7 +503,7 @@ class MainWindow(QMainWindow):
         self.act_chamfer.triggered.connect(self._chamfer)
 
         self.act_lpattern = QAction(
-            fa_icon("fa5s.th", color=ACCENT), "L-Pattern", self
+            fa_icon("fa5s.th", color=ACCENT), "Linear", self
         )
         self.act_lpattern.setToolTip(
             "Linear pattern of a solid along X/Y/Z spacing"
@@ -491,7 +511,7 @@ class MainWindow(QMainWindow):
         self.act_lpattern.triggered.connect(self._linear_pattern)
 
         self.act_cpattern = QAction(
-            fa_icon("fa5s.dharmachakra", color=ACCENT), "C-Pattern", self
+            fa_icon("fa5s.dharmachakra", color=ACCENT), "Circular", self
         )
         self.act_cpattern.setToolTip(
             "Circular pattern of a solid about Z (world up)"
@@ -537,7 +557,7 @@ class MainWindow(QMainWindow):
         tool_defs = (
             (SketchTool.SELECT, "Select", "fa5s.mouse-pointer", "Select and edit entities"),
             (SketchTool.LINE, "Line", "fa5s.minus", "Draw a line"),
-            (SketchTool.RECTANGLE, "Rectangle", "fa5s.vector-square", "Draw a rectangle"),
+            (SketchTool.RECTANGLE, "Rect", "fa5s.vector-square", "Draw a rectangle"),
             (SketchTool.CIRCLE, "Circle", "fa5s.circle", "Draw a circle"),
             (
                 SketchTool.ARC,
@@ -553,12 +573,12 @@ class MainWindow(QMainWindow):
             ),
             (
                 SketchTool.DIMENSION,
-                "Smart Dim",
+                "Dim",
                 "fa5s.ruler-combined",
-                "Driving dimension — click entity, type size (D)",
+                "Smart dimension — click entity, type size (D)",
             ),
-            (SketchTool.TRIM, "Trim", "fa5s.cut", "Trim a line at the click"),
-            (SketchTool.EXTEND, "Extend", "fa5s.expand", "Extend a line toward the click"),
+            (SketchTool.TRIM, "Trim", "fa5s.cut", "Trim at intersections (SolidWorks-style)"),
+            (SketchTool.EXTEND, "Extend", "fa5s.expand", "Extend to next entity"),
             (
                 SketchTool.OFFSET,
                 "Offset",
@@ -578,25 +598,25 @@ class MainWindow(QMainWindow):
             self._sketch_tool_actions[tool] = act
             sketch_tool_actions.append(act)
 
-        self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horizontal", self)
-        self.act_horiz.setToolTip("Horizontal — selected line(s) stay horizontal")
+        self.act_horiz = QAction(fa_icon("fa5s.arrows-alt-h"), "Horiz", self)
+        self.act_horiz.setToolTip("Horizontal — selected line(s) stay horizontal (H)")
         self.act_horiz.setShortcut(QKeySequence("H"))
         self.act_horiz.triggered.connect(self._make_horizontal)
-        self.act_vert = QAction(fa_icon("fa5s.arrows-alt-v"), "Vertical", self)
-        self.act_vert.setToolTip("Vertical — selected line(s) stay vertical")
+        self.act_vert = QAction(fa_icon("fa5s.arrows-alt-v"), "Vert", self)
+        self.act_vert.setToolTip("Vertical — selected line(s) stay vertical (V)")
         self.act_vert.setShortcut(QKeySequence("V"))
         self.act_vert.triggered.connect(self._make_vertical)
         self.act_equal = QAction(fa_icon("fa5s.equals"), "Equal", self)
-        self.act_equal.setToolTip("Equal — selected lines keep the same length")
+        self.act_equal.setToolTip("Equal — selected lines keep the same length (=)")
         self.act_equal.setShortcut(QKeySequence("="))
         self.act_equal.triggered.connect(self._make_equal)
-        self.act_parallel = QAction(fa_icon("fa5s.grip-lines"), "Parallel", self)
+        self.act_parallel = QAction(fa_icon("fa5s.grip-lines"), "//", self)
         self.act_parallel.setToolTip("Parallel — two selected lines stay parallel")
         self.act_parallel.triggered.connect(self._make_parallel)
-        self.act_perp = QAction(fa_icon("fa5s.plus"), "Perpendicular", self)
+        self.act_perp = QAction(fa_icon("fa5s.plus"), "Perp", self)
         self.act_perp.setToolTip("Perpendicular — two selected lines stay at 90°")
         self.act_perp.triggered.connect(self._make_perpendicular)
-        self.act_coincident = QAction(fa_icon("fa5s.dot-circle"), "Coincident", self)
+        self.act_coincident = QAction(fa_icon("fa5s.dot-circle"), "Coin", self)
         self.act_coincident.setToolTip(
             "Coincident — stick two selected line endpoints together"
         )
@@ -604,7 +624,7 @@ class MainWindow(QMainWindow):
         self.act_fix = QAction(fa_icon("fa5s.anchor"), "Fix", self)
         self.act_fix.setToolTip("Fix — lock selected line endpoint(s) in place")
         self.act_fix.triggered.connect(self._make_fix)
-        self.act_del_cstr = QAction(fa_icon("fa5s.unlink"), "Remove constraint", self)
+        self.act_del_cstr = QAction(fa_icon("fa5s.unlink"), "Unlink", self)
         self.act_del_cstr.setToolTip(
             "Remove constraints on the selected sketch entities"
         )
@@ -619,28 +639,28 @@ class MainWindow(QMainWindow):
             "Radius dimension — select an arc, type radius (ends stay put)"
         )
         self.act_radius.triggered.connect(self._make_radius_dimension)
-        self.act_construction = QAction(fa_icon("fa5s.slash"), "Construction", self)
+        self.act_construction = QAction(fa_icon("fa5s.slash"), "Constr", self)
         self.act_construction.setToolTip(
             "Toggle construction (centerline) on selected entities"
         )
         self.act_construction.triggered.connect(self._toggle_construction)
-        self.act_midpoint = QAction(fa_icon("fa5s.arrows-alt-h"), "Midpoint", self)
+        self.act_midpoint = QAction(fa_icon("fa5s.arrows-alt-h"), "Mid", self)
         self.act_midpoint.setToolTip(
             "Midpoint — selected point handle stays at mid of first selected line"
         )
         self.act_midpoint.triggered.connect(self._make_midpoint)
-        self.act_concentric = QAction(fa_icon("fa5s.bullseye"), "Concentric", self)
+        self.act_concentric = QAction(fa_icon("fa5s.bullseye"), "Conc", self)
         self.act_concentric.setToolTip("Concentric — two circles/arcs share a center")
         self.act_concentric.triggered.connect(self._make_concentric)
-        self.act_collinear = QAction(fa_icon("fa5s.grip-lines-vertical"), "Collinear", self)
+        self.act_collinear = QAction(fa_icon("fa5s.grip-lines-vertical"), "Col", self)
         self.act_collinear.setToolTip("Collinear — two selected lines stay collinear")
         self.act_collinear.triggered.connect(self._make_collinear)
-        self.act_symmetric = QAction(fa_icon("fa5s.balance-scale"), "Symmetric", self)
+        self.act_symmetric = QAction(fa_icon("fa5s.balance-scale"), "Sym", self)
         self.act_symmetric.setToolTip(
             "Symmetric — subject line endpoints about first selected mirror line"
         )
         self.act_symmetric.triggered.connect(self._make_symmetric)
-        self.act_equal_r = QAction(fa_icon("fa5s.circle"), "Equal R", self)
+        self.act_equal_r = QAction(fa_icon("fa5s.circle"), "=R", self)
         self.act_equal_r.setToolTip("Equal radius — two circles/arcs keep same radius")
         self.act_equal_r.triggered.connect(self._make_equal_radius)
         self.act_convert = QAction(fa_icon("fa5s.project-diagram"), "Convert", self)
@@ -654,42 +674,57 @@ class MainWindow(QMainWindow):
         self.act_exit_sketch.setToolTip("Exit sketch mode (Esc when idle)")
         self.act_exit_sketch.triggered.connect(self._exit_sketch)
 
-        # Full-width host strip
-        host = QWidget()
-        host.setObjectName("CommandManagerHost")
-        strip = QHBoxLayout(host)
-        strip.setContentsMargins(4, 2, 4, 2)
-        strip.setSpacing(0)
+        # ----- Tabbed Command Manager (SolidWorks-style) -----
+        tabs = QTabWidget()
+        tabs.setObjectName("CommandManagerTabs")
+        tabs.setDocumentMode(True)
+        tabs.setUsesScrollButtons(True)
+        tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        tabs.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
 
-        strip.addWidget(
-            self._make_cmd_section(
-                "Features",
+        # Features tab
+        feat_page = self._make_tab_page(
+            self._make_cmd_group(
                 [
                     self.act_sketch,
                     self.act_extrude,
                     self.act_cut_extrude,
                     self.act_revolve,
+                ]
+            ),
+            self._make_cmd_group(
+                [
                     self.act_fillet,
                     self.act_chamfer,
                     self.act_pocket,
+                ]
+            ),
+            self._make_cmd_group(
+                [
                     self.act_lpattern,
                     self.act_cpattern,
                     self.act_mirror,
                     self.act_offset_plane,
-                ],
-            )
+                ]
+            ),
         )
-        strip.addWidget(self._cmd_separator())
-        strip.addWidget(
-            self._make_cmd_section(
-                "Sketch",
-                sketch_tool_actions
-                + [
+        tabs.addTab(feat_page, "Features")
+
+        # Sketch tab — Draw | Modify | Relations | Dimensions
+        draw_acts = sketch_tool_actions[:6]  # Select..Spline
+        mod_acts = sketch_tool_actions[6:]  # Dim, Trim, Extend, Offset
+        sketch_page = self._make_tab_page(
+            self._make_cmd_group(draw_acts),
+            self._make_cmd_group(mod_acts),
+            self._make_cmd_group(
+                [
                     self.act_horiz,
                     self.act_vert,
-                    self.act_equal,
                     self.act_parallel,
                     self.act_perp,
+                    self.act_equal,
                     self.act_coincident,
                     self.act_fix,
                     self.act_midpoint,
@@ -698,22 +733,38 @@ class MainWindow(QMainWindow):
                     self.act_symmetric,
                     self.act_equal_r,
                     self.act_del_cstr,
+                ]
+            ),
+            self._make_cmd_group(
+                [
                     self.act_angle,
                     self.act_radius,
                     self.act_construction,
                     self.act_convert,
                     self.act_exit_sketch,
-                ],
-            )
+                ]
+            ),
         )
-        strip.addWidget(self._cmd_separator())
-        strip.addWidget(self._make_cmd_section("Evaluate", [self.act_export_stl]))
-        strip.addStretch(1)
+        self._sketch_tab_index = tabs.addTab(sketch_page, "Sketch")
 
-        host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        # Evaluate tab
+        eval_page = self._make_tab_page(
+            self._make_cmd_group([self.act_export_stl]),
+        )
+        tabs.addTab(eval_page, "Evaluate")
+
+        # Stretch tab bar to fill toolbar width
+        host = QWidget()
+        host.setObjectName("CommandManagerHost")
+        hl = QHBoxLayout(host)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        hl.addWidget(tabs, 1)
+
         bar.addWidget(host)
         self.sketch_tb = bar  # type: ignore[assignment]
         self._cmd_strip = host
+        self.cmd_tabs = tabs
         self._set_sketch_ribbon_enabled(False)
 
     def _set_sketch_ribbon_enabled(self, on: bool) -> None:
@@ -741,6 +792,13 @@ class MainWindow(QMainWindow):
         ):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(on)
+        # SolidWorks: jump to Sketch tab when editing; Features when not
+        tabs = getattr(self, "cmd_tabs", None)
+        if tabs is not None and getattr(self, "_sketch_tab_index", -1) >= 0:
+            if on:
+                tabs.setCurrentIndex(int(self._sketch_tab_index))
+            else:
+                tabs.setCurrentIndex(0)
 
     def _build_heads_up_view_bar(self) -> None:
         """Floating SolidWorks-style heads-up view tools over the viewport."""
