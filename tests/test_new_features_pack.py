@@ -109,12 +109,47 @@ def test_construction_excluded_from_profiles():
 
 
 def test_trim_and_offset_line():
+    from cadcore.sketch_ops import trim_entity_at
+
     sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
     ln = sk.add_line((0, 0), (10, 0))
-    trim_line_at(ln, (7, 0))
-    assert ln.p1[0] == pytest.approx(7.0) or ln.p0[0] == pytest.approx(7.0)
+    sk.add_line((6, -2), (6, 2))
+    assert trim_entity_at(sk, ln, (8.5, 0.0))
+    ends = sorted([ln.p0[0], ln.p1[0]])
+    assert ends[0] == pytest.approx(0.0)
+    assert ends[1] == pytest.approx(6.0)  # cut at intersection, not cursor
     off = offset_line(sk.add_line((0, 0), (10, 0)), 2.0)
     assert off.p0[1] == pytest.approx(2.0)
+
+
+def test_sw_trim_middle_splits_entity():
+    from cadcore.sketch_ops import trim_entity_at
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    h = sk.add_line((0, 0), (10, 0))
+    sk.add_line((3, -1), (3, 1))
+    sk.add_line((6, -1), (6, 1))
+    n0 = len(sk.entities)
+    assert trim_entity_at(sk, h, (5.0, 0.0))
+    assert len(sk.entities) == n0 + 1
+    horiz = [
+        e
+        for e in sk.entities
+        if isinstance(e, type(h)) and abs(e.p0[1]) < 1e-9 and abs(e.p1[1]) < 1e-9
+    ]
+    assert len(horiz) == 2
+
+
+def test_sw_extend_to_intersection():
+    from cadcore.sketch_ops import extend_entity_at
+
+    sk = Sketch(frame=PlaneFrame.from_plane_type("PLANE_FRONT"))
+    h = sk.add_line((-8, 0), (0, 0))
+    sk.add_line((8, -2), (8, 2))
+    assert extend_entity_at(sk, h, (-0.5, 0.0))
+    ends = sorted([h.p0[0], h.p1[0]])
+    assert ends[0] == pytest.approx(-8.0)
+    assert ends[1] == pytest.approx(8.0)
 
 
 def test_equal_radius_constraint():

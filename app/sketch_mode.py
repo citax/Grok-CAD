@@ -493,28 +493,35 @@ class SketchController:
             return f"DimPick:{eid}:{role}"
 
         if self.tool == SketchTool.TRIM:
+            from cadcore.sketch_ops import trim_entity_at
+
             eid = self.pick_entity_body(raw_uv)
             ent = self.sketch.find_entity(eid) if eid is not None else None
-            if isinstance(ent, LineEntity):
-                from cadcore.sketch_ops import trim_line_at
-
-                trim_line_at(ent, raw_uv)
-                return f"Trim:{ent.id}"
-            return "TrimMiss"
+            if ent is None:
+                return "TrimMiss"
+            if not isinstance(ent, (LineEntity, ArcEntity, CircleEntity)):
+                return "TrimMiss"
+            # Snapshot for undo is handled by viewport when msg starts with Trim:
+            n_before = len(self.sketch.entities)
+            ok = trim_entity_at(self.sketch, ent, raw_uv)
+            if not ok:
+                return "TrimMiss"
+            return f"Trim:{eid}:n{n_before}->{len(self.sketch.entities)}"
 
         if self.tool == SketchTool.EXTEND:
+            from cadcore.sketch_ops import extend_entity_at
+
             eid = self.pick_entity_body(raw_uv)
             ent = self.sketch.find_entity(eid) if eid is not None else None
-            if isinstance(ent, LineEntity):
-                from cadcore.sketch_ops import extend_line_to_point
-
-                # Extend free end nearer the click
-                d0 = float(np.hypot(raw_uv[0] - ent.p0[0], raw_uv[1] - ent.p0[1]))
-                d1 = float(np.hypot(raw_uv[0] - ent.p1[0], raw_uv[1] - ent.p1[1]))
-                free = "p0" if d0 <= d1 else "p1"
-                extend_line_to_point(ent, raw_uv, free_end=free)
-                return f"Extend:{ent.id}"
-            return "ExtendMiss"
+            if ent is None:
+                return "ExtendMiss"
+            if not isinstance(ent, (LineEntity, ArcEntity)):
+                # Circles are closed — nothing to extend
+                return "ExtendMiss"
+            ok = extend_entity_at(self.sketch, ent, raw_uv)
+            if not ok:
+                return "ExtendMiss"
+            return f"Extend:{eid}"
 
         if self.tool == SketchTool.OFFSET:
             eid = self.pick_entity_body(raw_uv)

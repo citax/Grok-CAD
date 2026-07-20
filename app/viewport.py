@@ -2653,6 +2653,16 @@ class Viewport(QWidget):
                     else:
                         self._drag_before = snapshot_entity(ent0)
         n_before = len(self._sketch_ctrl.sketch.entities)
+        # Snapshot before trim/extend/offset so the edit is undoable
+        _edit_before = None
+        if self._sketch_ctrl.tool in (
+            SketchTool.TRIM,
+            SketchTool.EXTEND,
+            SketchTool.OFFSET,
+        ):
+            from cadcore.sketch import snapshot_sketch_contents
+
+            _edit_before = snapshot_sketch_contents(self._sketch_ctrl.sketch)
         msg = self._sketch_ctrl.on_press(
             uv, display_xy=(float(x), float(y)), shift=shift, ctrl=ctrl
         )
@@ -2715,12 +2725,26 @@ class Viewport(QWidget):
                     self._render_timer.stop()
                 self._do_render()
             return
-        if msg and (msg.startswith("Trim:") or msg.startswith("Extend:")):
-            # Geometry mutated in place — full resync + undo snapshot of sketch
-            if self._doc is not None and self._sketch_feature_id >= 0:
-                # Already mutated; record via contents if we had before — use visual only
-                pass
+        if msg and (
+            msg.startswith("Trim:")
+            or msg.startswith("Extend:")
+            or msg.startswith("Offset:")
+        ):
+            if (
+                self._doc is not None
+                and self._sketch_feature_id >= 0
+                and _edit_before is not None
+            ):
+                from cadcore.sketch import snapshot_sketch_contents
+
+                after = snapshot_sketch_contents(sk)
+                self._doc.record_sketch_contents(
+                    self._sketch_feature_id, _edit_before, after
+                )
             self._rebuild_all_sketch_entities()
+            self._update_handles_visual()
+            self._update_junction_dots()
+            self._update_dim_labels()
             self.sketch_status.emit(f"Sketch: {msg}")
             self._request_render()
             return
