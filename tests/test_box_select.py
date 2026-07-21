@@ -132,9 +132,12 @@ def test_click_entity_still_single_selects():
     ctrl, inside, crossing, *_ = _ctrl_with_scene()
     # On line body between mid and end (not on a handle)
     msg = ctrl.on_press((1.2, 0.5), display_xy=(10.0, 10.0), shift=False)
-    assert msg and msg.startswith("Selected")
+    # Body press selects and starts whole-entity translate drag (daily-driver edit)
+    assert msg and (msg.startswith("Selected") or msg.startswith("Drag body"))
     assert ctrl.selected_ids == {inside.id}
     assert ctrl.box_select is None
+    assert ctrl.drag is not None
+    assert ctrl.drag.handle_name == "__body__"
 
 
 def test_multi_delete_one_undo():

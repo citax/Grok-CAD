@@ -114,6 +114,8 @@ class SketchController:
         self.drag: Optional[DragState] = None
         self.box_select: Optional[BoxSelectState] = None
         self.hover_handle: Optional[Handle] = None
+        # Entity under cursor (body or handle) — drives handle visibility on hover
+        self.hover_entity_id: Optional[int] = None
         # Multi-selection source of truth (entity geometry)
         self.selected_ids: Set[int] = set()
         # Closed-region (extrude profile) selection — ids may be negative (line loops)
@@ -190,6 +192,7 @@ class SketchController:
         if tool not in (SketchTool.SELECT, SketchTool.DIMENSION):
             self.selected_ids.clear()
             self.hover_handle = None
+            self.hover_entity_id = None
 
     def is_drawing(self) -> bool:
         return self.draw is not None and len(self.draw.points) > 0
@@ -444,11 +447,22 @@ class SketchController:
                 self._apply_drag(sn.uv)
                 self.preview_uv = sn.uv
             else:
-                self.hover_handle = self.pick_handle(raw_uv)
+                # Prefer handle under cursor; else entity body so mid/end
+                # resize handles appear while hovering the curve (not only the dots).
+                h = self.pick_handle(raw_uv)
+                self.hover_handle = h
+                if h is not None:
+                    self.hover_entity_id = int(h.entity_id)
+                else:
+                    eid = self.pick_entity_body(raw_uv)
+                    self.hover_entity_id = int(eid) if eid is not None else None
                 self.preview_uv = raw_uv
         else:
             sn = self.snap(raw_uv, drawing=True)
             self.preview_uv = sn.uv
+            # Clear select-hover chrome when drawing tools are active
+            self.hover_handle = None
+            self.hover_entity_id = None
 
     def on_press(
         self,
@@ -567,9 +581,25 @@ class SketchController:
                         self.selected_ids.discard(eid)
                     else:
                         self.selected_ids.add(eid)
-                else:
-                    self.selected_entity_id = eid
-                return f"Selected entity {eid}"
+                    return f"Selected entity {eid}"
+                # SolidWorks-like: press on body starts whole-entity translate drag.
+                # Use the same snap space as on_move so delta is not biased.
+                self.selected_entity_id = eid
+                ent = self.sketch.find_entity(eid)
+                snap0 = None
+                if ent is not None:
+                    from cadcore.sketch import snapshot_entity
+
+                    snap0 = snapshot_entity(ent)
+                sn0 = self.snap(raw_uv, drawing=False)
+                self.drag = DragState(
+                    entity_id=int(eid),
+                    handle_name="__body__",
+                    handle_kind=HandleKind.MIDPOINT,
+                    start_uv=(float(sn0.uv[0]), float(sn0.uv[1])),
+                    start_entity_snapshot=snap0,
+                )
+                return f"Drag body {eid}"
             # Interior of a region OR empty canvas: do not decide yet.
             # Press+drag → box select; press+release (no drag) → region pick if inside.
             multi = bool(shift or ctrl)
@@ -661,24 +691,58 @@ class SketchController:
         ent = self.sketch.find_entity(self.drag.entity_id)
         if ent is None:
             return
-        from cadcore.sketch import SplineEntity
+        from cadcore.sketch import SplineEntity, apply_entity_snapshot
 
-        if isinstance(ent, (LineEntity, RectEntity, CircleEntity, ArcEntity, SplineEntity)):
-            ent.set_handle(self.drag.handle_name, uv)
-            # Keep geometric relationships + driving dimensions after the drag
+        if not isinstance(
+            ent, (LineEntity, RectEntity, CircleEntity, ArcEntity, SplineEntity)
+        ):
+            return
+
+        if self.drag.handle_name == "__body__":
+            # Whole-entity translate: restore press snapshot then move by total delta
+            if self.drag.start_entity_snapshot is not None:
+                apply_entity_snapshot(ent, self.drag.start_entity_snapshot)
+            du = float(uv[0]) - float(self.drag.start_uv[0])
+            dv = float(uv[1]) - float(self.drag.start_uv[1])
+            ent.translate(du, dv)
             if getattr(self.sketch, "constraints", None) or getattr(
                 self.sketch, "dimensions", None
             ):
                 from cadcore.constraints import solve_sketch
 
+                # Prefer mid/center as the drag anchor for the solver
+                anchor = "mid"
+                if isinstance(ent, CircleEntity):
+                    anchor = "center"
+                elif isinstance(ent, RectEntity):
+                    anchor = "c0"
+                elif isinstance(ent, ArcEntity):
+                    anchor = "center"
                 solve_sketch(
                     self.sketch,
                     drag=(
                         int(self.drag.entity_id),
-                        str(self.drag.handle_name),
+                        anchor,
                         (float(uv[0]), float(uv[1])),
                     ),
                 )
+            return
+
+        ent.set_handle(self.drag.handle_name, uv)
+        # Keep geometric relationships + driving dimensions after the drag
+        if getattr(self.sketch, "constraints", None) or getattr(
+            self.sketch, "dimensions", None
+        ):
+            from cadcore.constraints import solve_sketch
+
+            solve_sketch(
+                self.sketch,
+                drag=(
+                    int(self.drag.entity_id),
+                    str(self.drag.handle_name),
+                    (float(uv[0]), float(uv[1])),
+                ),
+            )
 
     def _try_finish_draw(self) -> Optional[str]:
         if self.draw is None:

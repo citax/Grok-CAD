@@ -143,9 +143,11 @@ def test_edge_click_selects_entity_not_region():
     r = sk.add_rectangle((0, 0), (2, 2))
     ctrl = SketchController(sk)
     ctrl.set_tool(SketchTool.SELECT)
-    # Midpoint of bottom edge
+    # Midpoint of bottom edge (entity body — not interior region)
     msg = ctrl.on_press((1.0, 0.0), display_xy=(50.0, 50.0), shift=False)
-    assert msg and msg.startswith("Selected entity")
+    assert msg and (
+        msg.startswith("Selected entity") or msg.startswith("Drag body")
+    )
     assert ctrl.selected_ids == {r.id}
     assert not ctrl.selected_profile_ids
     assert ctrl.box_select is None

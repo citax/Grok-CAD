@@ -74,10 +74,17 @@ def main() -> int:
             f"count={len(cmd_btns)}",
             flush=True,
         )
-        if b0.width() > 60 or b0.height() > 56:
+        if b0.width() > 70 or b0.height() > 68:
             print(f"FAIL buttons still large: {b0.width()}x{b0.height()}", flush=True)
             return 1
-        print("OK buttons are compact (<=60x56)", flush=True)
+        # Labels under icons need vertical room (was 44px — captions clipped)
+        if b0.height() < 52:
+            print(f"FAIL buttons too short for labels: {b0.height()}", flush=True)
+            return 1
+        print(
+            f"OK buttons fit captions ({b0.width()}x{b0.height()}, expect ~52x58)",
+            flush=True,
+        )
     else:
         print("FAIL no CmdStripButton found", flush=True)
         return 1
@@ -105,9 +112,15 @@ def main() -> int:
 
     # Tab bar height / overall command manager height
     bar = win.sketch_tb
-    print(f"OK CommandManagerBar height={bar.height()} (target <= 80)", flush=True)
-    if bar.height() > 90:
+    print(f"OK CommandManagerBar height={bar.height()} (target ~90–110)", flush=True)
+    if bar.height() > 120:
         print(f"FAIL command manager too tall: {bar.height()}", flush=True)
+        return 1
+    if bar.height() < 70:
+        print(
+            f"FAIL command manager too short (labels may clip): {bar.height()}",
+            flush=True,
+        )
         return 1
 
     win._exit_sketch()

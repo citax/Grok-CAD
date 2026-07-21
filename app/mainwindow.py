@@ -442,7 +442,8 @@ class MainWindow(QMainWindow):
         else:
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             btn.setObjectName("CmdStripButton")
-            btn.setFixedSize(QSize(44, 44))
+            # Tall enough for 18px icon + caption under icon (was 44×44 — labels clipped)
+            btn.setFixedSize(QSize(52, 58))
         btn.setIconSize(QSize(self._CMD_ICON, self._CMD_ICON))
         btn.setAutoRaise(True)
         btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -485,7 +486,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("CmdTabPage")
         row = QHBoxLayout(page)
-        row.setContentsMargins(6, 2, 6, 2)
+        row.setContentsMargins(6, 4, 6, 4)
         row.setSpacing(0)
         for i, g in enumerate(groups):
             if i:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import time
-from typing import Dict, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyvista as pv
@@ -2393,6 +2393,9 @@ class Viewport(QWidget):
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
+        he = getattr(ctrl, "hover_entity_id", None)
+        if he is not None:
+            show_ids.add(int(he))
         for ent in sk.entities:
             if not isinstance(ent, LineEntity) or ent.id not in show_ids:
                 continue
@@ -2452,6 +2455,9 @@ class Viewport(QWidget):
         show_ids = set(ctrl.selected_ids)
         if ctrl.hover_handle is not None:
             show_ids.add(ctrl.hover_handle.entity_id)
+        he = getattr(ctrl, "hover_entity_id", None)
+        if he is not None:
+            show_ids.add(int(he))
         for ent in sk.entities:
             if isinstance(ent, LineEntity) and ent.id in show_ids and (ent.id, "length") not in seen:
                 out.append(format_length(line_length(ent), unit))
@@ -2476,6 +2482,11 @@ class Viewport(QWidget):
                 ent = ctrl.sketch.find_entity(hid)
                 if isinstance(ent, LineEntity):
                     ids.append(hid)
+        he = getattr(ctrl, "hover_entity_id", None)
+        if he is not None and int(he) not in ids:
+            ent = ctrl.sketch.find_entity(int(he))
+            if isinstance(ent, LineEntity):
+                ids.append(int(he))
         return ids
 
     def face_pick_frame(self) -> Optional[PlaneFrame]:
@@ -2553,8 +2564,12 @@ class Viewport(QWidget):
         name = f"sk_e_{ent.id}"
         selected = ent.id in self._sketch_ctrl.selected_ids
         fp = _entity_fingerprint(ent, selected=selected)
-        if self._sketch_entity_fps.get(ent.id) == fp and (
-            name in self.plotter.actors or name in self._overlay_actors
+        cached = self._sketch_entity_fps.get(ent.id)
+        # Cache key is "geo|dof=…" — geometry+selection match skips expensive DOF probe
+        if (
+            cached is not None
+            and cached.startswith(fp + "|")
+            and (name in self.plotter.actors or name in self._overlay_actors)
         ):
             return  # unchanged — skip VTK teardown/rebuild
         self._remove_actor(name)
@@ -2601,27 +2616,55 @@ class Viewport(QWidget):
     def _clear_handles(self) -> None:
         self._remove_actor("__sk_handles")
 
+    def _handles_visible_entity_ids(self) -> Set[int]:
+        """Entity ids whose endpoint/mid/rim handles should be drawn."""
+        if self._sketch_ctrl is None:
+            return set()
+        ctrl = self._sketch_ctrl
+        ids: Set[int] = set(ctrl.selected_ids)
+        he = getattr(ctrl, "hover_entity_id", None)
+        if he is not None:
+            ids.add(int(he))
+        if ctrl.hover_handle is not None:
+            ids.add(int(ctrl.hover_handle.entity_id))
+        return ids
+
     def _update_handles_visual(self) -> None:
         if not self.plotter or self._sketch_ctrl is None:
             return
-        self._clear_handles()
         ctrl = self._sketch_ctrl
         fr = ctrl.sketch.frame
+        show = self._handles_visible_entity_ids()
         pts = []
-        sel = ctrl.selected_ids
+        # Signature so identical hover/selection skips VTK teardown/rebuild
+        sig_parts: List[str] = []
         for h in ctrl.sketch.all_handles():
-            if sel and h.entity_id not in sel:
-                if ctrl.hover_handle is None or ctrl.hover_handle.entity_id != h.entity_id:
-                    continue
+            if show and h.entity_id not in show:
+                continue
+            # When nothing selected and nothing hovered, show nothing (clean canvas)
+            if not show:
+                continue
             pts.append(fr.to_world(h.uv))
+            sig_parts.append(
+                f"{h.entity_id}:{h.name}:{h.uv[0]:.4f}:{h.uv[1]:.4f}"
+            )
+        hot = ctrl.hover_handle is not None or getattr(ctrl, "hover_entity_id", None) is not None
+        sig = ("|".join(sig_parts) + f"|hot={int(hot)}") if pts else ""
+        if getattr(self, "_handles_vis_sig", None) == sig and (
+            (not pts and "__sk_handles" not in self._overlay_actors)
+            or (pts and "__sk_handles" in self._overlay_actors)
+        ):
+            return
+        self._handles_vis_sig = sig
+        self._clear_handles()
         if not pts:
             return
         # Flat 2D dots on-plane — never spheres (overlay layer handles z-order)
-        col = HANDLE_HOVER if ctrl.hover_handle else HANDLE_COLOR
+        col = HANDLE_HOVER if hot else HANDLE_COLOR
         self._add_overlay_mesh(
             _flat_point_cloud(np.array(pts, float)),
             color=col,
-            point_size=14 if ctrl.hover_handle else 10,
+            point_size=14 if hot else 10,
             render_points_as_spheres=False,
             name="__sk_handles",
             pickable=False,
@@ -2680,9 +2723,12 @@ class Viewport(QWidget):
             return
         ctrl = self._sketch_ctrl
         if ctrl.tool == SketchTool.SELECT or ctrl.preview_uv is None:
-            self._clear_preview()
-            if not self._draw_lod_active:
-                self._update_handles_visual()
+            # SELECT idle: never rebuild handles here — that was the hover FPS killer
+            # (every mouse move cleared/rebuilt the VTK handle actor + re-rendered).
+            if "__sk_preview" in self._overlay_actors or (
+                self.plotter is not None and "__sk_preview" in self.plotter.actors
+            ):
+                self._clear_preview()
             return
         if ctrl.draw is None or not ctrl.draw.points:
             self._clear_preview()
@@ -2810,7 +2856,8 @@ class Viewport(QWidget):
         if uv is None:
             return
         self._last_sketch_uv = uv
-        prev_hover = self._sketch_ctrl.hover_handle
+        prev_hover_h = self._sketch_ctrl.hover_handle
+        prev_hover_e = getattr(self._sketch_ctrl, "hover_entity_id", None)
         drawing = (
             self._sketch_ctrl.is_drawing()
             or self._sketch_ctrl.drag is not None
@@ -2830,25 +2877,49 @@ class Viewport(QWidget):
         if self._sketch_ctrl.drag is not None:
             ent = self._sketch_ctrl.sketch.find_entity(self._sketch_ctrl.drag.entity_id)
             if ent:
+                # Geometry changed under drag — force actor refresh
+                self._sketch_entity_fps.pop(ent.id, None)
                 self._upsert_entity_actor(ent)
             if not self._draw_lod_active:
+                # Handles move with entity; invalidate handle sig so points track drag
+                self._handles_vis_sig = None
                 self._update_handles_visual()
-                self._update_dim_labels()
             if self._render_timer.isActive():
                 self._render_timer.stop()
             self._do_render()
             return
-        # Live VTK draw preview on layer-1 overlay + one light re-render per move
-        self._update_preview_visual()
-        if drawing:
-            if self._render_timer.isActive():
-                self._render_timer.stop()
-            self._do_render()
-            self._stroke_move_ms.append((time.perf_counter() - t0) * 1000.0)
+        # Drawing tools: live VTK preview + one light re-render per move
+        if drawing or self._sketch_ctrl.tool != SketchTool.SELECT:
+            self._update_preview_visual()
+            if drawing or self._sketch_ctrl.is_drawing():
+                if self._render_timer.isActive():
+                    self._render_timer.stop()
+                self._do_render()
+                self._stroke_move_ms.append((time.perf_counter() - t0) * 1000.0)
+                return
+            self._request_render()
             return
-        if not self._draw_lod_active and self._sketch_ctrl.hover_handle != prev_hover:
+        # SELECT idle hover: only repaint when the hover target changes
+        new_h = self._sketch_ctrl.hover_handle
+        new_e = getattr(self._sketch_ctrl, "hover_entity_id", None)
+        hover_changed = (
+            new_h != prev_hover_h
+            or new_e != prev_hover_e
+            or (
+                new_h is not None
+                and prev_hover_h is not None
+                and (
+                    new_h.entity_id != prev_hover_h.entity_id
+                    or new_h.name != prev_hover_h.name
+                )
+            )
+        )
+        if hover_changed and not self._draw_lod_active:
             self._update_handles_visual()
-        self._request_render()
+            # Ephemeral length label follows hover entity (cheap; only on change)
+            self._update_dim_labels()
+            self._request_render()
+        self._stroke_move_ms.append((time.perf_counter() - t0) * 1000.0)
 
     def _sketch_mouse_press(
         self, x: float, y: float, *, shift: bool = False, ctrl: bool = False

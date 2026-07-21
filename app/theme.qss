@@ -113,7 +113,8 @@ QPushButton#primaryButton {
     border-color: @ACCENT;
 }
 
-/* Command Manager — SolidWorks-style compact tabbed ribbon */
+/* Command Manager — SolidWorks-style compact tabbed ribbon
+   Height must fit icon (~18px) + caption under icon (~2 lines max). */
 QToolBar#CommandManagerBar {
     background-color: @BG_PANEL;
     border: none;
@@ -121,7 +122,7 @@ QToolBar#CommandManagerBar {
     spacing: 0;
     padding: 0;
     min-height: 0;
-    max-height: 72px;
+    max-height: 104px;
 }
 QWidget#CommandManagerHost {
     background: transparent;
@@ -160,8 +161,8 @@ QTabWidget#CommandManagerTabs > QTabBar::tab:hover:!selected {
 }
 QWidget#CmdTabPage {
     background: transparent;
-    min-height: 48px;
-    max-height: 50px;
+    min-height: 62px;
+    max-height: 68px;
 }
 QWidget#CmdGroup {
     background: transparent;
@@ -172,14 +173,14 @@ QLabel#CmdGroupTitle {
     font-weight: 600;
     padding: 0 4px 0 2px;
 }
-/* Text-under-icon command buttons — compact like SW small buttons */
+/* Text-under-icon command buttons — room for caption under 18px icon */
 QToolButton#CmdStripButton {
-    min-width: 40px;
-    max-width: 52px;
-    min-height: 42px;
-    max-height: 46px;
-    padding: 1px 2px 2px 2px;
-    font-size: 7pt;
+    min-width: 44px;
+    max-width: 64px;
+    min-height: 54px;
+    max-height: 62px;
+    padding: 2px 2px 3px 2px;
+    font-size: 7.5pt;
     font-weight: 500;
     border-radius: 3px;
     background: transparent;
