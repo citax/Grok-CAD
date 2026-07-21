@@ -359,6 +359,48 @@ class MainWindow(QMainWindow):
         act_fit.setShortcut(QKeySequence("Ctrl+F"))
         act_fit.triggered.connect(self.viewport.zoom_to_fit)
         view_m.addAction(act_fit)
+        view_m.addSeparator()
+        # Section view — display clip only (document solids unchanged)
+        self.act_section = QAction(
+            fa_icon("fa5s.cut", color=ACCENT), "Section View", self
+        )
+        self.act_section.setCheckable(True)
+        self.act_section.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_section.setToolTip(
+            "Clip the display with a plane (view only — part volume unchanged)"
+        )
+        self.act_section.triggered.connect(self._toggle_section_view)
+        view_m.addAction(self.act_section)
+        sec_plane_m = view_m.addMenu("Section Plane")
+        self._section_plane_group = QActionGroup(self)
+        self._section_plane_group.setExclusive(True)
+        self._section_plane_actions: Dict[str, QAction] = {}
+        for key, label in (
+            ("FRONT", "Front (XY)"),
+            ("TOP", "Top (XZ)"),
+            ("RIGHT", "Right (YZ)"),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            if key == "FRONT":
+                act.setChecked(True)
+            act.triggered.connect(
+                lambda checked=False, k=key: self._set_section_plane(k)
+            )
+            self._section_plane_group.addAction(act)
+            sec_plane_m.addAction(act)
+            self._section_plane_actions[key] = act
+        self.act_section_flip = QAction("Flip Section Side", self)
+        self.act_section_flip.setCheckable(True)
+        self.act_section_flip.setToolTip("Keep the opposite half of the model")
+        self.act_section_flip.triggered.connect(self._flip_section_side)
+        view_m.addAction(self.act_section_flip)
+        self.act_section_offset = QAction("Section Offset…", self)
+        self.act_section_offset.setToolTip(
+            "Move the section plane along its normal (mm)"
+        )
+        self.act_section_offset.triggered.connect(self._section_offset_dialog)
+        view_m.addAction(self.act_section_offset)
 
         insert_m = self.menuBar().addMenu("&Insert")
         act = QAction(fa_icon("fa5s.pencil-ruler", color=ACCENT), "Sketch", self)
@@ -859,6 +901,60 @@ class MainWindow(QMainWindow):
             "Startup-only theming avoids half-updated colours from import-time "
             "bindings (restart required).",
         )
+
+    def _toggle_section_view(self) -> None:
+        on = bool(self.act_section.isChecked())
+        self.viewport.set_section_view(enabled=on)
+        st = self.viewport.section_view_state()
+        if on:
+            self.statusBar().showMessage(
+                f"Section view ON · plane={st['plane']} · "
+                f"flip={st['flip']} · offset={st['offset']:g} mm "
+                f"(display only — solid unchanged)",
+                4000,
+            )
+        else:
+            self.statusBar().showMessage("Section view OFF", 2500)
+
+    def _set_section_plane(self, plane: str) -> None:
+        self.viewport.set_section_view(plane=plane)
+        if not self.act_section.isChecked():
+            self.act_section.setChecked(True)
+            self.viewport.set_section_view(enabled=True)
+        st = self.viewport.section_view_state()
+        self.statusBar().showMessage(
+            f"Section plane → {st['plane']}  offset={st['offset']:g} mm", 3000
+        )
+
+    def _flip_section_side(self) -> None:
+        flip = bool(self.act_section_flip.isChecked())
+        self.viewport.set_section_view(flip=flip)
+        if not self.act_section.isChecked():
+            self.act_section.setChecked(True)
+            self.viewport.set_section_view(enabled=True)
+        st = self.viewport.section_view_state()
+        self.statusBar().showMessage(
+            f"Section flip={st['flip']} · keeping opposite half", 3000
+        )
+
+    def _section_offset_dialog(self) -> None:
+        st = self.viewport.section_view_state()
+        val, ok = QInputDialog.getDouble(
+            self,
+            "Section Offset",
+            "Offset along plane normal (mm):",
+            float(st["offset"]),
+            -1e6,
+            1e6,
+            3,
+        )
+        if not ok:
+            return
+        self.viewport.set_section_view(offset=float(val))
+        if not self.act_section.isChecked():
+            self.act_section.setChecked(True)
+            self.viewport.set_section_view(enabled=True)
+        self.statusBar().showMessage(f"Section offset → {float(val):g} mm", 3000)
 
     def _on_sketch_tool(self, tool: SketchTool) -> None:
         self.viewport.set_sketch_tool(tool)

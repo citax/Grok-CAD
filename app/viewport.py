@@ -472,6 +472,12 @@ class Viewport(QWidget):
         self._face_pick_frame: Optional[PlaneFrame] = None
         self._face_pick_point: Optional[np.ndarray] = None
 
+        # Section view (display-only clip — never mutates document solids)
+        self._section_on: bool = False
+        self._section_plane: str = "FRONT"  # FRONT | TOP | RIGHT
+        self._section_flip: bool = False
+        self._section_offset: float = 0.0  # mm along plane normal from origin
+
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.setInterval(40)
@@ -1225,12 +1231,15 @@ class Viewport(QWidget):
             self._solid_fps.pop(fid, None)
             self._solid_mesh_cache.pop(fid, None)
         for fid, (verts, faces, fp) in results.items():
-            # Always keep full-res mesh for face picking / scale (even if actor reused)
+            # Always keep full-res mesh for face picking / scale / volume (never sectioned)
             self._solid_mesh_cache[fid] = (
                 np.asarray(verts, dtype=np.float64),
                 np.asarray(faces, dtype=np.int32),
             )
-            if self._solid_fps.get(fid) == fp:
+            # Force re-upload when section state changes (fp alone is geometry-only)
+            sec_key = self._section_display_key()
+            full_fp = f"{fp}|sec={sec_key}"
+            if self._solid_fps.get(fid) == full_fp:
                 continue
             self._remove_actor(f"solid_{fid}")
             pdata = _mesh_to_polydata(verts, faces)
@@ -1239,14 +1248,208 @@ class Viewport(QWidget):
                     pdata = pdata.decimate_pro(1.0 - 4000.0 / len(faces), preserve_topology=True)
             except Exception:
                 pass
+            # View-only section: clip display polydata (cache stays full solid)
+            if self._section_on:
+                pdata = self._clip_polydata_for_section(pdata)
             self.plotter.add_mesh(
-                pdata, color=SOLID_COLOR, name=f"solid_{fid}", pickable=True,
-                smooth_shading=False, show_edges=False, render=False,
+                pdata,
+                color=SOLID_COLOR,
+                name=f"solid_{fid}",
+                pickable=True,
+                smooth_shading=False,
+                show_edges=bool(self._section_on),
+                edge_color=(0.25, 0.25, 0.28),
+                line_width=1.0,
+                render=False,
             )
-            self._solid_fps[fid] = fp
+            self._solid_fps[fid] = full_fp
         self._refresh_world_helpers()
         self._restyle_selection_only()
+        self._update_section_plane_actor()
         self._request_render()
+
+    # ----- Section view (display clip only) -----
+    def _section_display_key(self) -> str:
+        if not self._section_on:
+            return "off"
+        return (
+            f"{self._section_plane}|flip={int(self._section_flip)}|"
+            f"off={float(self._section_offset):.4g}"
+        )
+
+    def section_plane_origin_normal(self) -> Tuple[np.ndarray, np.ndarray]:
+        """World origin + unit normal for the active section plane."""
+        name = (self._section_plane or "FRONT").upper()
+        # Match reference plane normals (sketch PlaneFrame)
+        if name in ("TOP", "XZ"):
+            n = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        elif name in ("RIGHT", "YZ"):
+            n = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:  # FRONT / XY
+            n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if self._section_flip:
+            n = -n
+        origin = n * float(self._section_offset)
+        return origin, n
+
+    def _clip_polydata_for_section(self, pdata: pv.PolyData) -> pv.PolyData:
+        """Clip display mesh by section plane. Does not touch document geometry.
+
+        Prefers ``clip_closed_surface`` so the cut is capped (SolidWorks-like
+        filled section face). Falls back to open ``clip`` if needed.
+        """
+        if pdata is None or pdata.n_points == 0:
+            return pdata
+        origin, normal = self.section_plane_origin_normal()
+        o = tuple(float(x) for x in origin)
+        n = tuple(float(x) for x in normal)
+        try:
+            # Closed-surface clip produces a filled cut face when possible
+            if hasattr(pdata, "clip_closed_surface"):
+                clipped = pdata.clip_closed_surface(
+                    normal=n,
+                    origin=o,
+                    invert=False,
+                )
+                if clipped is not None and clipped.n_points > 0:
+                    return clipped
+            clipped = pdata.clip(normal=n, origin=o, invert=False)
+            if clipped is None or clipped.n_points == 0:
+                return pdata
+            return clipped
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] section clip: {exc}", file=sys.stderr)
+            try:
+                clipped = pdata.clip(normal=n, origin=o, invert=False)
+                return clipped if clipped is not None and clipped.n_points > 0 else pdata
+            except Exception:
+                return pdata
+
+    def set_section_view(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        plane: Optional[str] = None,
+        flip: Optional[bool] = None,
+        offset: Optional[float] = None,
+    ) -> None:
+        """Enable/update display-only section view. Document solids unchanged."""
+        if enabled is not None:
+            self._section_on = bool(enabled)
+        if plane is not None:
+            p = str(plane).upper()
+            if p in ("FRONT", "TOP", "RIGHT", "XY", "XZ", "YZ"):
+                if p == "XY":
+                    p = "FRONT"
+                elif p == "XZ":
+                    p = "TOP"
+                elif p == "YZ":
+                    p = "RIGHT"
+                self._section_plane = p
+        if flip is not None:
+            self._section_flip = bool(flip)
+        if offset is not None and np.isfinite(float(offset)):
+            self._section_offset = float(offset)
+        self._refresh_section_display()
+
+    def toggle_section_view(self) -> bool:
+        self.set_section_view(enabled=not self._section_on)
+        return self._section_on
+
+    def section_view_enabled(self) -> bool:
+        return bool(self._section_on)
+
+    def section_view_state(self) -> dict:
+        return {
+            "enabled": self._section_on,
+            "plane": self._section_plane,
+            "flip": self._section_flip,
+            "offset": float(self._section_offset),
+        }
+
+    def _refresh_section_display(self) -> None:
+        """Re-upload solid actors from full mesh cache with current section clip."""
+        if not self.plotter:
+            return
+        # Invalidate display fps so _apply path rebuilds actors
+        for fid in list(self._solid_fps.keys()):
+            self._solid_fps[fid] = ""  # force rebuild
+        # Rebuild from cache without re-running geometry job
+        for fid, (verts, faces) in list(self._solid_mesh_cache.items()):
+            self._remove_actor(f"solid_{fid}")
+            pdata = _mesh_to_polydata(verts, faces)
+            try:
+                if len(faces) > 8000:
+                    pdata = pdata.decimate_pro(
+                        1.0 - 4000.0 / max(len(faces), 1), preserve_topology=True
+                    )
+            except Exception:
+                pass
+            if self._section_on:
+                pdata = self._clip_polydata_for_section(pdata)
+            self.plotter.add_mesh(
+                pdata,
+                color=SOLID_COLOR,
+                name=f"solid_{fid}",
+                pickable=True,
+                smooth_shading=False,
+                show_edges=bool(self._section_on),
+                edge_color=(0.25, 0.25, 0.28),
+                line_width=1.0,
+                render=False,
+            )
+            # Synthetic fp so next geometry job still updates when mesh changes
+            self._solid_fps[fid] = f"cache|{self._section_display_key()}|{len(faces)}"
+        self._restyle_selection_only()
+        self._update_section_plane_actor()
+        self._request_render()
+
+    def _update_section_plane_actor(self) -> None:
+        """Translucent plane widget showing the section cut location."""
+        if not self.plotter:
+            return
+        self._remove_actor("__section_plane")
+        if not self._section_on:
+            return
+        origin, normal = self.section_plane_origin_normal()
+        # Size plane from solid bounds
+        half = 40.0
+        if self._solid_mesh_cache:
+            pts = []
+            for v, _f in self._solid_mesh_cache.values():
+                if len(v):
+                    pts.append(v)
+            if pts:
+                allv = np.vstack(pts)
+                diag = float(np.linalg.norm(allv.max(axis=0) - allv.min(axis=0)))
+                half = max(20.0, 0.65 * diag)
+        try:
+            # Build a square plane centered at origin, normal = normal
+            n = normal / max(float(np.linalg.norm(normal)), 1e-12)
+            # Orthonormal basis
+            tmp = np.array([0.0, 1.0, 0.0]) if abs(n[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            u = np.cross(n, tmp)
+            u = u / max(float(np.linalg.norm(u)), 1e-12)
+            v = np.cross(n, u)
+            corners = []
+            for su, sv in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                corners.append(origin + half * su * u + half * sv * v)
+            pts = np.array(corners, dtype=np.float64)
+            faces = np.hstack([[4], [0, 1, 2, 3]])
+            plane_pd = pv.PolyData(pts, faces)
+            self.plotter.add_mesh(
+                plane_pd,
+                color=(0.95, 0.55, 0.15),
+                opacity=0.22,
+                name="__section_plane",
+                pickable=False,
+                show_edges=True,
+                edge_color=(0.9, 0.4, 0.05),
+                line_width=2.0,
+                render=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewport] section plane actor: {exc}", file=sys.stderr)
 
     def _ensure_planes(self) -> None:
         if not self.plotter or self._doc is None:
