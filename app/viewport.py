@@ -1278,19 +1278,24 @@ class Viewport(QWidget):
         )
 
     def section_plane_origin_normal(self) -> Tuple[np.ndarray, np.ndarray]:
-        """World origin + unit normal for the active section plane."""
+        """World origin + unit normal for the active section plane.
+
+        The cut plane **position** is always ``base_normal * offset`` (same plane
+        whether flipped or not). Flip only reverses the normal so the *other*
+        half-space is kept — SolidWorks "Flip" behaviour.
+        """
         name = (self._section_plane or "FRONT").upper()
         # Match reference plane normals (sketch PlaneFrame)
         if name in ("TOP", "XZ"):
-            n = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            base = np.array([0.0, 1.0, 0.0], dtype=np.float64)
         elif name in ("RIGHT", "YZ"):
-            n = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            base = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         else:  # FRONT / XY
-            n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if self._section_flip:
-            n = -n
-        origin = n * float(self._section_offset)
-        return origin, n
+            base = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        # Plane sits at the same place; flip only chooses which side is kept
+        origin = base * float(self._section_offset)
+        normal = -base if self._section_flip else base
+        return origin, normal
 
     def _clip_polydata_for_section(self, pdata: pv.PolyData) -> pv.PolyData:
         """Clip display mesh by section plane. Does not touch document geometry.
@@ -1304,13 +1309,10 @@ class Viewport(QWidget):
         o = tuple(float(x) for x in origin)
         n = tuple(float(x) for x in normal)
         try:
-            # Closed-surface clip produces a filled cut face when possible
+            # Closed-surface clip produces a filled cut face when possible.
+            # API has no invert= — opposite half is selected by flipping normal.
             if hasattr(pdata, "clip_closed_surface"):
-                clipped = pdata.clip_closed_surface(
-                    normal=n,
-                    origin=o,
-                    invert=False,
-                )
+                clipped = pdata.clip_closed_surface(normal=n, origin=o)
                 if clipped is not None and clipped.n_points > 0:
                     return clipped
             clipped = pdata.clip(normal=n, origin=o, invert=False)

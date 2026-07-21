@@ -304,19 +304,71 @@ def main() -> int:
             _ok(f"plane {plane} normal unit length")
         else:
             _fail(f"plane {plane} bad normal {n}")
-    # Flip FRONT
-    win.viewport.set_section_view(plane="FRONT", flip=True, offset=12.5)
+    # Flip FRONT at mid — same plane origin, opposite half kept
+    win.viewport.set_section_view(
+        enabled=True, plane="FRONT", flip=False, offset=12.5
+    )
+    _pump(app, 15)
+    o0, n0 = win.viewport.section_plane_origin_normal()
+    actor0 = win.viewport.plotter.actors.get(f"solid_{ex.id}")
+    z0 = None
+    if actor0 is not None:
+        try:
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+
+            pts = vtk_to_numpy(actor0.GetMapper().GetInput().GetPoints().GetData())
+            z0 = (float(pts[:, 2].min()), float(pts[:, 2].max()))
+        except Exception:
+            pass
+    p_flip_a = _shot(win, "section_6_flip_off.png")
+
+    win.viewport.set_section_view(flip=True)
+    win.act_section_flip.setChecked(True)
     _pump(app, 15)
     o1, n1 = win.viewport.section_plane_origin_normal()
-    win.viewport.set_section_view(flip=False)
-    _pump(app, 10)
-    o0, n0 = win.viewport.section_plane_origin_normal()
+    actor1 = win.viewport.plotter.actors.get(f"solid_{ex.id}")
+    z1 = None
+    if actor1 is not None:
+        try:
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+
+            pts = vtk_to_numpy(actor1.GetMapper().GetInput().GetPoints().GetData())
+            z1 = (float(pts[:, 2].min()), float(pts[:, 2].max()))
+        except Exception:
+            pass
     print(f"  flip normals: off={n0} on={n1}", flush=True)
+    print(f"  flip origins: off={o0} on={o1}", flush=True)
+    print(f"  display Z flip-off={z0} flip-on={z1}", flush=True)
     if float(np.dot(n0, n1)) < -0.99:
         _ok("flip inverts section normal")
     else:
         _fail(f"flip did not invert normal {n0} vs {n1}")
-    _shot(win, "section_6_flip.png")
+    if np.allclose(o0, o1, atol=1e-9):
+        _ok(f"flip keeps plane origin fixed at {o0}")
+    else:
+        _fail(f"flip moved plane origin {o0} → {o1}")
+    if z0 and z1 and (z0[1] > 20) != (z1[1] > 20):
+        _ok(f"flip shows opposite half: Z {z0} vs {z1}")
+    else:
+        _fail(f"flip did not swap kept half: Z {z0} vs {z1}")
+    try:
+        from PIL import Image
+
+        a = np.asarray(Image.open(p_flip_a).convert("RGB"), dtype=np.float32)
+        b = np.asarray(
+            Image.open(_shot(win, "section_6_flip_on.png")).convert("RGB"),
+            dtype=np.float32,
+        )
+        if a.shape == b.shape:
+            d = float(np.mean(np.abs(a - b)))
+            print(f"  flip screenshots Δ={d:.2f}", flush=True)
+            if d > 2.0:
+                _ok(f"flip screenshots visibly different (Δ={d:.2f})")
+            else:
+                _fail(f"flip screenshots too similar (Δ={d:.2f})")
+    except Exception as exc:
+        print(f"  flip image compare: {exc}", flush=True)
+        _shot(win, "section_6_flip_on.png")
     v5 = _vol(doc, ex.id)
     if abs(v5 - v1) < 1e-6:
         _ok(f"volume still unchanged after plane/flip: {v5:.6f}")
