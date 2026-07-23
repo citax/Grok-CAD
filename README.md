@@ -13,6 +13,7 @@
   <a href="#features">Features</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="docs/getting-started.md">Getting started</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#roadmap">Roadmap</a> ·
   <a href="#contributing">Contributing</a>
@@ -114,6 +115,9 @@ Grok CAD is something rarer: a **desktop product workflow** — feature tree, Co
 ---
 
 ## Quick start
+
+> **First time?** Follow the full walkthrough: **[Getting started →](docs/getting-started.md)** · [rendered HTML](docs/getting-started.html)  
+> (install · UI tour · first solid · constraints · shortcuts)
 
 ### Requirements
 - **Python 3.12** recommended (VTK wheels are most reliable; avoid 3.14 on WSL if possible)

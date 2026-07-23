@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Getting started — Grok CAD</title>
+  <style>
+    :root { --bg:#0f1419; --panel:#1a2332; --text:#e7ecf3; --muted:#9aa7b8; --accent:#3b82f6; --border:#2a3544; --code-bg:#0b1220; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
+    .wrap { max-width:880px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+    a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+    h1 { font-size:2rem; margin-top:0; }
+    h2 { margin-top:2.25rem; padding-bottom:0.35rem; border-bottom:1px solid var(--border); }
+    h3 { margin-top:1.5rem; color:#d0d8e4; }
+    p, li { color:#d5dbe6; }
+    hr { border:0; border-top:1px solid var(--border); margin:2rem 0; }
+    table { width:100%; border-collapse:collapse; margin:1rem 0; font-size:0.95rem; }
+    th, td { border:1px solid var(--border); padding:0.55rem 0.7rem; text-align:left; vertical-align:top; }
+    th { background:var(--panel); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.88em; background:var(--code-bg); padding:0.12em 0.35em; border-radius:4px; }
+    pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:1rem 1.1rem; overflow-x:auto; }
+    pre code { padding:0; background:none; }
+    img { max-width:100%; height:auto; border-radius:8px; border:1px solid var(--border); display:block; margin:0.75rem auto; }
+    blockquote { margin:1rem 0; padding:0.6rem 1rem; border-left:3px solid var(--accent); background:var(--panel); color:var(--muted); }
+    .topnav { display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1.5rem; font-size:0.92rem; }
+    .topnav a { color:var(--muted); } .topnav a:hover { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav class="topnav">
+      <a href="../README.md">README</a>
+      <a href="getting-started.md">Markdown source</a>
+      <a href="https://github.com/citax/Grok-CAD">GitHub</a>
+      <a href="media/">Media</a>
+    </nav>
+    <h1 id="getting-started-with-grok-cad">Getting started with Grok CAD</h1>
+<p>A short path from <strong>clone → first solid → save</strong>.   If you only want install commands, see the root <a href="../README.md#quick-start">README</a>.</p>
+<hr />
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#1-install">Install</a></li>
+<li><a href="#2-launch-the-app">Launch the app</a></li>
+<li><a href="#3-tour-the-ui">Tour the UI</a></li>
+<li><a href="#4-your-first-part-5-minutes">Your first part (5 minutes)</a></li>
+<li><a href="#5-constraints--dimensions">Constraints &amp; dimensions</a></li>
+<li><a href="#6-more-modeling-tools">More modeling tools</a></li>
+<li><a href="#7-save-open-export">Save, open, export</a></li>
+<li><a href="#8-keyboard-reference">Keyboard reference</a></li>
+<li><a href="#9-troubleshooting">Troubleshooting</a></li>
+<li><a href="#10-next-steps">Next steps</a></li>
+</ol>
+<blockquote><p>Prefer a styled page? Open the rendered guide: <strong><a href="getting-started.html">getting-started.html</a></strong> (works offline with images).</p></blockquote>
+<hr />
+<h2 id="1-install">1. Install</h2>
+<h3 id="requirements">Requirements</h3>
+<table>
+<tr><td><strong>Python</strong></td><td><strong>3.12</strong> recommended (VTK wheels are most reliable)</td></tr>
+<tr><td><strong>OS</strong></td><td>Linux, WSL2, or Windows</td></tr>
+<tr><td><strong>GPU</strong></td><td>Optional — software GL works (slower)</td></tr>
+</table>
+<h3 id="clone">Clone</h3>
+<pre><code>git clone https://github.com/citax/Grok-CAD.git
+cd Grok-CAD</code></pre>
+<h3 id="create-a-virtualenv">Create a virtualenv</h3>
+<p><strong>WSL / Linux — put the venv on the Linux filesystem</strong>, not under <code>/mnt/c</code>.   VTK loads many <code>.so</code> files; a Windows mount is slow and can break imports.</p>
+<pre><code># With uv (recommended)
+uv venv &quot;$HOME/.venvs/grok-cad&quot; --python 3.12
+uv pip install --python &quot;$HOME/.venvs/grok-cad/bin/python&quot; -r requirements.txt
+ln -sfn &quot;$HOME/.venvs/grok-cad&quot; .venv</code></pre>
+<p>Plain <code>venv</code> also works:</p>
+<pre><code>python3.12 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt</code></pre>
+<h3 id="verify-tests-optional">Verify tests (optional)</h3>
+<pre><code>source .venv/bin/activate
+pytest -q</code></pre>
+<hr />
+<h2 id="2-launch-the-app">2. Launch the app</h2>
+<table>
+<tr><th>Platform</th><th>Command</th></tr>
+<tr><td>Linux / WSL</td><td><code>./run_cad.sh</code></td></tr>
+<tr><td>Windows (cmd)</td><td><code>run_cad.cmd</code></td></tr>
+<tr><td>Windows (PowerShell)</td><td><code>.\run_cad.ps1</code></td></tr>
+</table>
+<p><code>run_cad.sh</code> forces software GL and <code>xcb</code> so WSLg + VTK stay stable.</p>
+<p>You should see the dark (or light) shell: <strong>Feature Tree</strong> left, <strong>viewport</strong> center, <strong>PropertyManager</strong> right, <strong>Command Manager</strong> on top.</p>
+<p align="center">
+  <img src="media/hero.png" alt="Grok CAD main window" width="820" />
+</p>
+<hr />
+<h2 id="3-tour-the-ui">3. Tour the UI</h2>
+<table>
+<tr><th>Region</th><th>What it does</th></tr>
+<tr><td><strong>Feature Tree</strong></td><td>Reference planes + your sketches/features history</td></tr>
+<tr><td><strong>Command Manager</strong></td><td>Tabs: <strong>Features</strong> · <strong>Sketch</strong> · <strong>Evaluate</strong></td></tr>
+<tr><td><strong>Viewport</strong></td><td>Orbit (LMB drag), pan/zoom (VTK defaults), View Cube</td></tr>
+<tr><td><strong>PropertyManager</strong></td><td>Params for the active selection or command (~240px)</td></tr>
+<tr><td><strong>Menus</strong></td><td>File / Edit / Settings / View / Insert</td></tr>
+</table>
+<p align="center">
+  <img src="media/ui_features_live.png" alt="Features Command Manager" width="48%" />
+  &nbsp;
+  <img src="media/ui_sketch_live.png" alt="Sketch Command Manager" width="48%" />
+</p>
+<p><strong>SolidWorks-like flow:</strong> select something → start a command → set params in the PropertyManager → <strong>Apply</strong> / confirm. Failed features leave the part unchanged.</p>
+<hr />
+<h2 id="4-your-first-part-5-minutes">4. Your first part (5 minutes)</h2>
+<p>Goal: a simple rectangular block (and optionally a hole).</p>
+<h3 id="step-a-sketch-on-the-front-plane">Step A — Sketch on the Front plane</h3>
+<ol>
+<li>In the Feature Tree, click <strong>Front Plane</strong> (or start <strong>Sketch</strong> from Features / Insert).  </li>
+<li>Command Manager switches to <strong>Sketch</strong>.  </li>
+<li>Choose <strong>Rectangle</strong> (or <strong>Line</strong>).  </li>
+<li>Draw a closed rectangle on the grid.</li>
+</ol>
+<p align="center">
+  <img src="media/sketch_under.png" alt="Under-defined rectangle sketch" width="700" />
+</p>
+<p>Blue geometry usually means <strong>under-defined</strong> (still free to drag). That is normal until you add dimensions/constraints.</p>
+<h3 id="step-b-drive-the-size">Step B — Drive the size</h3>
+<ol>
+<li>Use <strong>Smart Dim</strong> / dimension tools.  </li>
+<li>Click edges and type values (e.g. <strong>20 mm</strong> × <strong>10 mm</strong>).  </li>
+<li>When fully constrained, geometry turns <strong>black</strong> (fully defined).</li>
+</ol>
+<p align="center">
+  <img src="media/sketch_defined.png" alt="Fully defined sketch with dimensions" width="700" />
+</p>
+<p>Closed profiles can show a <strong>fill</strong> when ready for a solid feature:</p>
+<p align="center">
+  <img src="media/sketch_profile.png" alt="Closed profile fill" width="480" />
+</p>
+<h3 id="step-c-exit-sketch-and-extrude">Step C — Exit sketch and Extrude</h3>
+<ol>
+<li>Click <strong>Exit</strong> (or leave sketch mode).  </li>
+<li>Select the sketch (or use <strong>Extrude</strong> from Features / press <code>E</code>).  </li>
+<li>In the PropertyManager, set depth (e.g. <strong>8 mm</strong>).  </li>
+<li><strong>Apply</strong>.</li>
+</ol>
+<p>You now have a solid body in the tree (e.g. <strong>Extrude1</strong>).</p>
+<h3 id="step-d-optional-boss-on-a-face">Step D — (Optional) Boss on a face</h3>
+<ol>
+<li>Click a face of the solid.  </li>
+<li>Start a new <strong>Sketch</strong> on that face.  </li>
+<li>Draw a smaller profile → <strong>Extrude</strong> again.  </li>
+<li>The boss <strong>merges</strong> (boolean union) into one continuous body — no double-counted volume.</li>
+</ol>
+<p align="center">
+  <img src="media/solid_boss.png" alt="Boss extrude from a face" width="420" />
+</p>
+<h3 id="step-e-optional-pocket-cut">Step E — (Optional) Pocket / cut</h3>
+<ul>
+<li><strong>Pocket</strong> or <strong>Cut-Extrude</strong> removes material.  </li>
+<li>Section view (<code>Ctrl+Shift+S</code>) helps inspect interiors.</li>
+</ul>
+<p align="center">
+  <img src="media/solid_section.png" alt="Solid with through hole and View Cube" width="480" />
+</p>
+<hr />
+<h2 id="5-constraints-dimensions">5. Constraints & dimensions</h2>
+<p>Constraints and driving dimensions are <strong>promises</strong>: they keep working after drag, save, and reopen.   If a new constraint <strong>conflicts</strong>, the app refuses it and leaves the sketch unchanged.</p>
+<h3 id="common-constraints">Common constraints</h3>
+<table>
+<tr><th>Tool</th><th>Meaning</th></tr>
+<tr><td>Horizontal / Vertical</td><td>Line stays axis-aligned</td></tr>
+<tr><td>Parallel / Perpendicular</td><td>Two lines</td></tr>
+<tr><td>Equal</td><td>Equal lengths (or equal radius for arcs/circles)</td></tr>
+<tr><td>Coincident</td><td>Points share a location</td></tr>
+<tr><td>Fix</td><td>Lock a point in place</td></tr>
+<tr><td>Tangent</td><td>Smooth line–arc join</td></tr>
+<tr><td>Midpoint · Concentric · Collinear · Symmetric</td><td>Advanced layout</td></tr>
+</table>
+<h3 id="driving-dimensions">Driving dimensions</h3>
+<table>
+<tr><th>Kind</th><th>Use on</th></tr>
+<tr><td>Linear</td><td>Line length, rect sides</td></tr>
+<tr><td>Diameter / Radius</td><td>Circles, arcs</td></tr>
+<tr><td>Angle</td><td>Two lines</td></tr>
+</table>
+<p>Partial under-constraint is fine — only over-constraint is rejected.</p>
+<hr />
+<h2 id="6-more-modeling-tools">6. More modeling tools</h2>
+<p>From the <strong>Features</strong> Command Manager (or <strong>Insert</strong> menu):</p>
+<table>
+<tr><th>Tool</th><th>Shortcut</th><th>Role</th></tr>
+<tr><td>Sketch</td><td><code>S</code></td><td>Start / edit sketch on plane or face</td></tr>
+<tr><td>Extrude</td><td><code>E</code></td><td>Boss pad from closed profile</td></tr>
+<tr><td>Cut-Extrude</td><td><code>C</code></td><td>Remove material</td></tr>
+<tr><td>Revolve</td><td><code>R</code></td><td>Revolve profile about an axis</td></tr>
+<tr><td>Fillet</td><td><code>F</code></td><td><strong>Edge</strong> fillet on a solid (not sketch corners)</td></tr>
+<tr><td>Pocket</td><td><code>P</code></td><td>Circular pocket / hole style cut</td></tr>
+<tr><td>Chamfer</td><td>—</td><td>Edge chamfer</td></tr>
+<tr><td>Linear / Circular / Mirror</td><td>—</td><td>Patterns & symmetry</td></tr>
+<tr><td>Plane</td><td>—</td><td>Offset reference plane</td></tr>
+</table>
+<p><strong>Fillet</strong> rounds <strong>edges on the solid</strong> after you have a body. Select edges → set radius → Apply.</p>
+<hr />
+<h2 id="7-save-open-export">7. Save, open, export</h2>
+<table>
+<tr><th>Action</th><th>Shortcut</th><th>Format</th></tr>
+<tr><td>New</td><td><code>Ctrl+N</code></td><td>Empty project</td></tr>
+<tr><td>Open</td><td><code>Ctrl+O</code></td><td><code>.gcad</code></td></tr>
+<tr><td>Save / Save As</td><td><code>Ctrl+S</code></td><td><code>.gcad</code> project</td></tr>
+<tr><td>Export STL</td><td><code>Ctrl+E</code></td><td>Mesh for print / other tools</td></tr>
+<tr><td>Undo / Redo</td><td><code>Ctrl+Z</code> / <code>Ctrl+Y</code></td><td>History stack</td></tr>
+</table>
+<p><code>.gcad</code> stores the feature tree and sketches so you can reopen and edit later — not just a dead mesh.</p>
+<hr />
+<h2 id="8-keyboard-reference">8. Keyboard reference</h2>
+<h3 id="file-edit">File & edit</h3>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><code>Ctrl+N</code></td><td>New</td></tr>
+<tr><td><code>Ctrl+O</code></td><td>Open</td></tr>
+<tr><td><code>Ctrl+S</code></td><td>Save</td></tr>
+<tr><td><code>Ctrl+E</code></td><td>Export STL</td></tr>
+<tr><td><code>Ctrl+Z</code></td><td>Undo</td></tr>
+<tr><td><code>Ctrl+Y</code> / <code>Ctrl+Shift+Z</code></td><td>Redo</td></tr>
+<tr><td><code>Ctrl+X</code> / <code>C</code> / <code>V</code></td><td>Cut / Copy / Paste (sketch)</td></tr>
+<tr><td><code>Delete</code></td><td>Delete selection</td></tr>
+<tr><td><code>Ctrl+L</code></td><td>Set length</td></tr>
+</table>
+<h3 id="features">Features</h3>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><code>S</code></td><td>Sketch</td></tr>
+<tr><td><code>E</code></td><td>Extrude</td></tr>
+<tr><td><code>C</code></td><td>Cut-Extrude</td></tr>
+<tr><td><code>R</code></td><td>Revolve</td></tr>
+<tr><td><code>F</code></td><td>Fillet</td></tr>
+<tr><td><code>P</code></td><td>Pocket</td></tr>
+</table>
+<h3 id="view">View</h3>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><code>Ctrl+F</code></td><td>Fit all</td></tr>
+<tr><td><code>Ctrl+Shift+S</code></td><td>Section view</td></tr>
+<tr><td><code>Space</code></td><td>(view / triad related shortcut)</td></tr>
+<tr><td>LMB drag</td><td>Orbit</td></tr>
+<tr><td>View Cube</td><td>Jump to named views</td></tr>
+</table>
+<hr />
+<h2 id="9-troubleshooting">9. Troubleshooting</h2>
+<h3 id="import-vtk-errors-on-wsl">Import / VTK errors on WSL</h3>
+<pre><code>Failed to load vtkRenderingVolumeOpenGL2: No module named vtkmodules...</code></pre>
+<p><strong>Fix:</strong> recreate the venv under <code>$HOME</code> (not <code>/mnt/c</code>), reinstall <code>requirements.txt</code>, re-link <code>.venv</code>.</p>
+<h3 id="blank-black-viewport">Blank / black viewport</h3>
+<p>Often software-GL or Qt platform mismatch. Prefer:</p>
+<pre><code>./run_cad.sh   # sets LIBGL_ALWAYS_SOFTWARE=1 and QT_QPA_PLATFORM=xcb</code></pre>
+<h3 id="app-hangs-on-close-in-automation">App hangs on close in automation</h3>
+<p>Use unattended mode so dirty docs discard without dialogs:</p>
+<pre><code>GROK_CAD_UNATTENDED=1 QT_QPA_PLATFORM=offscreen python -m app.main</code></pre>
+<h3 id="feature-failed">Feature failed</h3>
+<p>Read the status / PropertyManager message. The part should be <strong>unchanged</strong> — fix selection or params and try again.</p>
+<hr />
+<h2 id="10-next-steps">10. Next steps</h2>
+<ul>
+<li>Browse more screenshots in <a href="media/"><code>docs/media/</code></a>  </li>
+<li>Read product rules in <a href="../AGENTS.md"><code>AGENTS.md</code></a>  </li>
+<li>Contribute: <a href="../CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>  </li>
+<li>Report bugs / ideas: <a href="https://github.com/citax/Grok-CAD/issues">GitHub Issues</a>  </li>
+</ul>
+<p>Happy modeling.</p>
+<hr />
+<p align="center">
+  <a href="../README.md">← Back to README</a>
+  ·
+  <a href="https://github.com/citax/Grok-CAD">Repository</a>
+</p>
+  </div>
+</body>
+</html>
